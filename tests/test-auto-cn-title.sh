@@ -15,9 +15,15 @@ PASS=0; FAIL=0
 TMPROOT="$(mktemp -d)"
 trap 'rm -rf "$TMPROOT"' EXIT
 FAKE_HOME="$TMPROOT/home"; mkdir -p "$FAKE_HOME/.claude/.title-cache"
+# 隔离 CLAUDE_JOB_DIR（关键）：默认指向一个【无 state.json】的空目录。hook 的 persist_job_name() 会把
+# worker 标题原子写进 ${CLAUDE_JOB_DIR}/state.json 的 .name，这是无条件副作用；若不隔离，从一个【真实运行的
+# 后台 session】里跑本套件时，worker 夹具（⟦FLEET-WORKER⟧ module=gateway/pay/foo）会把夹具名写进【真实
+# session 的 state.json】，把该 session 改名成 ↳gateway@… 等（实测踩过）。空目录无 state.json → persist 直接
+# no-op。需要断言 state.json 的用例在 "${@:2}" 里显式传 CLAUDE_JOB_DIR=<临时JD> 覆盖（env 后者生效）。
+NOJOB="$TMPROOT/nojob"; mkdir -p "$NOJOB"
 
-# 在隔离 HOME 下跑 hook，回显其 stdout
-run_hook() { printf '%s' "$1" | env HOME="$FAKE_HOME" "${@:2}" bash "$HOOK" 2>/dev/null || true; }
+# 在隔离 HOME + 隔离 CLAUDE_JOB_DIR 下跑 hook，回显其 stdout
+run_hook() { printf '%s' "$1" | env HOME="$FAKE_HOME" CLAUDE_JOB_DIR="$NOJOB" "${@:2}" bash "$HOOK" 2>/dev/null || true; }
 title_of() { printf '%s' "$1" | jq -r '.sessionTitle // empty' 2>/dev/null || true; }
 nested_of() { printf '%s' "$1" | jq -r '.hookSpecificOutput.sessionTitle // empty' 2>/dev/null || true; }
 

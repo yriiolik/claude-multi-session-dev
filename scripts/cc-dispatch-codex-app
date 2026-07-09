@@ -1,0 +1,703 @@
+#!/usr/bin/env bash
+# cc-dispatch-codex-app — 启动一个 Codex App 可见 worker thread。
+#
+# 设计边界：
+#   - 预建隔离 worktree、复用 fleet/<RQ> 集成分支和 canonical 协调目录。
+#   - 通过 Codex app-server thread/start + turn/start 创建 App 可见 worker thread。
+#   - 产生的 worker 会出现在 Codex App 线程列表中，可用 App UI 或 cc-fleet-reply-codex-app 继续回复。
+#   - Codex App 可见性、thread source、unarchive/resume、临时 pin、三层 CLAUDE.md 注入等实现策略集中在本脚本；
+#     SKILL.md 只说明何时调用本脚本，避免把易变的 App/server 细节扩散到编排方法论里。
+
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+COORD_BIN="$SCRIPT_DIR/cc-fleet-coord"
+APP_CALL_BIN="${CODEX_APP_CALL_BIN:-$SCRIPT_DIR/cc-codex-app-call}"
+PIN_BIN="${CODEX_APP_PIN_BIN:-$SCRIPT_DIR/cc-codex-app-pin}"
+PREAMBLE_TMPL="$ROOT_DIR/reference/codex-app-dispatch-preamble.md"
+
+OPT_CWD=""
+OPT_NAME=""
+OPT_PROMPT=""
+OPT_PROMPT_FILE=""
+OPT_SID_FILE=""
+OPT_JOIN=0
+OPT_DRY_RUN=0
+OPT_JSON=0
+OPT_FAST=0
+OPT_RAW_PROMPT=0
+OPT_INJECT_CLAUDE_MD=1
+OPT_CODEX_BIN="${CODEX_CLI_PATH:-}"
+OPT_WORKTREE_DIR=""
+OPT_APP_VISIBLE_CWD=""
+OPT_PIN_POLICY="auto"
+OPT_START_APP_SERVER=0
+ENV_KVS=()
+
+usage() {
+  cat >&2 <<'EOF'
+cc-dispatch-codex-app — 启动 Codex App 可见 worker thread
+
+用法:
+  cc-dispatch-codex-app --cwd <DIR> --name "↳<module>@<RQ>" --prompt <TEXT>
+  cc-dispatch-codex-app --cwd <DIR> --name "↳<module>@<RQ>" --prompt-file <FILE>
+  echo "task..." | cc-dispatch-codex-app --cwd <DIR> --name "↳<module>@<RQ>"
+
+常用选项:
+  --env KEY=VAL          注入 worker prompt 元数据（可重复；FLEET_* 会写入 prompt/协调元数据）
+  --sid-file PATH        写入 Codex App thread id；推荐 "$COORD/<module>.sid"
+  --join                 同一任务后续批次，放行复用兜底闸
+  --fast                 快速模式：serviceTier=priority；默认 serviceTier=default
+  --codex-bin PATH       指定 Codex 可执行文件；默认 CODEX_CLI_PATH / Codex.app / PATH 中的 codex
+  --start-app-server     若 app-server control socket 未启动，尝试 `codex remote-control start --json`
+  --worktree-dir DIR     指定 worker worktree 根目录；默认 <repo>/.claude/worktrees/<RQ>-<module>-codex-app
+  --app-visible-cwd DIR  Codex App 侧栏归属 cwd；默认从 ~/.codex/config.toml 找 --cwd 所属最长保存项目
+  --pin-policy MODE      App 侧栏可见性兜底：auto|always|never；默认 auto
+  --pin                  等价 --pin-policy always
+  --no-pin               等价 --pin-policy never
+  --raw-prompt           不自动包裹 Codex App preamble，仅注入 CLAUDE.md 和原 prompt
+  --no-inject-claude-md  不注入三层 CLAUDE.md（通常不用）
+  --dry-run              只打印计划，不创建 worktree、不启动 thread
+  --json                 启动成功后输出 JSON
+
+说明:
+  主技能/主 session 通常只需要传 --cwd/--name/--env/--sid-file/--prompt-file。
+  App 可见性、worktree、三层 CLAUDE.md 注入、thread 加载与临时 pin 都由脚本默认处理。
+  模型与 reasoning 不由本脚本覆盖，沿用 Codex App / Codex 配置。
+  默认 serviceTier=default；显式 --fast 才用 priority。
+EOF
+}
+
+die_usage() {
+  echo "❌ $*" >&2
+  usage
+  exit 5
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --cwd) OPT_CWD="${2:-}"; shift 2 ;;
+    --name) OPT_NAME="${2:-}"; shift 2 ;;
+    --prompt) OPT_PROMPT="${2:-}"; shift 2 ;;
+    --prompt-file) OPT_PROMPT_FILE="${2:-}"; shift 2 ;;
+    --env) ENV_KVS+=("${2:-}"); shift 2 ;;
+    --sid-file) OPT_SID_FILE="${2:-}"; shift 2 ;;
+    --join) OPT_JOIN=1; shift ;;
+    --fast) OPT_FAST=1; shift ;;
+    --codex-bin) OPT_CODEX_BIN="${2:-}"; shift 2 ;;
+    --start-app-server) OPT_START_APP_SERVER=1; shift ;;
+    --worktree-dir) OPT_WORKTREE_DIR="${2:-}"; shift 2 ;;
+    --app-visible-cwd) OPT_APP_VISIBLE_CWD="${2:-}"; shift 2 ;;
+    --pin-policy) OPT_PIN_POLICY="${2:-}"; shift 2 ;;
+    --pin) OPT_PIN_POLICY="always"; shift ;;
+    --no-pin) OPT_PIN_POLICY="never"; shift ;;
+    --raw-prompt) OPT_RAW_PROMPT=1; shift ;;
+    --inject-claude-md) OPT_INJECT_CLAUDE_MD=1; shift ;;
+    --no-inject-claude-md) OPT_INJECT_CLAUDE_MD=0; shift ;;
+    --dry-run) OPT_DRY_RUN=1; shift ;;
+    --json) OPT_JSON=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) die_usage "未知参数: $1" ;;
+  esac
+done
+
+[[ -n "$OPT_CWD" ]] || die_usage "--cwd required"
+[[ -n "$OPT_NAME" ]] || die_usage "--name required"
+if [[ -n "$OPT_PROMPT" && -n "$OPT_PROMPT_FILE" ]]; then
+  die_usage "--prompt 与 --prompt-file 只能二选一"
+fi
+case "$OPT_PIN_POLICY" in
+  auto|always|never) ;;
+  *) die_usage "--pin-policy 只能是 auto|always|never: $OPT_PIN_POLICY" ;;
+esac
+
+for kv in "${ENV_KVS[@]}"; do
+  case "$kv" in
+    *=*) ;;
+    *) die_usage "--env 需要 KEY=VAL 形式: $kv" ;;
+  esac
+  key="${kv%%=*}"
+  [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die_usage "--env key 非法: $key"
+done
+
+env_get() {
+  local want="$1" kv key
+  for kv in "${ENV_KVS[@]}"; do
+    key="${kv%%=*}"
+    if [[ "$key" == "$want" ]]; then
+      printf '%s\n' "${kv#*=}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+slugify() {
+  local s
+  s="$(printf '%s' "$1" | LC_ALL=C tr -c 'A-Za-z0-9._-' '-' | sed 's/--*/-/g; s/^-//; s/-$//')"
+  [[ -n "$s" ]] || s="module"
+  printf '%s\n' "$s"
+}
+
+discover_codex_bin() {
+  if [[ -n "$OPT_CODEX_BIN" ]]; then
+    [[ -x "$OPT_CODEX_BIN" ]] || return 1
+    printf '%s\n' "$OPT_CODEX_BIN"
+    return 0
+  fi
+  if [[ -x "/Applications/Codex.app/Contents/Resources/codex" ]]; then
+    printf '%s\n' "/Applications/Codex.app/Contents/Resources/codex"
+    return 0
+  fi
+  if [[ -x "$HOME/.codex/plugins/.plugin-appserver/codex" ]]; then
+    printf '%s\n' "$HOME/.codex/plugins/.plugin-appserver/codex"
+    return 0
+  fi
+  command -v codex 2>/dev/null || return 1
+}
+
+saved_codex_project_for() {
+  local cwd="$1" config="$HOME/.codex/config.toml"
+  [[ -f "$config" ]] || return 1
+  node - "$cwd" "$config" <<'NODE'
+const fs = require("fs");
+const path = require("path");
+
+const cwd = fs.realpathSync.native(process.argv[2]);
+const configPath = process.argv[3];
+const text = fs.readFileSync(configPath, "utf8");
+let best = "";
+
+for (const line of text.split(/\r?\n/)) {
+  const m = line.match(/^\[projects\."((?:\\"|\\\\|[^"])*)"\]$/);
+  if (!m) continue;
+  const projectPath = m[1].replace(/\\"/g, '"').replace(/\\\\/g, "\\");
+  let realProjectPath = "";
+  try {
+    realProjectPath = fs.realpathSync.native(projectPath);
+  } catch {
+    continue;
+  }
+  if (cwd === realProjectPath || cwd.startsWith(realProjectPath + path.sep)) {
+    if (realProjectPath.length > best.length) best = realProjectPath;
+  }
+}
+
+if (best) process.stdout.write(best);
+NODE
+}
+
+first_existing_claude_md() {
+  local dir="$1"
+  if [[ -f "$dir/CLAUDE.md" ]]; then printf '%s\n' "$dir/CLAUDE.md"; return 0; fi
+  if [[ -f "$dir/claude.md" ]]; then printf '%s\n' "$dir/claude.md"; return 0; fi
+  return 1
+}
+
+emit_claude_block() {
+  local home_file file dir parent label seen=" " dir_chain=""
+  echo "⟦INJECTED-CLAUDE-MD⟧"
+  echo "下面是派发方复用 Claude Code 规则收集到的用户级 / 项目级 / 目录级 CLAUDE.md 原文。Codex App worker 必须逐条遵守。"
+
+  home_file=""
+  [[ -f "$HOME/.claude/CLAUDE.md" ]] && home_file="$HOME/.claude/CLAUDE.md"
+  [[ -z "$home_file" && -f "$HOME/.claude/claude.md" ]] && home_file="$HOME/.claude/claude.md"
+  if [[ -n "$home_file" ]]; then
+    echo
+    echo "========== [用户级] $home_file =========="
+    cat "$home_file"
+    echo
+    seen=" $home_file "
+  fi
+
+  dir="$CWD_ABS"
+  while :; do
+    dir_chain="$dir
+$dir_chain"
+    [[ "$dir" == "$GIT_TOP" ]] && break
+    parent="${dir%/*}"
+    [[ -n "$parent" && "$parent" != "$dir" && "${#parent}" -ge "${#GIT_TOP}" ]] || break
+    dir="$parent"
+  done
+
+  while IFS= read -r dir; do
+    [[ -n "$dir" ]] || continue
+    file="$(first_existing_claude_md "$dir" || true)"
+    [[ -n "$file" ]] || continue
+    case "$seen" in *" $file "*) continue ;; esac
+    label="项目级"
+    [[ "$dir" == "$CWD_ABS" ]] && label="目录级"
+    echo
+    echo "========== [$label] $file =========="
+    cat "$file"
+    echo
+    seen="$seen$file "
+  done <<EOF
+$dir_chain
+EOF
+  echo "⟦/INJECTED-CLAUDE-MD⟧"
+}
+
+render_preamble() {
+  if [[ -f "$PREAMBLE_TMPL" ]]; then
+    RQ="$RQ" MODULE="$MODULE" COORD_DIR="$COORD" INT_BRANCH="$INT_BRANCH" \
+    WORKTREE_ROOT="$WT_ROOT" WORKTREE_CWD="$WT_CWD" CODEX_SPEED="$CODEX_SPEED" \
+    CLAUDE_SOURCE_CWD="$CWD_ABS" APP_VISIBLE_CWD="$APP_VISIBLE_CWD" \
+      perl -0pe '
+        s/\{\{RQ\}\}/$ENV{RQ}/g;
+        s/\{\{MODULE\}\}/$ENV{MODULE}/g;
+        s/\{\{COORD_DIR\}\}/$ENV{COORD_DIR}/g;
+        s/\{\{INT_BRANCH\}\}/$ENV{INT_BRANCH}/g;
+        s/\{\{WORKTREE_ROOT\}\}/$ENV{WORKTREE_ROOT}/g;
+        s/\{\{WORKTREE_CWD\}\}/$ENV{WORKTREE_CWD}/g;
+        s/\{\{APP_VISIBLE_CWD\}\}/$ENV{APP_VISIBLE_CWD}/g;
+        s/\{\{CODEX_SPEED\}\}/$ENV{CODEX_SPEED}/g;
+        s/\{\{CLAUDE_SOURCE_CWD\}\}/$ENV{CLAUDE_SOURCE_CWD}/g;
+      ' "$PREAMBLE_TMPL"
+  else
+    cat <<EOF
+你是 Codex App worker。只负责 $MODULE，协调目录 $COORD，集成分支 $INT_BRANCH。
+已在隔离 worktree $WT_CWD 中运行。完成后 commit、cc-fleet-land $RQ、写 result: 回执。
+EOF
+  fi
+}
+
+write_full_prompt() {
+  local src="$1" dst="$2"
+  {
+    echo "⟦FLEET-WORKER⟧ rq=$RQ module=$MODULE mode=codex-app"
+    echo
+    if [[ "$OPT_INJECT_CLAUDE_MD" -eq 1 ]]; then
+      emit_claude_block
+      echo
+    fi
+    if [[ "$OPT_RAW_PROMPT" -eq 0 ]]; then
+      render_preamble
+      echo
+      echo "## 你的具体任务"
+      echo
+    fi
+    cat "$src"
+  } > "$dst"
+}
+
+write_context_prompt() {
+  local dst="$1"
+  {
+    if [[ "$OPT_INJECT_CLAUDE_MD" -eq 1 || "$OPT_RAW_PROMPT" -eq 0 ]]; then
+      echo "⟦FLEET-WORKER-CONTEXT⟧ rq=$RQ module=$MODULE mode=codex-app"
+      echo "下面内容通过 Codex app-server thread/start.developerInstructions 注入为 developer context：模型可见，App 首屏不把它当作用户任务卡展示。"
+      echo
+    fi
+    if [[ "$OPT_INJECT_CLAUDE_MD" -eq 1 ]]; then
+      emit_claude_block
+      echo
+    fi
+    if [[ "$OPT_RAW_PROMPT" -eq 0 ]]; then
+      render_preamble
+    fi
+  } > "$dst"
+}
+
+write_visible_prompt() {
+  local src="$1" dst="$2"
+  {
+    echo "⟦FLEET-WORKER⟧ rq=$RQ module=$MODULE mode=codex-app"
+    echo
+    if [[ "$OPT_INJECT_CLAUDE_MD" -eq 1 || "$OPT_RAW_PROMPT" -eq 0 ]]; then
+      echo "本 thread 的三层 CLAUDE.md 与 Codex App worker 规则已作为 developer instructions 注入；此处只显示短任务卡，避免 Codex App 首条消息过长导致后续进展渲染不稳定。"
+    else
+      echo "本 thread 使用 raw prompt，未额外注入 CLAUDE.md / Codex App worker 规则；此处显示原始任务卡。"
+    fi
+    echo
+    echo "- 真实 worker 工作目录：$WT_CWD"
+    echo "- App 侧栏锚点目录：$APP_VISIBLE_CWD"
+    echo "- 协调目录：$COORD"
+    echo "- 回执文件：$SUMMARY_FILE"
+    echo
+    echo "## 你的具体任务"
+    echo
+    cat "$src"
+  } > "$dst"
+}
+
+write_json_params() {
+  local kind="$1" out="$2"
+  KIND="$kind" OUT="$out" THREAD_ID="${THREAD_ID:-}" TURN_ID="${TURN_ID:-}" \
+  OPT_NAME="$OPT_NAME" WT_CWD="$WT_CWD" APP_VISIBLE_CWD="$APP_VISIBLE_CWD" \
+  PROMPT_FILE="${VISIBLE_PROMPT:-}" CONTEXT_PROMPT_FILE="${CONTEXT_PROMPT:-}" \
+  SERVICE_TIER="$SERVICE_TIER_VALUE" APP_THREAD_SOURCE="${APP_THREAD_SOURCE:-user}" \
+  node <<'NODE'
+const fs = require("fs");
+const kind = process.env.KIND;
+const out = process.env.OUT;
+let params;
+if (kind === "thread-start") {
+  const developerInstructionsPath = process.env.CONTEXT_PROMPT_FILE || "";
+  let developerInstructions = null;
+  if (developerInstructionsPath && fs.existsSync(developerInstructionsPath)) {
+    const text = fs.readFileSync(developerInstructionsPath, "utf8");
+    if (text.trim()) developerInstructions = text;
+  }
+  params = {
+    cwd: process.env.APP_VISIBLE_CWD,
+    approvalPolicy: "never",
+    approvalsReviewer: "auto_review",
+    sandbox: "danger-full-access",
+    threadSource: process.env.APP_THREAD_SOURCE || "user",
+    ephemeral: false,
+    serviceName: "multi-session-dev",
+    serviceTier: process.env.SERVICE_TIER || "default",
+    developerInstructions,
+  };
+} else if (kind === "set-name") {
+  params = { threadId: process.env.THREAD_ID, name: process.env.OPT_NAME };
+} else if (kind === "thread-resume") {
+  params = { threadId: process.env.THREAD_ID };
+} else if (kind === "thread-unarchive") {
+  params = { threadId: process.env.THREAD_ID };
+} else if (kind === "turn-start") {
+  params = {
+    threadId: process.env.THREAD_ID,
+    cwd: process.env.APP_VISIBLE_CWD,
+    approvalPolicy: "never",
+    approvalsReviewer: "auto_review",
+    sandboxPolicy: { type: "dangerFullAccess" },
+    serviceTier: process.env.SERVICE_TIER || "default",
+    input: [{ type: "text", text: fs.readFileSync(process.env.PROMPT_FILE, "utf8") }],
+  };
+} else {
+  throw new Error(`unknown params kind ${kind}`);
+}
+fs.writeFileSync(out, JSON.stringify(params));
+NODE
+}
+
+app_call() {
+  local method="$1" params="$2"
+  local args=()
+  [[ -n "$OPT_CODEX_BIN" ]] && args+=(--codex-bin "$OPT_CODEX_BIN")
+  [[ "$OPT_START_APP_SERVER" -eq 1 ]] && args+=(--start-app-server)
+  "$APP_CALL_BIN" "${args[@]}" "$method" "$params"
+}
+
+CWD_ABS="$(cd "$OPT_CWD" 2>/dev/null && pwd -P)" || die_usage "cwd not a directory: $OPT_CWD"
+GIT_TOP="$(git -C "$CWD_ABS" rev-parse --show-toplevel 2>/dev/null)" || {
+  echo "❌ --cwd 不在 git 仓库内: $CWD_ABS" >&2
+  exit 7
+}
+GIT_TOP="$(cd "$GIT_TOP" && pwd -P)"
+COMMON_DIR="$(git -C "$CWD_ABS" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || {
+  echo "❌ 无法定位 git-common-dir: $CWD_ABS" >&2
+  exit 7
+}
+
+MODULE="$(env_get FLEET_MODULE || true)"
+RQ="$(env_get FLEET_RQ || true)"
+if [[ -z "$MODULE" || -z "$RQ" ]]; then
+  parsed_module="$(printf '%s' "$OPT_NAME" | sed -n 's/^↳\(.*\)@\(RQ-[^[:space:]]*\)$/\1/p')"
+  parsed_rq="$(printf '%s' "$OPT_NAME" | sed -n 's/^↳\(.*\)@\(RQ-[^[:space:]]*\)$/\2/p')"
+  [[ -z "$MODULE" ]] && MODULE="$parsed_module"
+  [[ -z "$RQ" ]] && RQ="$parsed_rq"
+fi
+if [[ -z "$MODULE" && -n "$OPT_SID_FILE" ]]; then
+  MODULE="$(basename "$OPT_SID_FILE" .sid)"
+fi
+if [[ -z "$RQ" && -n "$OPT_SID_FILE" ]]; then
+  RQ="$(basename "$(dirname "$OPT_SID_FILE")")"
+fi
+[[ -n "$MODULE" ]] || die_usage "无法推断 module，请传 --env FLEET_MODULE=<module> 或使用 ↳<module>@<RQ> 命名"
+[[ -n "$RQ" ]] || die_usage "无法推断 RQ，请传 --env FLEET_RQ=<RQ> 或使用 ↳<module>@<RQ> 命名"
+
+COORD="$COMMON_DIR/fleet/$RQ"
+if [[ -z "$OPT_SID_FILE" ]]; then
+  OPT_SID_FILE="$COORD/$MODULE.sid"
+fi
+mkdir -p "$COORD"
+
+if [[ -x "$COORD_BIN" ]]; then
+  if [[ "$OPT_JOIN" -eq 1 ]]; then
+    "$COORD_BIN" --check-join "$(dirname "$OPT_SID_FILE")" "$MODULE" --join
+  else
+    "$COORD_BIN" --check-join "$(dirname "$OPT_SID_FILE")" "$MODULE"
+  fi
+  GRC=$?
+  [[ "$GRC" -eq 6 ]] && exit 6
+fi
+
+CODEX_BIN="$(discover_codex_bin || true)"
+if [[ -z "$CODEX_BIN" || ! -x "$CODEX_BIN" ]]; then
+  echo "❌ 找不到 Codex 可执行文件。请设置 CODEX_CLI_PATH 或传 --codex-bin。" >&2
+  exit 8
+fi
+OPT_CODEX_BIN="$CODEX_BIN"
+
+INT_BRANCH="$(env_get FLEET_BASE_BRANCH || true)"
+[[ -n "$INT_BRANCH" ]] || INT_BRANCH="fleet/$RQ"
+if ! git -C "$GIT_TOP" show-ref --verify --quiet "refs/heads/$INT_BRANCH"; then
+  echo "❌ 集成分支 $INT_BRANCH 不存在。主 session 应先运行：cc-fleet-coord --init-base $RQ" >&2
+  exit 7
+fi
+
+REL_CWD="."
+if [[ "$CWD_ABS" != "$GIT_TOP" ]]; then
+  REL_CWD="${CWD_ABS#"$GIT_TOP"/}"
+fi
+MODULE_SLUG="$(slugify "$MODULE")"
+RQ_SLUG="$(slugify "$RQ")"
+if [[ -n "$OPT_WORKTREE_DIR" ]]; then
+  WT_ROOT="$OPT_WORKTREE_DIR"
+else
+  WT_ROOT="$GIT_TOP/.claude/worktrees/${RQ_SLUG}-${MODULE_SLUG}-codex-app"
+fi
+if [[ -e "$WT_ROOT" ]]; then
+  WT_ROOT="${WT_ROOT}-$(date +%H%M%S)-$$"
+fi
+WT_CWD="$WT_ROOT"
+[[ "$REL_CWD" == "." ]] || WT_CWD="$WT_ROOT/$REL_CWD"
+WORKER_BRANCH="fleet-worker/$RQ/$MODULE_SLUG-codex-app"
+if git -C "$GIT_TOP" show-ref --verify --quiet "refs/heads/$WORKER_BRANCH"; then
+  WORKER_BRANCH="$WORKER_BRANCH-$(date +%H%M%S)-$$"
+fi
+
+CODEX_SPEED="1x"
+SERVICE_TIER_VALUE="default"
+if [[ "$OPT_FAST" -eq 1 ]]; then
+  CODEX_SPEED="fast"
+  SERVICE_TIER_VALUE="priority"
+fi
+APP_THREAD_SOURCE="${CODEX_APP_THREAD_SOURCE:-user}"
+
+APP_VISIBLE_MATCHED=0
+APP_VISIBLE_REASON="fallback-cwd"
+APP_VISIBLE_SAVED_PROJECT=""
+if [[ -n "$OPT_APP_VISIBLE_CWD" ]]; then
+  APP_VISIBLE_CWD="$(cd "$OPT_APP_VISIBLE_CWD" 2>/dev/null && pwd -P)" || die_usage "--app-visible-cwd not a directory: $OPT_APP_VISIBLE_CWD"
+  APP_VISIBLE_SAVED_PROJECT="$(saved_codex_project_for "$APP_VISIBLE_CWD" || true)"
+  if [[ -n "$APP_VISIBLE_SAVED_PROJECT" ]]; then
+    APP_VISIBLE_MATCHED=1
+    APP_VISIBLE_REASON="explicit-saved-project"
+  else
+    APP_VISIBLE_REASON="explicit-unmatched-project"
+  fi
+else
+  APP_VISIBLE_SAVED_PROJECT="$(saved_codex_project_for "$CWD_ABS" || true)"
+  if [[ -n "$APP_VISIBLE_SAVED_PROJECT" ]]; then
+    APP_VISIBLE_CWD="$APP_VISIBLE_SAVED_PROJECT"
+    APP_VISIBLE_MATCHED=1
+    APP_VISIBLE_REASON="saved-project"
+  else
+    APP_VISIBLE_CWD="$CWD_ABS"
+    APP_VISIBLE_REASON="fallback-cwd"
+  fi
+fi
+
+VISIBILITY_PIN_REQUESTED=0
+VISIBILITY_PIN_REASON="$APP_VISIBLE_REASON"
+case "$OPT_PIN_POLICY" in
+  auto)
+    if [[ "$APP_VISIBLE_MATCHED" -eq 1 ]]; then
+      VISIBILITY_PIN_REQUESTED=0
+      VISIBILITY_PIN_REASON="$APP_VISIBLE_REASON"
+    else
+      VISIBILITY_PIN_REQUESTED=1
+      VISIBILITY_PIN_REASON="unmatched-project"
+    fi
+    ;;
+  always)
+    VISIBILITY_PIN_REQUESTED=1
+    VISIBILITY_PIN_REASON="forced"
+    ;;
+  never)
+    VISIBILITY_PIN_REQUESTED=0
+    VISIBILITY_PIN_REASON="disabled"
+    ;;
+esac
+
+if [[ -n "$OPT_PROMPT_FILE" ]]; then
+  PROMPT_SRC="$OPT_PROMPT_FILE"
+elif [[ -n "$OPT_PROMPT" ]]; then
+  mkdir -p "$COORD/prompts"
+  PROMPT_SRC="$COORD/prompts/${MODULE}.codex-app.input.md"
+  printf '%s\n' "$OPT_PROMPT" > "$PROMPT_SRC"
+elif [[ ! -t 0 ]]; then
+  mkdir -p "$COORD/prompts"
+  PROMPT_SRC="$COORD/prompts/${MODULE}.codex-app.input.md"
+  cat > "$PROMPT_SRC"
+else
+  die_usage "prompt required (--prompt / --prompt-file / stdin)"
+fi
+[[ -f "$PROMPT_SRC" ]] || die_usage "prompt file not found: $PROMPT_SRC"
+
+mkdir -p "$COORD/prompts" "$COORD/app-json"
+RUN_PROMPT="$COORD/prompts/${MODULE}.codex-app.prompt.md"
+CONTEXT_PROMPT="$COORD/prompts/${MODULE}.codex-app.context.md"
+VISIBLE_PROMPT="$COORD/prompts/${MODULE}.codex-app.visible.md"
+META_FILE="$COORD/${MODULE}.codex-app.env"
+SUMMARY_FILE="$COORD/${MODULE}.summary.md"
+THREAD_START_PARAMS="$COORD/app-json/${MODULE}.thread-start.json"
+SET_NAME_PARAMS="$COORD/app-json/${MODULE}.set-name.json"
+TURN_START_PARAMS="$COORD/app-json/${MODULE}.turn-start.json"
+THREAD_RESUME_PARAMS="$COORD/app-json/${MODULE}.thread-resume.json"
+THREAD_UNARCHIVE_PARAMS="$COORD/app-json/${MODULE}.thread-unarchive.json"
+
+if [[ "$OPT_DRY_RUN" -eq 1 ]]; then
+  echo "[dry-run] codex bin: $CODEX_BIN"
+  echo "[dry-run] app call helper: $APP_CALL_BIN"
+  echo "[dry-run] cwd: $CWD_ABS"
+  echo "[dry-run] git top: $GIT_TOP"
+  echo "[dry-run] worktree root: $WT_ROOT"
+  echo "[dry-run] worktree cwd: $WT_CWD"
+  echo "[dry-run] app visible cwd: $APP_VISIBLE_CWD"
+  echo "[dry-run] app visible saved project: ${APP_VISIBLE_SAVED_PROJECT:-<none>}"
+  echo "[dry-run] app visible reason: $APP_VISIBLE_REASON"
+  echo "[dry-run] visibility pin policy: $OPT_PIN_POLICY"
+  echo "[dry-run] visibility pin requested: $VISIBILITY_PIN_REQUESTED ($VISIBILITY_PIN_REASON)"
+  echo "[dry-run] worker branch: $WORKER_BRANCH"
+  echo "[dry-run] integration branch: $INT_BRANCH"
+  echo "[dry-run] serviceTier: $SERVICE_TIER_VALUE"
+  echo "[dry-run] app threadSource: $APP_THREAD_SOURCE"
+  echo "[dry-run] thread title: $OPT_NAME"
+  exit 0
+fi
+
+mkdir -p "$(dirname "$WT_ROOT")" || {
+  echo "❌ 无法创建 worktree 父目录: $(dirname "$WT_ROOT")" >&2
+  exit 7
+}
+if ! git -C "$GIT_TOP" worktree add -b "$WORKER_BRANCH" "$WT_ROOT" "$INT_BRANCH" >/dev/null 2>&1; then
+  echo "❌ 创建 Codex App worker worktree 失败: $WT_ROOT" >&2
+  exit 7
+fi
+if ! git -C "$WT_ROOT" reset --hard "$INT_BRANCH" >/dev/null 2>&1; then
+  echo "❌ worktree reset 到 $INT_BRANCH 失败: $WT_ROOT" >&2
+  exit 7
+fi
+if [[ ! -d "$WT_CWD" ]]; then
+  echo "❌ worktree 中不存在派发 cwd 对应子目录: $WT_CWD" >&2
+  exit 7
+fi
+
+write_full_prompt "$PROMPT_SRC" "$RUN_PROMPT"
+write_context_prompt "$CONTEXT_PROMPT"
+write_visible_prompt "$PROMPT_SRC" "$VISIBLE_PROMPT"
+
+write_json_params thread-start "$THREAD_START_PARAMS"
+THREAD_RESULT="$(app_call "thread/start" "$THREAD_START_PARAMS")" || {
+  echo "❌ 创建 Codex App thread 失败。worktree 已保留: $WT_ROOT" >&2
+  exit 9
+}
+THREAD_ID="$(printf '%s' "$THREAD_RESULT" | node -e 'let s="";process.stdin.on("data",b=>s+=b);process.stdin.on("end",()=>{const r=JSON.parse(s); console.log(r.thread && r.thread.id ? r.thread.id : "");})')"
+if [[ -z "$THREAD_ID" ]]; then
+  echo "❌ Codex App thread/start 未返回 thread.id。worktree 已保留: $WT_ROOT" >&2
+  exit 9
+fi
+
+write_json_params set-name "$SET_NAME_PARAMS"
+app_call "thread/name/set" "$SET_NAME_PARAMS" >/dev/null || true
+write_json_params thread-unarchive "$THREAD_UNARCHIVE_PARAMS"
+app_call "thread/unarchive" "$THREAD_UNARCHIVE_PARAMS" >/dev/null 2>&1 || true
+
+CONTEXT_INJECTED=0
+[[ -s "$CONTEXT_PROMPT" ]] && CONTEXT_INJECTED=1
+CONTEXT_INJECT_ERROR=""
+
+write_json_params turn-start "$TURN_START_PARAMS"
+TURN_RESULT="$(app_call "turn/start" "$TURN_START_PARAMS")" || {
+  echo "❌ 向 Codex App thread 发送任务失败。thread=$THREAD_ID worktree=$WT_ROOT" >&2
+  exit 9
+}
+TURN_ID="$(printf '%s' "$TURN_RESULT" | node -e 'let s="";process.stdin.on("data",b=>s+=b);process.stdin.on("end",()=>{const r=JSON.parse(s); console.log(r.turn && r.turn.id ? r.turn.id : "");})')"
+
+LIVE_RESUME_APPLIED=0
+LIVE_RESUME_ERROR=""
+VISIBILITY_UNARCHIVE_APPLIED=0
+VISIBILITY_UNARCHIVE_ERROR=""
+write_json_params thread-resume "$THREAD_RESUME_PARAMS"
+if UNARCHIVE_OUTPUT="$(app_call "thread/unarchive" "$THREAD_UNARCHIVE_PARAMS" 2>&1)"; then
+  VISIBILITY_UNARCHIVE_APPLIED=1
+else
+  VISIBILITY_UNARCHIVE_ERROR="$UNARCHIVE_OUTPUT"
+fi
+if LIVE_RESUME_OUTPUT="$(app_call "thread/resume" "$THREAD_RESUME_PARAMS" 2>&1)"; then
+  LIVE_RESUME_APPLIED=1
+else
+  LIVE_RESUME_ERROR="$LIVE_RESUME_OUTPUT"
+  echo "⚠ Codex App live 加载 thread 失败，worker 仍已启动。thread=$THREAD_ID worktree=$WT_ROOT" >&2
+fi
+LIVE_RESUME_ERROR="${LIVE_RESUME_ERROR//$'\r'/ }"
+LIVE_RESUME_ERROR="${LIVE_RESUME_ERROR//$'\n'/ }"
+VISIBILITY_UNARCHIVE_ERROR="${VISIBILITY_UNARCHIVE_ERROR//$'\r'/ }"
+VISIBILITY_UNARCHIVE_ERROR="${VISIBILITY_UNARCHIVE_ERROR//$'\n'/ }"
+
+PIN_APPLIED=0
+PIN_ERROR=""
+if [[ "$VISIBILITY_PIN_REQUESTED" -eq 1 ]]; then
+  if [[ ! -x "$PIN_BIN" ]]; then
+    PIN_ERROR="pin helper not executable: $PIN_BIN"
+    echo "⚠ Codex App 临时 pin 失败：$PIN_ERROR" >&2
+  elif PIN_OUTPUT="$("$PIN_BIN" pin "$THREAD_ID" 2>&1)"; then
+    PIN_APPLIED=1
+  else
+    PIN_ERROR="$PIN_OUTPUT"
+    echo "⚠ Codex App 临时 pin 失败：${PIN_ERROR:-unknown error}" >&2
+  fi
+fi
+PIN_ERROR="${PIN_ERROR//$'\r'/ }"
+PIN_ERROR="${PIN_ERROR//$'\n'/ }"
+
+cat > "$META_FILE" <<EOF
+id=$THREAD_ID
+thread_id=$THREAD_ID
+turn_id=$TURN_ID
+rq=$RQ
+module=$MODULE
+name=$OPT_NAME
+started_at=$(date +%s)
+codex_bin=$CODEX_BIN
+speed=$CODEX_SPEED
+service_tier=$SERVICE_TIER_VALUE
+app_thread_source=$APP_THREAD_SOURCE
+cwd=$CWD_ABS
+worktree_root=$WT_ROOT
+worktree_cwd=$WT_CWD
+app_visible_cwd=$APP_VISIBLE_CWD
+app_visible_saved_project=$APP_VISIBLE_SAVED_PROJECT
+app_visible_matched=$APP_VISIBLE_MATCHED
+app_visible_reason=$APP_VISIBLE_REASON
+thread_cwd=$APP_VISIBLE_CWD
+branch=$WORKER_BRANCH
+integration_branch=$INT_BRANCH
+prompt=$RUN_PROMPT
+context_prompt=$CONTEXT_PROMPT
+visible_prompt=$VISIBLE_PROMPT
+context_injected=$CONTEXT_INJECTED
+context_inject_error=$CONTEXT_INJECT_ERROR
+live_resume_applied=$LIVE_RESUME_APPLIED
+live_resume_error=$LIVE_RESUME_ERROR
+visibility_unarchive_applied=$VISIBILITY_UNARCHIVE_APPLIED
+visibility_unarchive_error=$VISIBILITY_UNARCHIVE_ERROR
+summary_file=$SUMMARY_FILE
+mode=codex-app
+visibility_pin_policy=$OPT_PIN_POLICY
+visibility_pin_requested=$VISIBILITY_PIN_REQUESTED
+visibility_pin_reason=$VISIBILITY_PIN_REASON
+visibility_pinned=$PIN_APPLIED
+visibility_pin_error=$PIN_ERROR
+visibility_unpinned=0
+EOF
+
+printf '%s\n' "$THREAD_ID" > "$OPT_SID_FILE" || {
+  echo "⚠ 无法写 --sid-file ${OPT_SID_FILE}（不影响已启动，但 status-codex-app 将无法从 sid 兜底）" >&2
+}
+
+if [[ "$OPT_JSON" -eq 1 ]]; then
+  printf '{"ok":true,"threadId":"%s","turnId":"%s","rq":"%s","module":"%s","worktree":"%s","appVisibleCwd":"%s","visibilityPinned":%s}\n' \
+    "$THREAD_ID" "$TURN_ID" "$RQ" "$MODULE" "$WT_ROOT" "$APP_VISIBLE_CWD" "$([[ "$PIN_APPLIED" -eq 1 ]] && echo true || echo false)"
+else
+  echo "✅ codex app thread dispatched  thread=$THREAD_ID  turn=$TURN_ID  module=$MODULE  rq=$RQ"
+  echo "   title=$OPT_NAME"
+  echo "   worktree=$WT_ROOT"
+  echo "   app-visible=$APP_VISIBLE_CWD  pin=$PIN_APPLIED/$VISIBILITY_PIN_REQUESTED ($VISIBILITY_PIN_REASON)"
+fi

@@ -1,0 +1,266 @@
+#!/usr/bin/env perl
+# cc-fleet-kill — 取消/终止某个（或某 RQ 下全部）正在跑的子 session（worker）。
+#
+# 用途：worker 跑偏 / 卡死 / 不再需要时，主 session 直接终止它，不必去 FleetView 手点 kill。
+#
+# 协议：daemon control socket 的 `kill` op（见 reference/PROTOCOL.md §5）：
+#   {"proto":1,"op":"kill","short":"<8hex>","signal":"SIGTERM"|"SIGKILL"} → {"ok":true} / {"ok":false,"code":"ENOJOB"}
+#   ⚠ kill 用的是 daemon 的 **short（8 位 hex）**，不是 .sid 里的 sessionId（UUID）。
+#     本脚本复用 `cc-fleet-status <RQ> --json`（单一事实源）把 <module> 解析成它【当前 live job 的 short】。
+#   注意：kill 只是终止进程，**不删除**会话尾迹/回执——已落盘的 <module>.summary.md 仍可被 cc-fleet-summary 收。
+#
+# 用法:
+#   cc-fleet-kill <RQ> <module>                     # SIGTERM 该模块的 worker
+#   cc-fleet-kill <RQ> <module> --signal SIGKILL    # 强杀
+#   cc-fleet-kill <RQ> --all                        # 终止该 RQ 名册里所有【在跑】的 worker
+#   cc-fleet-kill --short <8hex>                     # 直接 kill 某个 short
+#   cc-fleet-kill <RQ> <module> --dry-run           # 只解析+打印将 kill 谁，不真杀
+#
+# 退出码:
+#   0  全部目标 kill 成功（或 --all 下至少一个成功、其余本就已结束）
+#   2  daemon 不可达 / 解析不到任何 live 目标
+#   3  目标已结束（ENOJOB）/ proto 拒
+#   4  daemon 其他业务错误
+#   5  参数错误
+
+use strict;
+use warnings;
+use IO::Socket::UNIX;
+use File::Basename qw(dirname);
+use Cwd qw(abs_path);
+
+binmode(STDOUT, ':raw');
+binmode(STDERR, ':raw');
+
+my ($rq, $module, $short, $coord, $all, $dry_run, $help, $mock_status);
+my $signal = 'SIGTERM';
+my @pos;
+my @argv = @ARGV;
+while (@argv) {
+  my $a = shift @argv;
+  if    ($a eq '--short')       { $short = shift @argv }
+  elsif ($a eq '--coord')       { $coord = shift @argv }
+  elsif ($a eq '--signal')      { $signal = shift @argv }
+  elsif ($a eq '--all')         { $all = 1 }
+  elsif ($a eq '--mock-status') { $mock_status = shift @argv }  # 测试用：从文件读 cc-fleet-status --json
+  elsif ($a eq '--dry-run')     { $dry_run = 1 }
+  elsif ($a eq '-h' || $a eq '--help') { $help = 1 }
+  elsif ($a =~ /^--/)       { die_usage("未知参数: $a") }
+  else                      { push @pos, $a }
+}
+if ($help) { print_usage(); exit 0 }
+die_usage("--signal 只能是 SIGTERM 或 SIGKILL") unless $signal eq 'SIGTERM' || $signal eq 'SIGKILL';
+
+# 目标集合：[ [label, short, state], ... ]
+my @targets;
+if (defined $short) {
+  die_usage("short 形如 8 位 hex，收到: $short") unless $short =~ /^[a-f0-9]{8}$/;
+  push @targets, [$short, $short, '?'];
+} else {
+  $rq     = shift @pos if @pos;
+  $module = shift @pos if @pos && !$all;
+  die_usage("缺 <RQ>（或用 --short <8hex>）") unless defined $rq;
+  die_usage("缺 <module>（或加 --all 杀整个 RQ）") unless $all || defined $module;
+
+  my ($jobs, $err) = list_rq_jobs($rq, $coord);
+  unless (defined $jobs) { warn "❌ $err\n"; exit 2 }
+
+  if ($all) {
+    for my $j (@$jobs) {
+      my $mod = $j->{_module} // $j->{short} // '?';
+      my $st  = $j->{state} // '?';
+      next if $st eq 'gone' || $st eq 'done';        # 终态（已结束/被回收），无需 kill
+      my $s = $j->{short} // '';
+      next unless $s =~ /^[a-f0-9]{8}$/;
+      push @targets, [$mod, $s, $st];
+    }
+    unless (@targets) { warn "⚠ $rq 名册里没有【在跑】的 worker（都已 done/gone）——无可 kill 对象。\n"; exit 2 }
+  } else {
+    my $hit;
+    for my $j (@$jobs) { if (defined $j->{_module} && $j->{_module} eq $module) { $hit = $j; last } }
+    unless ($hit) { warn "❌ $rq 名册里没有 module=$module（确认 --sid-file <COORD>/$module.sid）\n"; exit 2 }
+    my $st = $hit->{state} // '?';
+    if ($st eq 'gone' || $st eq 'done') { warn "⚠ module=$module 已 $st（已结束）——无需 kill。去 cc-fleet-summary 收回执。\n"; exit 3 }
+    my $s = $hit->{short} // '';
+    unless ($s =~ /^[a-f0-9]{8}$/) { warn "❌ module=$module 解析不到有效 short（state=$st）\n"; exit 2 }
+    push @targets, [$module, $s, $st];
+  }
+}
+
+# 2.1.169+ 控制密钥鉴权：kill 是写操作，须带 auth=控制密钥（缺失则不带，兼容旧版）
+my $ckey = load_control_key();
+my @auth = (defined $ckey && length $ckey) ? (auth => $ckey) : ();
+
+if ($dry_run) {
+  for my $t (@targets) {
+    my ($label, $s, $st) = @$t;
+    print "would kill → $label (short=$s, state=$st, signal=$signal)\n";
+    print to_json({ proto => 1, op => 'kill', short => $s, signal => $signal, @auth }), "\n";
+  }
+  exit 0;
+}
+
+my $sock = find_control_sock();
+unless ($sock && -S $sock) {
+  warn "❌ daemon control socket 找不到（先 `claude agents --json` 拉起 daemon）。\n";
+  exit 2;
+}
+
+my ($ok_n, $gone_n, $err_n) = (0, 0, 0);
+my $last_bad = 4;
+for my $t (@targets) {
+  my ($label, $s, $st) = @$t;
+  my $resp = send_request($sock, { proto => 1, op => 'kill', short => $s, signal => $signal, @auth });
+  my $parsed = parse_json($resp);
+  if ($parsed && $parsed->{ok}) {
+    print "✅ killed $label (short=$s, $signal)\n";
+    $ok_n++;
+    next;
+  }
+  my $code = $parsed ? ($parsed->{code} // 'EUNKNOWN') : 'EUNPARSED';
+  my $errm = $parsed ? ($parsed->{error} // 'unknown') : $resp;
+  if ($code eq 'ENOJOB') {
+    print "⚠ $label (short=$s) 已结束（ENOJOB）——无需 kill。\n";
+    $gone_n++; $last_bad = 3;
+  } elsif ($code eq 'EPROTO') {
+    warn "❌ proto 不匹配（server=", ($parsed->{serverProto}//'?'), "）：协议升级了，去 FleetView 手动 kill 或更新 PROTOCOL.md。\n";
+    $err_n++; $last_bad = 3;
+  } else {
+    warn "❌ kill $label (short=$s) 失败: [$code] $errm\n";
+    $err_n++; $last_bad = 4;
+  }
+}
+
+# 汇总退出码：有成功就 0；否则按最后一类失败返回（全 gone→3，含其他错→last_bad）
+exit 0 if $ok_n > 0;
+exit $last_bad;
+
+# ---------------- helpers ----------------
+
+# 复用 cc-fleet-status --json 取该 RQ 的 jobs（带 _module/short/state，单一事实源）。
+# --mock-status FILE 时从文件读（测试用）。返回 (\@jobs, undef) 成功 / (undef, errmsg) 失败。
+sub list_rq_jobs {
+  my ($rq, $coord) = @_;
+  my $out;
+  if (defined $mock_status) {
+    open my $fh, '<', $mock_status or return (undef, "打不开 --mock-status $mock_status: $!");
+    local $/; $out = <$fh>; close $fh;
+  } else {
+    my $status_bin = sibling('cc-fleet-status');
+    return (undef, "找不到同目录 cc-fleet-status（解析 module→short 依赖它）") unless -x $status_bin;
+    my @cmd = ($status_bin, $rq, '--json');
+    push @cmd, ('--coord', $coord) if defined $coord && length $coord;
+    my $pid = open(my $fh, '-|');
+    return (undef, "fork cc-fleet-status 失败: $!") unless defined $pid;
+    if ($pid == 0) { open(STDERR, '>', '/dev/null'); exec @cmd; exit 127 }
+    { local $/; $out = <$fh> }
+    close $fh;
+  }
+  my $data = parse_json($out);
+  return (undef, "cc-fleet-status 无 JSON 输出（daemon 不可达？先 `claude agents --json`）")
+    unless $data && ref($data->{jobs}) eq 'ARRAY';
+  return ($data->{jobs}, undef);
+}
+
+sub sibling { my $name = shift; return dirname(abs_path($0)) . "/$name" }
+
+sub find_control_sock {
+  my $base = "/tmp/cc-daemon-$<";
+  return undef unless -d $base;
+  opendir my $dh, $base or return undef;
+  my @dirs = grep { /^[a-f0-9]{8}$/ && -d "$base/$_" } readdir $dh;
+  closedir $dh;
+  for my $d (sort @dirs) {
+    my $s = "$base/$d/control.sock";
+    return $s if -S $s;
+  }
+  return undef;
+}
+
+# 读 daemon 控制密钥：环境变量 > ~/.claude/daemon/control.key（2.1.169+ 鉴权）
+sub load_control_key {
+  for my $ev (qw(CLAUDE_DAEMON_CONTROL_KEY CLAUDE_BG_CONTROL_AUTH)) {
+    return $ENV{$ev} if defined $ENV{$ev} && length $ENV{$ev};
+  }
+  my $home = $ENV{HOME} // (getpwuid($<))[7];
+  return undef unless defined $home;
+  my $kf = "$home/.claude/daemon/control.key";
+  return undef unless -r $kf;
+  open my $fh, '<', $kf or return undef;
+  local $/; my $k = <$fh>; close $fh;
+  return undef unless defined $k;
+  $k =~ s/^\s+//; $k =~ s/\s+$//;
+  return length $k ? $k : undef;
+}
+
+sub send_request {
+  my ($path, $obj) = @_;
+  my $s = IO::Socket::UNIX->new(Peer => $path, Type => SOCK_STREAM)
+    or do { warn "❌ connect $path: $!\n"; exit 2 };
+  binmode($s, ':raw');
+  print $s to_json($obj) . "\n";
+  my $reply = '';
+  eval {
+    local $SIG{ALRM} = sub { die "timeout\n" };
+    alarm 30;
+    while (my $l = <$s>) { $reply .= $l; last if length($reply) > 65536 }
+    alarm 0;
+  };
+  close $s;
+  return $reply;
+}
+
+sub to_json {
+  my ($v) = @_;
+  my $r = ref($v);
+  if ($r eq 'HASH')  { return '{' . join(',', map { json_str($_) . ':' . to_json($v->{$_}) } sort keys %$v) . '}' }
+  if ($r eq 'ARRAY') { return '[' . join(',', map { to_json($_) } @$v) . ']' }
+  if (!defined $v)   { return 'null' }
+  if ($v =~ /^-?\d+(\.\d+)?$/) { return "$v" }
+  return json_str($v);
+}
+sub json_str {
+  my ($s) = @_;
+  $s =~ s/\\/\\\\/g; $s =~ s/"/\\"/g;
+  $s =~ s/\n/\\n/g;  $s =~ s/\r/\\r/g; $s =~ s/\t/\\t/g;
+  $s =~ s/([\x00-\x1f])/sprintf("\\u%04x", ord($1))/ge;
+  return qq("$s");
+}
+sub parse_json {
+  my ($s) = @_;
+  return undef unless defined $s && length $s;
+  eval { require JSON::PP } or do {
+    my %h;
+    while ($s =~ /"(ok|op|code|error|serverProto|short|state|_module)":\s*(true|false|"((?:[^"\\]|\\.)*)"|(-?\d+))/g) {
+      my ($k, $raw, $sv, $nv) = ($1, $2, $3, $4);
+      $h{$k} = defined($sv) ? $sv : (defined($nv) ? 0+$nv : ($raw eq 'true' ? 1 : 0));
+    }
+    return \%h;
+  };
+  return eval { JSON::PP->new->utf8->decode($s) };
+}
+
+sub die_usage { my $m = shift; warn "❌ $m\n"; print_usage(); exit 5 }
+
+sub print_usage {
+  print <<'EOF';
+cc-fleet-kill — 取消/终止某个（或某 RQ 下全部）正在跑的子 session（worker）
+
+用法:
+  cc-fleet-kill <RQ> <module>                   # SIGTERM 该模块 worker
+  cc-fleet-kill <RQ> <module> --signal SIGKILL  # 强杀
+  cc-fleet-kill <RQ> --all                      # 终止该 RQ 所有在跑 worker
+  cc-fleet-kill --short <8hex>                   # 直接 kill 某 short
+
+选项:
+  --short <8hex>   直接指定 daemon short（跳过 RQ/module 解析）
+  --all            kill 该 RQ 名册里所有【在跑】的 worker（done/gone 跳过）
+  --signal SIG     SIGTERM（默认）或 SIGKILL
+  --coord DIR      显式协调目录（透传给 cc-fleet-status 做解析）
+  --dry-run        只解析+打印将 kill 谁，不真杀
+  -h, --help       本帮助
+
+说明: kill 只终止进程，不删回执——已落盘的 <module>.summary.md 仍可被 cc-fleet-summary 收。
+退出码: 0=至少一个成功 / 2=daemon不可达或无live目标 / 3=已结束(ENOJOB)或proto拒 / 4=其他错误 / 5=参数错误
+EOF
+}

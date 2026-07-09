@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# cc-fleet-init — 一次性任务初始化：主 session 派发前的【唯一入口】。
+#
+# 存在意义（根治「编号重复」）：以前派发前要【手动串三条】cc-fleet-coord 命令
+#   （--alloc 取号 / 解析 COORD / --init-base 建集成分支），任何一条被漏掉或凭"今天+NNN"
+#   手拼编号，就会复用别任务的协调目录 → .sid/回执串台、Monitor 盯错 RQ、job 列表编号重复。
+#   本脚本把四件事收敛成【一条 eval】，从结构上砍掉"绕过 --alloc / 手拼编号"的机会：
+#     ① GC：删 canonical fleet 里 >7 天的旧协调目录 + 过期序号池文件（可 --no-gc / --gc-days N）
+#     ② --alloc：从【持久序号池 .seq/<stem> + 原子锁】取全新单调 RQ，目录被清也永不回退重号
+#     ③ 解析 canonical COORD（<git-common-dir>/fleet/<RQ>，worktree 无关绝对路径）
+#     ④ --init-base：在 base（默认当前分支）上幂等建集成分支 fleet/<RQ>，并把任务信息写进 <COORD>/task.meta
+#
+# 用法（主 session 在项目目录、发起任务时的开发分支上跑一次）：
+#     eval "$(~/.claude/skills/multi-session-dev/scripts/cc-fleet-init)"
+#   之后 $RQ / $COORD / $INT 三个 shell 变量就绪：
+#     • $RQ    = 全新单调 RQ-id（如 RQ-2026-0703-002）
+#     • $COORD = canonical 协调目录绝对路径（作 dispatch 的 {{COORD_DIR}} / --sid-file "$COORD/<m>.sid"）
+#     • $INT   = 集成分支 fleet/<RQ>（作 dispatch 的 --env FLEET_BASE_BRANCH="$INT"）
+#
+# 选项:
+#   --base <branch>   显式指定集成分支的 base（默认=当前分支；detached HEAD 必须给）
+#   --no-init-base    跳过建集成分支（$INT 输出为空；非分支落地模型 / 只要 RQ+COORD 时用）
+#   --no-gc           本次不做 GC
+#   --gc-days N       GC 保留窗口天数（默认 7）
+#   [stem|ISO日期]    自定义 RQ 前缀或指定日期（默认今天 RQ-<YYYY>-<MMDD>）
+#
+# 输出契约：stdout 只打印【可 eval 的三行】RQ=.. / COORD=.. / INT=..（%q 安全转义）；
+#   一切诊断/进度走 stderr —— 所以 `eval "$(cc-fleet-init)"` 干净，不会把日志 eval 进 shell。
+#
+# 退出码: 0 成功 / 2 用法错或分配/建分支失败（stderr 有原因）
+
+set -uo pipefail
+
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+COORD_BIN="$SELF_DIR/cc-fleet-coord"
+[[ -x "$COORD_BIN" ]] || { echo "❌ 找不到可执行的 cc-fleet-coord：$COORD_BIN" >&2; exit 2; }
+
+BASE=""; DO_INITBASE=1; DO_GC=1; GC_DAYS=7; STEM=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --base)         BASE="${2:-}"; shift 2 ;;
+    --no-init-base) DO_INITBASE=0; shift ;;
+    --no-gc)        DO_GC=0; shift ;;
+    --gc-days)      GC_DAYS="${2:-7}"; shift 2 ;;
+    -*)             echo "未知选项: $1" >&2; exit 2 ;;
+    *)              STEM="$1"; shift ;;
+  esac
+done
+
+# ① GC（幂等；失败不阻断初始化）
+if [[ "$DO_GC" -eq 1 ]]; then
+  "$COORD_BIN" --gc "$GC_DAYS" || echo "⚠ GC 失败（忽略，继续初始化）" >&2
+fi
+
+# ② 取全新单调 RQ（持久序号池 + 原子锁，永不重号）
+if [[ -n "$STEM" ]]; then
+  RQ="$("$COORD_BIN" --alloc "$STEM")"
+else
+  RQ="$("$COORD_BIN" --alloc)"
+fi
+[[ -n "${RQ:-}" ]] || { echo "❌ 分配 RQ 失败（cc-fleet-coord --alloc 返回空）。是否在 git 仓库内？" >&2; exit 2; }
+
+# ③ 解析 canonical COORD
+COORD="$("$COORD_BIN" "$RQ")"
+[[ -n "${COORD:-}" && -d "$COORD" ]] || { echo "❌ 解析 COORD 失败：$COORD" >&2; exit 2; }
+
+# ④ 建集成分支 fleet/<RQ>（可关）
+INT=""
+if [[ "$DO_INITBASE" -eq 1 ]]; then
+  if [[ -n "$BASE" ]]; then
+    INT="$("$COORD_BIN" --init-base "$RQ" "$BASE")" || true
+  else
+    INT="$("$COORD_BIN" --init-base "$RQ")" || true
+  fi
+  [[ -n "${INT:-}" ]] || {
+    echo "❌ 建集成分支失败。detached HEAD 请显式 --base <branch>，或加 --no-init-base 跳过。" >&2
+    exit 2; }
+fi
+
+# 任务信息落盘 <COORD>/task.meta（纯记录，供人事后追溯本轮 RQ 是谁、何时、从哪条分支起的）
+BR="$(git symbolic-ref --short -q HEAD 2>/dev/null || echo '(detached)')"
+{
+  echo "rq=$RQ"
+  echo "allocated_at=$(date '+%Y-%m-%d %H:%M:%S')"
+  echo "base_branch=${BASE:-$BR}"
+  echo "integration_branch=${INT:-'(none)'}"
+  echo "cwd=$(pwd)"
+} > "$COORD/task.meta" 2>/dev/null || echo "⚠ 写 task.meta 失败（忽略）" >&2
+
+echo "✅ 任务初始化完成：RQ=${RQ}  COORD=${COORD}  集成分支=${INT:-'(无)'}" >&2
+
+# stdout：可 eval 的三变量（%q 安全转义，防路径带空格/特殊字符）
+printf 'RQ=%q\n'    "$RQ"
+printf 'COORD=%q\n' "$COORD"
+printf 'INT=%q\n'   "$INT"

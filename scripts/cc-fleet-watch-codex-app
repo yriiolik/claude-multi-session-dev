@@ -1,0 +1,116 @@
+#!/usr/bin/env node
+// cc-fleet-watch-codex-app — monitor Codex App visible worker threads.
+
+const { spawnSync } = require("child_process");
+const path = require("path");
+
+let rq = "";
+let coord = "";
+let wait = false;
+let interval = 20;
+let heartbeat = 240;
+let maxLoops = 0;
+let once = false;
+let codexBin = "";
+let startAppServer = false;
+
+function usage() {
+  console.error("cc-fleet-watch-codex-app <RQ-id> [--coord DIR] [--wait] [--interval SEC] [--heartbeat SEC] [--max-loops N]");
+}
+
+for (let i = 2; i < process.argv.length; i++) {
+  const a = process.argv[i];
+  if (a === "--coord") coord = process.argv[++i] || "";
+  else if (a === "--wait") wait = true;
+  else if (a === "--once") once = true;
+  else if (a === "--interval") interval = Number(process.argv[++i] || "20");
+  else if (a === "--heartbeat") heartbeat = Number(process.argv[++i] || "240");
+  else if (a === "--max-loops") maxLoops = Number(process.argv[++i] || "0");
+  else if (a === "--codex-bin") codexBin = process.argv[++i] || "";
+  else if (a === "--start-app-server") startAppServer = true;
+  else if (a === "-h" || a === "--help") { usage(); process.exit(0); }
+  else if (a.startsWith("-")) { console.error(`unknown flag: ${a}`); process.exit(5); }
+  else rq = a;
+}
+
+if (!rq) {
+  usage();
+  process.exit(5);
+}
+
+const statusBin = path.join(__dirname, "cc-fleet-status-codex-app");
+const settled = new Set();
+const failed = new Set();
+const known = new Set();
+let lastEmit = Date.now();
+let loops = 0;
+
+function emit(msg) {
+  lastEmit = Date.now();
+  console.log(msg);
+}
+
+function fetchStatus() {
+  const args = [rq, "--json"];
+  if (coord) args.push("--coord", coord);
+  if (codexBin) args.push("--codex-bin", codexBin);
+  if (startAppServer) args.push("--start-app-server");
+  const res = spawnSync(statusBin, args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  let data = null;
+  try { data = JSON.parse(res.stdout); } catch {}
+  return { rc: res.status ?? 1, data, raw: res.stdout || res.stderr || "" };
+}
+
+function sleep(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+while (true) {
+  loops++;
+  const { rc, data, raw } = fetchStatus();
+  if (rc === 2 && (!data || !Array.isArray(data.jobs))) {
+    if (!wait) emit(`❌ Codex App 协调目录或 app-server 不可用，停止监视: ${String(raw).slice(0, 300)}`);
+    process.exit(2);
+  }
+  const jobs = data && Array.isArray(data.jobs) ? data.jobs : [];
+  for (const j of jobs) {
+    const m = j.module || "?";
+    const s = j.state || "?";
+    known.add(m);
+    if (settled.has(m)) continue;
+    if (s === "done") {
+      settled.add(m);
+      if (!wait) emit(`✅ ${m} Codex App worker 已完成`);
+    } else if (s === "failed" || s === "lost" || s === "unknown") {
+      settled.add(m);
+      failed.add(m);
+      if (!wait) emit(`❌ ${m} Codex App worker 异常 — ${j.detail || s}`);
+    } else if (s === "blocked") {
+      if (!wait) emit(`⏸ ${m} Codex App worker 等待输入/approval`);
+    }
+  }
+
+  const total = known.size;
+  const done = settled.size;
+  if (total > 0 && done >= total) {
+    if (failed.size) {
+      emit(`❌ Codex App fleet ${rq} 全部结束，但 ${failed.size} 个异常`);
+      process.exit(3);
+    }
+    emit(`✅ Codex App fleet ${rq} 全部完成（${done}/${total}）`);
+    process.exit(0);
+  }
+
+  if (!wait && heartbeat >= 0 && Date.now() - lastEmit >= heartbeat * 1000) {
+    emit(`… Codex App fleet ${rq} 心跳：${done}/${total} 已结束`);
+  }
+
+  if (once) break;
+  if (maxLoops && loops >= maxLoops) {
+    if (!wait) emit(`⚠ Codex App fleet ${rq} 达到 max-loops=${maxLoops}，仍未全部结束`);
+    process.exit(1);
+  }
+  sleep(Math.max(1, interval) * 1000);
+}
+
+process.exit(1);

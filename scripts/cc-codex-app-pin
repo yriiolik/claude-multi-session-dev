@@ -1,0 +1,76 @@
+#!/usr/bin/env node
+// cc-codex-app-pin — local visibility fallback for Codex App worker threads.
+
+const fs = require("fs");
+const path = require("path");
+
+const action = process.argv[2] || "";
+const threadId = process.argv[3] || "";
+const valid = new Set(["pin", "unpin", "is-pinned"]);
+
+function usage() {
+  console.error("cc-codex-app-pin <pin|unpin|is-pinned> <thread-id>");
+}
+
+if (!valid.has(action) || !threadId) {
+  usage();
+  process.exit(5);
+}
+
+const home = process.env.CODEX_HOME || path.join(process.env.HOME || "", ".codex");
+const statePath = process.env.CODEX_APP_GLOBAL_STATE || path.join(home, ".codex-global-state.json");
+const backupPath = `${statePath}.bak`;
+const key = "pinned-thread-ids";
+
+function readState() {
+  try {
+    return JSON.parse(fs.readFileSync(statePath, "utf8"));
+  } catch (e) {
+    throw new Error(`cannot read Codex App global state ${statePath}: ${e.message || e}`);
+  }
+}
+
+function writeState(state) {
+  let mode = 0o600;
+  try {
+    mode = fs.statSync(statePath).mode & 0o777;
+  } catch {}
+  try {
+    if (fs.existsSync(statePath)) fs.copyFileSync(statePath, backupPath);
+  } catch {}
+  const tmp = `${statePath}.tmp-${process.pid}-${Date.now()}`;
+  fs.writeFileSync(tmp, JSON.stringify(state), { mode });
+  fs.renameSync(tmp, statePath);
+}
+
+let state;
+try {
+  state = readState();
+} catch (e) {
+  console.error(e.message || String(e));
+  process.exit(2);
+}
+
+if (!Array.isArray(state[key])) state[key] = [];
+const before = state[key].includes(threadId);
+
+try {
+  if (action === "is-pinned") {
+    console.log(before ? "1" : "0");
+  } else if (action === "pin") {
+    if (!before) {
+      state[key].push(threadId);
+      writeState(state);
+    }
+    console.log("pinned");
+  } else if (action === "unpin") {
+    if (before) {
+      state[key] = state[key].filter((id) => id !== threadId);
+      writeState(state);
+    }
+    console.log("unpinned");
+  }
+} catch (e) {
+  console.error(e.message || String(e));
+  process.exit(1);
+}

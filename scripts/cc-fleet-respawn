@@ -1,0 +1,174 @@
+#!/usr/bin/env bash
+# cc-fleet-respawn — 停掉某个跑偏/降级的子 session（worker），用【同一张任务卡】另起一个【全新 worker】重跑。
+#
+# 为什么要它（灰度坏模型自救）：
+#   当前大模型处于灰度分流——偶尔某个 worker 会被分到【质量很差的模型实例】，症状是：
+#     · 把瞬时工具抖动（cat/echo/Read 偶发无回显）误判成"通道彻底卡死"，停下来问人而不重试；
+#     · 明明能自主判断的口径/路径，却反复要人确认、要人手把手（违反自主判断铁律）；
+#     · 空转很久（Brewed 20min+）没实质进展、或轻易放弃/兜圈子。
+#   这类【模型能力降级】用 cc-fleet-reply 纠偏往往没用——它还在同一个坏模型上。**换一个新 session 通常就分到好模型、问题自愈。**
+#   本脚本把"kill 旧的 + 用同一任务卡另起新的"做成一条原子操作，并内建两道护栏：
+#     ① 退避旧回执：把 <COORD>/<module>.summary.md 改名归档，避免坏 worker 万一落了 result: 被【回执闩锁】误判"已完成"；
+#     ② 放行复用兜底闸：重派带 --join（同一 RQ 的后续批次），避免同 RQ 里别的模块工件超新鲜窗口把本次重派拦成 exit 6。
+#   旧 worker 的隔离 worktree 里的半成品从未 cc-fleet-land、不进集成分支 fleet/<RQ>——集成分支保持干净，新 worker 自开全新 worktree。
+#
+# 与既有 Monitor/watch 的衔接：无需重挂 watch。重派用同一 --sid-file 覆盖 <module>.sid，
+#   cc-fleet-status / cc-fleet-watch 下一轮即解析到【新 worker 的 short】；旧回执已归档（无 receipt=1），不会误闩完成。
+#
+# 用法:
+#   cc-fleet-respawn <RQ> <module> --prompt-file <任务卡.md>            # kill 旧 + 归档旧回执 + 用同卡重派新 worker
+#   cc-fleet-respawn <RQ> <module> --prompt-file <f> --signal SIGKILL   # 强杀旧的
+#   cc-fleet-respawn <RQ> <module> --prompt-file <f> --dispatch cc-dispatch-codex-app  # codex/App 可见模式
+#   cc-fleet-respawn <RQ> <module> --prompt-file <f> --dry-run          # 只打印将执行的 kill/归档/重派计划，不动手
+#   cc-fleet-respawn <RQ> <module> --prompt-file <f> -- --isolation worktree --env FOO=bar  # -- 之后原样转发给派发脚本
+#
+# 退出码:
+#   0  重派成功（旧 worker 已 kill 或本就已结束）
+#   2  派发时 daemon 不可达 / 协调目录解析失败
+#   3  派发协议不兼容（透传自派发脚本）
+#   4  派发业务错误（透传自派发脚本）
+#   5  参数错误
+#   6  复用兜底闸拦截（正常不会发生——本脚本已自动 --join；仅当显式 --no-join 才可能）
+
+set -u
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+RQ=""; MODULE=""; PROMPT_FILE=""; CWD=""; SIGNAL="SIGTERM"
+DISPATCH="cc-dispatch"; COORD=""; BASE=""; DRY_RUN=0; NO_KILL=0; NO_JOIN=0; HELP=0
+PASSTHRU=()
+
+die_usage(){ echo "❌ $1" >&2; print_usage >&2; exit 5; }
+
+print_usage(){ cat <<'EOF'
+cc-fleet-respawn — 停掉跑偏/降级的 worker，用同一任务卡另起全新 worker 重跑（灰度坏模型自救）
+
+用法:
+  cc-fleet-respawn <RQ> <module> --prompt-file <任务卡.md> [选项] [-- <转发给派发脚本的额外参数>]
+
+选项:
+  --prompt-file PATH   重派用的任务卡/prompt 文件（真跑时必给；建议就用当初派发那份）
+  --cwd DIR            新 worker 工作目录（默认=当前 $PWD，与原派发一致）
+  --signal SIG         kill 旧 worker 的信号：SIGTERM（默认）或 SIGKILL
+  --dispatch NAME      派发脚本：cc-dispatch（默认）| cc-dispatch-codex-app（codex/App 可见模式）
+  --base BRANCH        新 worker 的 FLEET_BASE_BRANCH（默认 fleet/<RQ> 集成分支）
+  --coord DIR          显式协调目录（默认 cc-fleet-coord <RQ> --no-mkdir 解析）
+  --no-kill            跳过 kill（旧的已结束/已手动 kill 时用），只归档旧回执 + 重派
+  --no-join            重派不加 --join（一般别用；可能撞复用兜底闸 exit 6）
+  --dry-run            只打印 kill/归档/重派三步计划，不真执行
+  -h, --help           本帮助
+  --                   其后所有参数原样转发给派发脚本（如 --isolation worktree / 额外 --env）
+
+说明:
+  · kill 只终止旧进程、不删回执；本脚本会把 <COORD>/<module>.summary.md 归档成 .superseded-<时间戳>.md
+    （防坏 worker 的旧 result: 被回执闩锁误判"已完成"）。旧 worker 半成品未 land、不污染集成分支。
+  · 重派复用同一 <module>.sid，现有 cc-fleet-watch 会自动跟到新 worker，无需重挂 Monitor。
+EOF
+}
+
+# ---- 解析参数（-- 之前是本脚本选项，之后原样转发派发脚本）----
+POS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --prompt-file) PROMPT_FILE="${2:-}"; shift 2 ;;
+    --cwd)         CWD="${2:-}"; shift 2 ;;
+    --signal)      SIGNAL="${2:-}"; shift 2 ;;
+    --dispatch)    DISPATCH="${2:-}"; shift 2 ;;
+    --base)        BASE="${2:-}"; shift 2 ;;
+    --coord)       COORD="${2:-}"; shift 2 ;;
+    --no-kill)     NO_KILL=1; shift ;;
+    --no-join)     NO_JOIN=1; shift ;;
+    --dry-run)     DRY_RUN=1; shift ;;
+    -h|--help)     HELP=1; shift ;;
+    --)            shift; PASSTHRU=("$@"); break ;;
+    --*)           die_usage "未知参数: $1" ;;
+    *)             POS+=("$1"); shift ;;
+  esac
+done
+[ "$HELP" -eq 1 ] && { print_usage; exit 0; }
+
+RQ="${POS[0]:-}"; MODULE="${POS[1]:-}"
+[ -n "$RQ" ] || die_usage "缺 <RQ>"
+[ -n "$MODULE" ] || die_usage "缺 <module>"
+[ "$SIGNAL" = "SIGTERM" ] || [ "$SIGNAL" = "SIGKILL" ] || die_usage "--signal 只能是 SIGTERM 或 SIGKILL"
+case "$DISPATCH" in
+  cc-dispatch|cc-dispatch-codex-app|cc-dispatch-codex) : ;;
+  *) die_usage "--dispatch 只能是 cc-dispatch / cc-dispatch-codex-app" ;;
+esac
+[ -n "$CWD" ] || CWD="$PWD"
+[ -n "$BASE" ] || BASE="fleet/$RQ"
+
+# ---- 解析协调目录 ----
+if [ -z "$COORD" ]; then
+  COORD="$("$SELF_DIR/cc-fleet-coord" "$RQ" --no-mkdir 2>/dev/null)"
+  if [ -z "$COORD" ]; then
+    echo "❌ 解析不到 $RQ 的协调目录（在项目 git 仓库里跑，或用 --coord 显式指定）。" >&2
+    exit 2
+  fi
+fi
+SID_FILE="$COORD/$MODULE.sid"
+SUMMARY="$COORD/$MODULE.summary.md"
+
+# ---- 组装重派命令 ----
+DISPATCH_BIN="$SELF_DIR/$DISPATCH"
+dispatch_cmd=( "$DISPATCH_BIN"
+  --cwd "$CWD"
+  --name "↳$MODULE@$RQ"
+  --env "FLEET_ROLE=worker" --env "FLEET_RQ=$RQ" --env "FLEET_MODULE=$MODULE"
+  --env "FLEET_BASE_BRANCH=$BASE"
+  --sid-file "$SID_FILE" )
+[ "$NO_JOIN" -eq 1 ] || dispatch_cmd+=( --join )
+if [ ${#PASSTHRU[@]} -gt 0 ]; then dispatch_cmd+=( "${PASSTHRU[@]}" ); fi
+dispatch_cmd+=( --prompt-file "$PROMPT_FILE" )
+
+kill_cmd=( "$SELF_DIR/cc-fleet-kill" "$RQ" "$MODULE" --signal "$SIGNAL" --coord "$COORD" )
+
+# ---- dry-run：只打印计划 ----
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "PLAN respawn 模块 '$MODULE' @ ${RQ}（coord=${COORD}）"
+  if [ "$NO_KILL" -eq 1 ]; then
+    echo "  1) kill     → (跳过，--no-kill)"
+  else
+    echo "  1) kill     → ${kill_cmd[*]}"
+  fi
+  if [ -f "$SUMMARY" ]; then
+    echo "  2) archive  → $SUMMARY → $SUMMARY.superseded-<时间戳>（旧回执存在，归档以免误判已完成）"
+  else
+    echo "  2) archive  → (无旧回执 $MODULE.summary.md，跳过)"
+  fi
+  echo "  3) dispatch → ${dispatch_cmd[*]}"
+  exit 0
+fi
+
+# ---- 真跑：prompt-file 必给 ----
+[ -n "$PROMPT_FILE" ] || die_usage "真跑必须给 --prompt-file（用当初派发那张任务卡；仅 --dry-run 可省）"
+[ -f "$PROMPT_FILE" ] || { echo "❌ --prompt-file 不存在: $PROMPT_FILE" >&2; exit 5; }
+
+# 1) kill 旧 worker（best-effort：已结束返回 3 也照常继续重派）
+if [ "$NO_KILL" -eq 0 ]; then
+  "${kill_cmd[@]}"; krc=$?
+  case "$krc" in
+    0) : ;;                                              # 杀掉了
+    3) echo "ℹ️ 旧 worker 已结束（无需 kill），继续用同卡重派新 worker。" >&2 ;;
+    2) echo "⚠ kill 阶段 daemon 不可达（可能旧 worker 也已消失）；仍尝试重派，由派发脚本给出权威结果。" >&2 ;;
+    *) echo "⚠ kill 返回 ${krc}；仍继续重派（旧回执会被归档、集成分支未受污染）。" >&2 ;;
+  esac
+fi
+
+# 2) 归档旧回执（防坏 worker 的旧 result: 被回执闩锁误判"已完成"）
+if [ -f "$SUMMARY" ]; then
+  ARCH="$SUMMARY.superseded-$(date +%s)"
+  [ -e "$ARCH" ] && ARCH="$ARCH.$$"
+  if mv "$SUMMARY" "$ARCH" 2>/dev/null; then
+    echo "🗄  已归档旧回执: $(basename "$SUMMARY") → $(basename "$ARCH")" >&2
+  else
+    echo "⚠ 归档旧回执失败（${SUMMARY}）；若它含 result: 首行，watch 可能误判已完成，请手动移走。" >&2
+  fi
+fi
+
+# 3) 用同一任务卡重派全新 worker（--join 放行复用兜底闸；同 --sid-file 覆盖名册键）
+echo "🔁 用同卡重派新 worker: ↳$MODULE@${RQ}（${DISPATCH}，base=${BASE}）" >&2
+"${dispatch_cmd[@]}"; drc=$?
+if [ "$drc" -eq 0 ]; then
+  echo "✅ 重派成功。现有 cc-fleet-watch 会自动跟到新 worker（sid 已覆盖、旧回执已归档），无需重挂 Monitor。" >&2
+fi
+exit "$drc"

@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+# cc-fleet-land — worker 把自己 worktree 里【已提交】的改动安全合入本 RQ 的集成分支 fleet/<RQ>。
+#
+# 为什么需要它（本技能的隔离模型，2026-06-13 起）：
+#   每个 RQ 有一条独立【集成分支】 fleet/<RQ>（主 session 用 `cc-fleet-coord --init-base <RQ>` 在
+#   发起任务时的当前分支上创建）。worker 的 worktree base 锚定 fleet/<RQ>、改动也只合回 fleet/<RQ>，
+#   **绝不碰共享开发分支（dev/<name> / main）**——共享分支只在主 session 整体验收通过后、由它把
+#   fleet/<RQ> 合回一次。这样「单个模块完成但整体需求没做完」时，半成品被关在 fleet/<RQ> 里，
+#   同项目其它并发 RQ / 用户本人完全不受干扰。
+#
+# 并发安全（多个 worker 同时往同一条 fleet/<RQ> 落地）：
+#   fleet/<RQ> 不在任何 worktree 被 checkout（它只是一条 ref），所以 worker【不能】直接 `git merge`
+#   进去。本脚本用 **compare-and-swap**：先把 fleet/<RQ> 现 tip 合进【自己】这条分支，再用
+#   `git update-ref refs/heads/fleet/<RQ> <new> <old>` 原子推进——只有 fleet/<RQ> 仍停在读到的 <old>
+#   时才成功；若期间被别的 worker 抢先推进（<old> 变了）→ CAS 失败 → 重新读 tip、重新 merge、重试。
+#   收敛、零丢更新；冲突（RQ 内按模块粒度拆分本就罕见）留给 worker 解决后重跑。
+#
+# 用法（在 worker 自己的隔离 worktree 内、所有改动已 commit 后运行）：
+#   cc-fleet-land <RQ>                       # 落地到 fleet/<RQ>（本地 ref；不推远端）
+#   cc-fleet-land <RQ> --push-backup <module>  # 额外把本模块分支推到 origin/fleet/<RQ>/<module> 作持久备份
+#   cc-fleet-land <RQ> --int-branch <name>   # 显式指定集成分支名（默认 fleet/<RQ>）
+#   cc-fleet-land <RQ> --dry-run             # 只打印将做什么，不改任何 ref
+#
+# 退出码: 0 成功（已落地 / 本就最新）
+#         2 用法错 / 不在 git 仓库 / 集成分支不存在（主 session 还没 --init-base）
+#         3 工作树不干净（先把改动 commit / 解决未完成的合并再来）
+#         5 CAS 重试耗尽（fleet/<RQ> 被持续高频推进，极少见）
+#         7 与 fleet/<RQ> 合并冲突（解决冲突→git add→git commit→重跑 cc-fleet-land）
+
+set -uo pipefail
+
+RQ=""
+INT_BRANCH=""
+PUSH_MODULE=""
+DRYRUN=0
+MAX_TRIES="${FLEET_LAND_MAX_TRIES:-25}"
+
+usage() {
+  cat >&2 <<'EOF'
+用法: cc-fleet-land <RQ> [--int-branch <name>] [--push-backup <module>] [--dry-run]
+  在 worker 自己的隔离 worktree 内、改动已 commit 后运行，把改动安全合入集成分支 fleet/<RQ>。
+  绝不碰共享开发分支——共享分支由主 session 验收后合一次。
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --int-branch)  INT_BRANCH="${2:-}"; shift 2 || { usage; exit 2; } ;;
+    --push-backup) PUSH_MODULE="${2:-}"; shift 2 || { usage; exit 2; } ;;
+    --dry-run)     DRYRUN=1; shift ;;
+    -h|--help)     usage; exit 0 ;;
+    -*)            echo "未知选项: $1" >&2; usage; exit 2 ;;
+    *)             [[ -z "$RQ" ]] && RQ="$1" || { echo "多余参数: $1" >&2; usage; exit 2; }; shift ;;
+  esac
+done
+
+[[ -n "$RQ" ]] || { usage; exit 2; }
+[[ -n "$INT_BRANCH" ]] || INT_BRANCH="fleet/$RQ"
+
+# 必须在 git 仓库里
+git rev-parse --git-dir >/dev/null 2>&1 || { echo "❌ 不在 git 仓库里。" >&2; exit 2; }
+
+INT_REF="refs/heads/$INT_BRANCH"
+
+# 集成分支必须已存在（主 session 用 cc-fleet-coord --init-base <RQ> 建）
+if ! git show-ref --verify --quiet "$INT_REF"; then
+  echo "❌ 集成分支 $INT_BRANCH 不存在。主 session 应先跑：cc-fleet-coord --init-base $RQ" >&2
+  echo "   （它会在发起任务时的当前分支上创建 fleet/${RQ}，并把 base 记进协调目录 base.ref）" >&2
+  exit 2
+fi
+
+# 当前分支不能就是集成分支本身（worker 应在自己 worktree 的独立分支上）
+CUR_BRANCH="$(git symbolic-ref --short -q HEAD || true)"
+if [[ "$CUR_BRANCH" == "$INT_BRANCH" ]]; then
+  echo "❌ 你当前就在集成分支 $INT_BRANCH 上——worker 应在自己 worktree 的独立分支上开发，不要直接占用集成分支。" >&2
+  exit 2
+fi
+
+# 工作树必须干净（改动已 commit、没有未完成的合并）
+if [[ -n "$(git status --porcelain 2>/dev/null)" ]]; then
+  echo "❌ 工作树有未提交改动 / 未完成的合并。先把改动 commit（或解决冲突后 git add && git commit），再跑 cc-fleet-land。" >&2
+  exit 3
+fi
+
+OLD_INT="$(git rev-parse --verify "$INT_REF")"
+HEAD_SHA="$(git rev-parse --verify HEAD)"
+
+if [[ "$DRYRUN" -eq 1 ]]; then
+  echo "[dry-run] 集成分支 $INT_BRANCH 现 tip = ${OLD_INT:0:12}"
+  echo "[dry-run] 我的分支 ${CUR_BRANCH:-<detached>} HEAD = ${HEAD_SHA:0:12}"
+  echo "[dry-run] 将循环：git merge $INT_BRANCH → git update-ref $INT_REF <new> <old>（CAS，失败重试）"
+  [[ -n "$PUSH_MODULE" ]] && echo "[dry-run] 落地后将推备份：git push origin HEAD:refs/heads/fleet/$RQ/$PUSH_MODULE"
+  exit 0
+fi
+
+# ---- CAS 落地循环 ----
+landed=0
+try=0
+while (( try < MAX_TRIES )); do
+  try=$((try + 1))
+  OLD_INT="$(git rev-parse --verify "$INT_REF")"
+
+  # 把集成分支现 tip 合进自己这条分支（带回别的 worker 已落地的改动）。
+  if ! git merge --no-edit "$INT_BRANCH" >/dev/null 2>&1; then
+    # 合并冲突：留在工作树里给 worker 解决，不自动 abort。
+    echo "⚠ 与集成分支 $INT_BRANCH 合并出现冲突。请：" >&2
+    echo "    1) 解决冲突 → git add <files> → git commit" >&2
+    echo "    2) 重新跑：cc-fleet-land $RQ" >&2
+    echo "  （集成分支 $INT_BRANCH 未被改动；你的改动也都还在）" >&2
+    exit 7
+  fi
+
+  NEW_SHA="$(git rev-parse --verify HEAD)"
+
+  if [[ "$NEW_SHA" == "$OLD_INT" ]]; then
+    # 我的分支恰好就是集成分支 tip（无新增 / 已落地过）——幂等成功。
+    echo "✓ fleet/$RQ 已是最新（${OLD_INT:0:12}），无需落地。"
+    landed=1
+    break
+  fi
+
+  # CAS：仅当 fleet/<RQ> 仍停在 OLD_INT 时把它推进到 NEW_SHA（fast-forward，含别人的改动为祖先）。
+  if git update-ref "$INT_REF" "$NEW_SHA" "$OLD_INT" 2>/dev/null; then
+    echo "✓ 已落地到 ${INT_BRANCH}：${OLD_INT:0:12} → ${NEW_SHA:0:12}（第 ${try} 次尝试）"
+    landed=1
+    break
+  fi
+
+  # CAS 失败：别的 worker 抢先推进了 fleet/<RQ>；短暂退避后重读 tip 重 merge 重试。
+  sleep "0.$(( (try % 9) + 1 ))" 2>/dev/null || sleep 1
+done
+
+if [[ "$landed" -ne 1 ]]; then
+  echo "❌ 落地失败：CAS 重试 ${MAX_TRIES} 次仍未推进 ${INT_BRANCH}（被持续高频抢占？稍后重跑 cc-fleet-land ${RQ}）。" >&2
+  exit 5
+fi
+
+# ---- 可选：把本模块分支推到远端做持久备份（不影响落地成败；不碰共享分支）----
+if [[ -n "$PUSH_MODULE" ]]; then
+  backup_ref="refs/heads/fleet/$RQ/$PUSH_MODULE"
+  if git remote get-url origin >/dev/null 2>&1; then
+    if git push -q origin "HEAD:$backup_ref" 2>/dev/null; then
+      echo "✓ 已推模块分支备份到 origin/fleet/$RQ/$PUSH_MODULE"
+    else
+      echo "⚠ 推远端备份失败（不影响本地落地；fleet/$RQ 已含你的改动）。" >&2
+    fi
+  else
+    echo "⚠ 没有 origin 远端，跳过模块分支备份（不影响本地落地）。" >&2
+  fi
+fi
+
+exit 0

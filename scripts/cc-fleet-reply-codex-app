@@ -1,0 +1,165 @@
+#!/usr/bin/env node
+// cc-fleet-reply-codex-app — send a follow-up message to a Codex App worker thread.
+
+const fs = require("fs");
+const path = require("path");
+const { execFileSync, spawnSync } = require("child_process");
+
+let rq = "";
+let moduleName = "";
+let coord = "";
+let textFile = "";
+let dryRun = false;
+let codexBin = "";
+let startAppServer = false;
+const textParts = [];
+
+function usage() {
+  console.error(`cc-fleet-reply-codex-app <RQ> <module> "message"
+  --text-file FILE     read message from file
+  --coord DIR          override coordination directory
+  --dry-run            show target without sending
+  --start-app-server   try to start Codex app-server if not reachable`);
+}
+
+for (let i = 2; i < process.argv.length; i++) {
+  const a = process.argv[i];
+  if (a === "--coord") coord = process.argv[++i] || "";
+  else if (a === "--text-file") textFile = process.argv[++i] || "";
+  else if (a === "--dry-run") dryRun = true;
+  else if (a === "--codex-bin") codexBin = process.argv[++i] || "";
+  else if (a === "--start-app-server") startAppServer = true;
+  else if (a === "-h" || a === "--help") { usage(); process.exit(0); }
+  else if (!rq) rq = a;
+  else if (!moduleName) moduleName = a;
+  else textParts.push(a);
+}
+
+if (!rq || !moduleName) {
+  usage();
+  process.exit(5);
+}
+
+function gitOut(args) {
+  try {
+    return execFileSync("git", args, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+  } catch {
+    return "";
+  }
+}
+
+function defaultCoord() {
+  const common = gitOut(["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+  return common ? path.join(common, "fleet", rq) : "";
+}
+
+function parseEnv(file) {
+  const out = {};
+  for (const line of fs.readFileSync(file, "utf8").split(/\r?\n/)) {
+    if (!line.trim() || line.trim().startsWith("#")) continue;
+    const idx = line.indexOf("=");
+    if (idx < 0) continue;
+    out[line.slice(0, idx)] = line.slice(idx + 1);
+  }
+  return out;
+}
+
+function callApp(method, params) {
+  const callBin = process.env.CODEX_APP_CALL_BIN || path.join(__dirname, "cc-codex-app-call");
+  const tmpDir = path.join(coord, "app-json");
+  fs.mkdirSync(tmpDir, { recursive: true });
+  const tmp = path.join(tmpDir, `.reply-${process.pid}-${Math.random().toString(16).slice(2)}.json`);
+  fs.writeFileSync(tmp, JSON.stringify(params));
+  const args = [];
+  if (codexBin) args.push("--codex-bin", codexBin);
+  if (startAppServer) args.push("--start-app-server");
+  args.push(method, tmp);
+  const res = spawnSync(callBin, args, {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+    maxBuffer: 64 * 1024 * 1024,
+  });
+  try { fs.unlinkSync(tmp); } catch {}
+  if (res.status !== 0) {
+    throw new Error((res.stderr || res.stdout || `app call failed ${res.status}`).trim());
+  }
+  return JSON.parse(res.stdout);
+}
+
+function bestEffortVisible(threadId) {
+  try { callApp("thread/unarchive", { threadId }); } catch {}
+  try { callApp("thread/resume", { threadId }); } catch {}
+}
+
+coord = coord || defaultCoord();
+if (!coord || !fs.existsSync(coord)) {
+  console.error(`❌ 找不到协调目录: ${coord || "<unknown>"}`);
+  process.exit(2);
+}
+
+const metaPath = path.join(coord, `${moduleName}.codex-app.env`);
+if (!fs.existsSync(metaPath)) {
+  console.error(`❌ 找不到 Codex App worker 元数据: ${metaPath}`);
+  process.exit(2);
+}
+
+const meta = parseEnv(metaPath);
+const threadId = meta.thread_id || meta.id;
+if (!threadId) {
+  console.error(`❌ 元数据缺少 thread_id: ${metaPath}`);
+  process.exit(2);
+}
+bestEffortVisible(threadId);
+
+let text = "";
+if (textFile) text = fs.readFileSync(textFile, "utf8");
+else if (textParts.length) text = textParts.join(" ");
+else if (!process.stdin.isTTY) text = fs.readFileSync(0, "utf8");
+if (!text.trim()) {
+  console.error("❌ reply message is empty");
+  process.exit(5);
+}
+
+const appVisibleCwd = meta.app_visible_cwd || meta.thread_cwd || meta.cwd || null;
+const worktreeCwd = meta.worktree_cwd || meta.cwd || "";
+if (worktreeCwd && appVisibleCwd && worktreeCwd !== appVisibleCwd) {
+  text = `提醒：本 Codex App thread 的侧栏锚点 cwd 是 ${appVisibleCwd}，真实 worker 工作目录是 ${worktreeCwd}。请只在真实 worker 工作目录中执行命令/读写文件。\n\n${text}`;
+}
+
+const read = callApp("thread/read", { threadId, includeTurns: true });
+const thread = read.thread || {};
+const turns = Array.isArray(thread.turns) ? thread.turns : [];
+const latestTurn = turns.length ? turns[turns.length - 1] : null;
+const active = thread.status && thread.status.type === "active" && latestTurn && latestTurn.status === "inProgress";
+
+if (dryRun) {
+  console.log(`[dry-run] thread=${threadId}`);
+  console.log(`[dry-run] module=${moduleName}`);
+  console.log(`[dry-run] method=${active ? "turn/steer" : "turn/start"}`);
+  console.log(`[dry-run] message=${text.slice(0, 200)}`);
+  process.exit(0);
+}
+
+if (active) {
+  const result = callApp("turn/steer", {
+    threadId,
+    expectedTurnId: latestTurn.id,
+    input: [{ type: "text", text }],
+  });
+  console.log(`✅ 已 steer Codex App worker ${moduleName} thread=${threadId} turn=${latestTurn.id}`);
+  if (result && result.turn) console.log(`   turn=${result.turn.id || latestTurn.id}`);
+  bestEffortVisible(threadId);
+} else {
+  const result = callApp("turn/start", {
+    threadId,
+    cwd: appVisibleCwd || meta.worktree_cwd || meta.cwd || null,
+    approvalPolicy: "never",
+    approvalsReviewer: "auto_review",
+    sandboxPolicy: { type: "dangerFullAccess" },
+    serviceTier: meta.service_tier || "default",
+    input: [{ type: "text", text }],
+  });
+  console.log(`✅ 已向 Codex App worker ${moduleName} 追加新 turn thread=${threadId}`);
+  if (result && result.turn) console.log(`   turn=${result.turn.id || ""}`);
+  bestEffortVisible(threadId);
+}

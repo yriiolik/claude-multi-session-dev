@@ -1,0 +1,264 @@
+#!/usr/bin/env node
+// cc-codex-app-call — minimal JSON-RPC caller for Codex app-server proxy.
+
+const fs = require("fs");
+const crypto = require("crypto");
+const net = require("net");
+const { spawnSync } = require("child_process");
+
+let codexBin = process.env.CODEX_CLI_PATH || "";
+let shouldStart = false;
+let method = "";
+let paramsPath = "";
+let lastStartError = "";
+
+function usage() {
+  console.error(`cc-codex-app-call [--codex-bin PATH] [--start-app-server] <method> [params.json|-]
+
+Reads one JSON params object and prints the JSON-RPC result object.
+The Codex app-server daemon/remote-control socket must be running.`);
+}
+
+for (let i = 2; i < process.argv.length; i++) {
+  const a = process.argv[i];
+  if (a === "--codex-bin") {
+    codexBin = process.argv[++i] || "";
+  } else if (a === "--start-app-server") {
+    shouldStart = true;
+  } else if (a === "-h" || a === "--help") {
+    usage();
+    process.exit(0);
+  } else if (!method) {
+    method = a;
+  } else if (!paramsPath) {
+    paramsPath = a;
+  } else {
+    console.error(`unknown argument: ${a}`);
+    usage();
+    process.exit(5);
+  }
+}
+
+if (!method) {
+  usage();
+  process.exit(5);
+}
+
+function discoverCodexBin() {
+  if (codexBin) return codexBin;
+  const appPath = "/Applications/Codex.app/Contents/Resources/codex";
+  if (fs.existsSync(appPath)) return appPath;
+  const pluginPath = `${process.env.HOME || ""}/.codex/plugins/.plugin-appserver/codex`;
+  if (fs.existsSync(pluginPath)) return pluginPath;
+  const which = spawnSync("sh", ["-lc", "command -v codex"], { encoding: "utf8" });
+  if (which.status === 0 && which.stdout.trim()) return which.stdout.trim();
+  return "";
+}
+
+function readParams() {
+  if (!paramsPath) return {};
+  const raw = paramsPath === "-"
+    ? fs.readFileSync(0, "utf8")
+    : fs.readFileSync(paramsPath, "utf8");
+  if (!raw.trim()) return {};
+  return JSON.parse(raw);
+}
+
+function startServer(bin) {
+  const rc = spawnSync(bin, ["remote-control", "start", "--json"], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  if (rc.status === 0) return true;
+  lastStartError = `${rc.stderr || rc.stdout || ""}`.trim();
+  const ds = spawnSync(bin, ["app-server", "daemon", "start"], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  if (ds.status !== 0) {
+    const daemonError = `${ds.stderr || ds.stdout || ""}`.trim();
+    lastStartError = [lastStartError, daemonError].filter(Boolean).join("\n");
+  }
+  return ds.status === 0;
+}
+
+function callProxy(bin, params) {
+  const socketPath = process.env.CODEX_APP_SERVER_SOCK ||
+    `${process.env.HOME || ""}/.codex/app-server-control/app-server-control.sock`;
+
+  return new Promise((resolve, reject) => {
+    const socket = net.createConnection(socketPath);
+    const wsKey = crypto.randomBytes(16).toString("base64");
+    let buffer = Buffer.alloc(0);
+    let handshakeDone = false;
+    let settled = false;
+    const timeout = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      reject(new Error("timed out waiting for Codex app-server response"));
+    }, 30000);
+
+    function finish(value) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      socket.end();
+      resolve(value);
+    }
+
+    function fail(err) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      socket.destroy();
+      reject(err);
+    }
+
+    function wsFrame(obj) {
+      const payload = Buffer.from(JSON.stringify(obj));
+      const head = [0x81];
+      if (payload.length < 126) {
+        head.push(0x80 | payload.length);
+      } else if (payload.length < 65536) {
+        head.push(0x80 | 126, (payload.length >> 8) & 0xff, payload.length & 0xff);
+      } else {
+        throw new Error("request too large for helper frame encoder");
+      }
+      const mask = crypto.randomBytes(4);
+      const masked = Buffer.alloc(payload.length);
+      for (let i = 0; i < payload.length; i++) masked[i] = payload[i] ^ mask[i % 4];
+      return Buffer.concat([Buffer.from(head), mask, masked]);
+    }
+
+    function sendRequest(id, reqMethod, reqParams) {
+      socket.write(wsFrame({ id, method: reqMethod, params: reqParams }));
+    }
+
+    function parseFrames() {
+      while (buffer.length >= 2) {
+        const b0 = buffer[0];
+        const b1 = buffer[1];
+        const opcode = b0 & 0x0f;
+        let len = b1 & 0x7f;
+        let off = 2;
+        if (len === 126) {
+          if (buffer.length < 4) return;
+          len = buffer.readUInt16BE(2);
+          off = 4;
+        } else if (len === 127) {
+          if (buffer.length < 10) return;
+          const hi = buffer.readUInt32BE(2);
+          const lo = buffer.readUInt32BE(6);
+          if (hi !== 0) return fail(new Error("response frame too large"));
+          len = lo;
+          off = 10;
+        }
+        const masked = !!(b1 & 0x80);
+        let mask;
+        if (masked) {
+          if (buffer.length < off + 4) return;
+          mask = buffer.subarray(off, off + 4);
+          off += 4;
+        }
+        if (buffer.length < off + len) return;
+        let payload = buffer.subarray(off, off + len);
+        buffer = buffer.subarray(off + len);
+        if (masked) {
+          const unmasked = Buffer.alloc(payload.length);
+          for (let i = 0; i < payload.length; i++) unmasked[i] = payload[i] ^ mask[i % 4];
+          payload = unmasked;
+        }
+        if (opcode === 0x8) return fail(new Error("Codex app-server closed websocket"));
+        if (opcode !== 0x1) continue;
+        let msg;
+        try {
+          msg = JSON.parse(payload.toString("utf8"));
+        } catch {
+          continue;
+        }
+        if (msg.id !== 2) continue;
+        if (msg.error) return fail(new Error(JSON.stringify(msg.error)));
+        return finish(msg.result ?? null);
+      }
+    }
+
+    socket.on("connect", () => {
+      socket.write(
+        `GET / HTTP/1.1\r\n` +
+        `Host: localhost\r\n` +
+        `Upgrade: websocket\r\n` +
+        `Connection: Upgrade\r\n` +
+        `Sec-WebSocket-Key: ${wsKey}\r\n` +
+        `Sec-WebSocket-Version: 13\r\n\r\n`
+      );
+    });
+    socket.on("data", (chunk) => {
+      buffer = Buffer.concat([buffer, chunk]);
+      if (!handshakeDone) {
+        const idx = buffer.indexOf("\r\n\r\n");
+        if (idx < 0) return;
+        const header = buffer.subarray(0, idx).toString("utf8");
+        buffer = buffer.subarray(idx + 4);
+        if (!/^HTTP\/1\.1 101\b/i.test(header)) {
+          return fail(new Error(`websocket upgrade failed: ${header.split(/\r?\n/)[0] || header}`));
+        }
+        handshakeDone = true;
+        sendRequest(1, "initialize", {
+          clientInfo: {
+            name: "multi-session-dev",
+            title: "multi-session-dev",
+            version: "1",
+          },
+          capabilities: {
+            experimentalApi: true,
+            optOutNotificationMethods: [
+              "agent/message/delta",
+              "thread/status/changed",
+              "thread/tokenUsage/updated",
+              "turn/diff/updated",
+            ],
+          },
+        });
+        sendRequest(2, method, params);
+      }
+      parseFrames();
+    });
+    socket.on("error", fail);
+    socket.on("close", () => {
+      if (!settled) fail(new Error("Codex app-server socket closed before response"));
+    });
+  });
+}
+
+(async () => {
+  const bin = discoverCodexBin();
+  if (!bin || !fs.existsSync(bin)) {
+    console.error("cannot find Codex CLI; set CODEX_CLI_PATH or pass --codex-bin");
+    process.exit(8);
+  }
+  const params = readParams();
+  try {
+    const result = await callProxy(bin, params);
+    process.stdout.write(`${JSON.stringify(result)}\n`);
+  } catch (firstErr) {
+    if (shouldStart || process.env.CODEX_APP_START === "1") {
+      startServer(bin);
+      try {
+        const result = await callProxy(bin, params);
+        process.stdout.write(`${JSON.stringify(result)}\n`);
+        return;
+      } catch (secondErr) {
+        console.error(secondErr.message);
+        if (lastStartError) console.error(lastStartError);
+        if (secondErr.stderr) console.error(secondErr.stderr.trim());
+        process.exit(9);
+      }
+    }
+    console.error(firstErr.message);
+    if (firstErr.stderr) console.error(firstErr.stderr.trim());
+    console.error("Codex app-server is not reachable. Start it with: codex remote-control start --json");
+    console.error("If that command says the managed standalone Codex install is missing, install the standalone Codex CLI first.");
+    process.exit(9);
+  }
+})();

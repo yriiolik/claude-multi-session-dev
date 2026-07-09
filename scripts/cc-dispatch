@@ -1,0 +1,487 @@
+#!/usr/bin/env perl
+# cc-dispatch — 通过 Claude Code daemon control socket 直接派发一个 background session
+# 等效于在 `claude agents` FleetView 里手动 "New agent" 派发。
+#
+# 用法:
+#   cc-dispatch --cwd <DIR> --name <NAME> --prompt <TEXT>
+#   cc-dispatch --cwd <DIR> --name <NAME> --prompt-file <FILE>
+#   echo "prompt..." | cc-dispatch --cwd <DIR> --name <NAME>
+#
+# 可选:
+#   --agent <name>           agent 名（默认 claude）
+#   --isolation worktree     在隔离 worktree 跑（默认 none）
+#   --proto-version <N>      覆盖 proto 版本（默认 1）
+#   --timeout-ms <N>         daemon 派发超时（默认 10000）
+#   --json                   输出 daemon 返回的原始 JSON
+#
+# 退出码:
+#   0  派发成功
+#   2  daemon 不可达（未启动 / socket 找不到）—— 调用方应回退到手动派发
+#   3  protocol mismatch / schema 拒绝 —— 调用方应回退到手动派发
+#   4  daemon 业务错误（duplicate short / no spare / etc.）—— 同上
+#   5  参数错误
+#   6  复用兜底闸拦截：--sid-file 指向的协调目录已被【别的模块】占用且超出新鲜窗口（疑似复用别任务 RQ）。
+#      正解：新任务用 `cc-fleet-coord --alloc` 取新号；确属同一任务后续批次加 --join 放行。
+#
+# 协议参考: 来自 binary 反向工程，可能随 claude code 升级失效。
+# 失效信号: 退出码 3。调用方可降级到 `claude agents` TUI 手动派发。
+
+use strict;
+use warnings;
+use IO::Socket::UNIX;
+use Getopt::Long qw(GetOptions);
+use Encode qw(encode_utf8);
+
+# 不依赖 ambient PerlIO 层（PERLIO=:utf8 / PERL_UNICODE 等会给所有句柄套 :utf8）。
+# 源码里的中文/emoji/↳ 已是 UTF-8 字节，按字节原样输出，避免被再编码一次（双重编码乱码）。
+binmode(STDOUT, ':raw');
+binmode(STDERR, ':raw');
+
+my $opt_cwd;
+my $opt_name;
+my $opt_prompt;
+my $opt_prompt_file;
+my $opt_agent = 'claude';
+my $opt_isolation = 'none';
+my $opt_proto = 1;
+my $opt_timeout = 10000;
+my $opt_json = 0;
+my $opt_socket;
+my $opt_help;
+my @opt_env;          # 可重复: --env KEY=VAL，注入到被派发 session 的环境变量
+my $opt_dry_run = 0;  # 只打印 request JSON，不连 daemon（便于测试/调试）
+my $opt_sid_file;     # 派发成功后把 sessionId 写到此文件（供 cc-fleet-status 用 SID 名册稳定关联）
+my $opt_join = 0;     # 确认是【同一任务后续批次】，放行复用兜底闸（见 reuse_guard）
+# CLAUDE.md 注入（默认关，2.1.181 起）：旧版后台 session 不保证自动加载 CLAUDE.md（daemon spare 池沿用预热
+# cwd、约 3/4 会 miss），曾靠把规范原文塞进 prompt 兜底。2.1.181 实测此 bug 已修复——14/14 spare worker 均按
+# 【派发 cwd】重新解析并加载三层 CLAUDE.md（用户级 + 从 cwd 向上到 git root 沿途每层；含 factory/ 这类目录级、
+# 仓库根项目级），且目录级精确跟随派发 cwd（见 PROTOCOL.md §11 / tests/test-cc-dispatch-inject.sh）。故默认
+# 不再注入——避免与自动加载内容重复白烧 token。仅当 daemon 版本回归（worker 又英文回复 / 不开 worktree）时
+# 用 --inject-claude-md 重开兜底：自动发现并把三层 CLAUDE.md 原文塞进 prompt，等同 worker 已加载。
+my $opt_inject_cmd = 0;
+my $opt_cmd_maxbytes = 131072;   # 单个 CLAUDE.md 注入上限（防异常大文件撑爆 prompt）
+# daemon 控制密钥（Claude Code 2.1.169+ 给 control socket 加了鉴权：请求顶层须带 auth=控制密钥，
+# daemon 用 crypto.timingSafeEqual 与 ~/.claude/daemon/control.key 直接比对，不等即 EAUTH 拒绝）。
+# 默认自动读该文件；可用 --auth-key / 环境变量覆盖。缺失时不带 auth（兼容旧版无鉴权 daemon）。
+my $opt_auth_key;
+
+GetOptions(
+  'cwd=s'            => \$opt_cwd,
+  'name=s'           => \$opt_name,
+  'prompt=s'         => \$opt_prompt,
+  'prompt-file=s'    => \$opt_prompt_file,
+  'agent=s'          => \$opt_agent,
+  'isolation=s'      => \$opt_isolation,
+  'inject-claude-md!'=> \$opt_inject_cmd,   # --inject-claude-md / --no-inject-claude-md（默认关，2.1.181 起）
+  'cmd-maxbytes=i'   => \$opt_cmd_maxbytes,
+  'proto-version=i'  => \$opt_proto,
+  'timeout-ms=i'     => \$opt_timeout,
+  'socket=s'         => \$opt_socket,
+  'auth-key=s'       => \$opt_auth_key,    # daemon 控制密钥（默认读 ~/.claude/daemon/control.key）
+  'env=s'            => \@opt_env,
+  'sid-file=s'       => \$opt_sid_file,
+  'join'             => \$opt_join,        # 同一任务后续批次：放行复用兜底闸
+  'dry-run'          => \$opt_dry_run,
+  'json'             => \$opt_json,
+  'help|h'           => \$opt_help,
+) or die_usage("bad args");
+
+if ($opt_help) { print_usage(); exit 0; }
+die_usage("--cwd required") unless $opt_cwd;
+die_usage("--name required") unless $opt_name;
+
+# prompt 来源优先级: --prompt > --prompt-file > stdin
+my $prompt;
+if (defined $opt_prompt) {
+  $prompt = $opt_prompt;
+} elsif (defined $opt_prompt_file) {
+  open my $fh, '<:encoding(UTF-8)', $opt_prompt_file or die "open $opt_prompt_file: $!";
+  local $/; $prompt = <$fh>; close $fh;
+} elsif (! -t STDIN) {
+  local $/; $prompt = <STDIN>;
+}
+die_usage("prompt required (--prompt / --prompt-file / stdin)") unless defined $prompt && length($prompt);
+
+# 解析 cwd 到绝对路径
+unless ($opt_cwd =~ m{^/}) {
+  require Cwd; $opt_cwd = Cwd::abs_path($opt_cwd) // $opt_cwd;
+}
+die_usage("cwd not a directory: $opt_cwd") unless -d $opt_cwd;
+
+# 解析 --env KEY=VAL 列表为 hash（注入被派发 session 的环境，用于子 session 自我识别）
+my %env;
+for my $kv (@opt_env) {
+  my ($k, $v) = split /=/, $kv, 2;
+  die_usage("--env 需要 KEY=VAL 形式: $kv") unless defined $k && length($k) && defined $v;
+  $env{$k} = $v;
+}
+
+# 复用兜底闸：把【新模块】写进【已被别模块占用且超新鲜窗口】的协调目录前先拦一道（疑似复用别任务 RQ）。
+# 委托给同目录的 cc-fleet-coord --check-join（单一事实源），它 exit 6 即拦；找不到则降级跳过、不阻断派发。
+reuse_guard($opt_sid_file, $opt_join) if defined $opt_sid_file && length $opt_sid_file;
+
+# 文本统一成 UTF-8 字节串（flag off），不依赖 ambient 的解码/编码层：
+#   - 已带 UTF-8 flag（被 -CA / :encoding 层解码过，如 --prompt-file）→ 编码回 UTF-8 字节
+#   - 否则（@ARGV / stdin 原始字节）→ 原样保留（本就是 UTF-8 字节）
+# 配合 send_request 里的 binmode($s, ':raw')，保证落到 socket/STDOUT 的是单次正确 UTF-8。
+$opt_name = utf8_bytes($opt_name);
+$prompt   = utf8_bytes($prompt);
+$_ = utf8_bytes($_) for values %env;
+
+# 原文 prompt 作 FleetView 显示用 intent（不含注入，保持简洁）；
+# launch prompt 默认即原文（2.1.181 起 daemon 已自动加载三层 CLAUDE.md）；仅 --inject-claude-md 时才把原文塞进去兜底。
+my $intent_prompt = $prompt;
+my $launch_prompt = $opt_inject_cmd ? inject_claude_mds($prompt, $opt_cwd) : $prompt;
+
+# 构造 d payload
+my $short = randhex(8);
+# ⚠ 极简 JSON 编码器(to_json)把"看起来是数字"的标量裸输出成 number；randhex(8) 约 2% 概率
+# 生成全数字(无 a-f)，会让本该是 string 的 short 被当 number → daemon schema 拒 "expected
+# string, received number"。强制 short 至少含一个十六进制字母(仍满足 schema /^[a-f0-9]{8}$/)。
+$short = randhex(8) while $short !~ /[a-f]/;
+my $session_id = uuid4();
+my $created_at = int(time() * 1000);
+
+my $d = {
+  proto         => $opt_proto,
+  short         => $short,
+  sessionId     => $session_id,
+  createdAt     => $created_at,
+  source        => 'fleet',
+  cwd           => $opt_cwd,
+  agent         => $opt_agent,
+  isolation     => $opt_isolation,
+  respawnFlags  => [],
+  launch        => { mode => 'prompt', args => [$launch_prompt] },
+  seed          => { intent => $intent_prompt, name => $opt_name },
+};
+$d->{env} = \%env if %env;   # 仅在有 --env 时带上（schema 默认 {}）
+
+my $req = {
+  proto     => $opt_proto,
+  op        => 'dispatch',
+  d         => $d,
+  timeoutMs => $opt_timeout,
+};
+# 2.1.169+ 控制密钥鉴权：顶层带 auth=控制密钥（缺失则不带，兼容旧版）
+my $ckey = load_control_key();
+$req->{auth} = $ckey if defined $ckey && length $ckey;
+
+# --dry-run: 只打印将要发送的 request JSON，不连 daemon（测试/调试用）
+if ($opt_dry_run) {
+  print to_json($req), "\n";
+  exit 0;
+}
+
+# 找 control.sock —— /tmp/cc-daemon-<uid>/<8hex>/control.sock
+my $sock = $opt_socket // find_control_sock();
+unless ($sock && -S $sock) {
+  warn "❌ daemon control socket not found.\n";
+  warn "   尝试: claude agents --json   # 启动 daemon 后重试\n";
+  exit 2;
+}
+
+my $resp = send_request($sock, $req);
+my $parsed = parse_json($resp);
+
+if ($opt_json) {
+  print $resp;
+  exit 0 if $parsed && $parsed->{ok};
+}
+
+if (!$parsed) {
+  warn "❌ daemon 返回不可解析: $resp\n";
+  exit 4;
+}
+
+if ($parsed->{ok}) {
+  printf "✅ dispatched  short=%s  pid=%s  sessionId=%s  via=%s\n",
+    $parsed->{short} // $short,
+    $parsed->{pid}    // '?',
+    $session_id,
+    $parsed->{via}    // '?';
+  # 记录稳定关联键（sessionId）：cc-fleet-status 据此用 SID 名册关联，避免靠会变空的 session 名
+  if (defined $opt_sid_file && length $opt_sid_file) {
+    if (open my $sfh, '>', $opt_sid_file) {
+      print $sfh "$session_id\n";
+      close $sfh;
+    } else {
+      warn "⚠ 无法写 --sid-file $opt_sid_file: $!（不影响派发，但 cc-fleet-status 将退回 name 关联）\n";
+    }
+  }
+  exit 0;
+}
+
+my $code = $parsed->{code} // 'EUNKNOWN';
+my $err  = $parsed->{error} // 'unknown';
+
+if ($code eq 'EPROTO') {
+  warn "❌ protocol mismatch (server=$parsed->{serverProto}, client=$opt_proto)\n";
+  warn "   claude code 升级后协议已变。请用 'claude agents' TUI 手动派发，或更新本脚本。\n";
+  exit 3;
+}
+if ($err =~ /malformed request/) {
+  warn "❌ schema rejected: $err\n";
+  warn "   协议字段已变。请用 'claude agents' TUI 手动派发，或更新本脚本。\n";
+  exit 3;
+}
+
+warn "❌ daemon error: [$code] $err\n";
+exit 4;
+
+# --- helpers ---
+
+# reuse_guard —— 调用同目录 cc-fleet-coord --check-join 拦"复用别任务 RQ"。
+# coord = --sid-file 的父目录；module = 文件名去掉 .sid。它 exit 6 → 本进程同样 exit 6（停在派发前）。
+# 找不到 cc-fleet-coord（脱离技能目录单独跑）则静默降级、不阻断派发。
+sub reuse_guard {
+  my ($sidfile, $join) = @_;
+  (my $self_dir = $0) =~ s{/[^/]+$}{};
+  $self_dir = '.' unless length $self_dir;
+  my $coord_bin = "$self_dir/cc-fleet-coord";
+  return unless -x $coord_bin;
+  (my $coord = $sidfile) =~ s{/[^/]+$}{};   # dirname
+  $coord = '.' unless length $coord;
+  (my $module = $sidfile) =~ s{.*/}{};      # basename
+  $module =~ s/\.sid$//;
+  my @args = ($coord_bin, '--check-join', $coord, $module);
+  push @args, '--join' if $join;
+  my $rc = system { $args[0] } @args;       # 它把信息直接打到 stderr
+  exit 6 if (($rc >> 8) == 6);
+}
+
+# 归一成 UTF-8 字节串：带 flag 的字符串编码回字节，原始字节串原样返回。
+sub utf8_bytes {
+  my ($x) = @_;
+  return $x unless defined $x;
+  return utf8::is_utf8($x) ? encode_utf8($x) : $x;
+}
+
+# 原始字节读文件（不解码，避免与 prompt 字节串混拼时双重编码）。
+sub read_raw_bytes {
+  my ($f) = @_;
+  open my $fh, '<:raw', $f or return undef;
+  local $/; my $c = <$fh>; close $fh;
+  return $c;
+}
+
+# 发现要注入的 CLAUDE.md：用户级 + 从 cwd 向上到 git root 沿途每一层。
+# 返回 ([label, path], ...)，顺序：用户级 → 仓库根/项目级 …→ cwd 目录级（越具体越靠后）。
+sub discover_claude_mds {
+  my ($cwd) = @_;
+  my @out;
+  my $home = $ENV{HOME};
+  push @out, ['用户级', "$home/.claude/CLAUDE.md"] if $home && -f "$home/.claude/CLAUDE.md";
+
+  # 定位 git root（含 .git 的目录）；找不到就以 cwd 为界，不向上无限爬。
+  my $root = $cwd;
+  { my $d = $cwd;
+    while (length($d) > 1) {
+      if (-e "$d/.git") { $root = $d; last }
+      (my $p = $d) =~ s{/[^/]+/?$}{};
+      last if $p eq $d || $p eq '';
+      $d = $p;
+    }
+  }
+  # 构造 root..cwd 的目录链（root 在前、cwd 在后）。
+  my @chain; my $d = $cwd;
+  while (1) {
+    unshift @chain, $d;
+    last if $d eq $root;
+    (my $p = $d) =~ s{/[^/]+/?$}{};
+    last if $p eq $d || length($p) < length($root);
+    $d = $p;
+  }
+  for my $dir (@chain) {
+    my $f = "$dir/CLAUDE.md";
+    next unless -f $f;
+    push @out, [($dir eq $cwd ? '目录级' : '项目级'), $f];
+  }
+  return @out;
+}
+
+# 把三层 CLAUDE.md 原文注入进 prompt（$p 已是 UTF-8 字节）。
+# 插在首行 ⟦FLEET-WORKER⟧ 哨兵之后（保持哨兵在第一行，子 session 身份判定/取名 hook 仍生效）；
+# 无哨兵则置顶。块本身也带 ⟦INJECTED-CLAUDE-MD⟧ 标记，便于人/模型识别。
+sub inject_claude_mds {
+  my ($p, $cwd) = @_;
+  my @files = discover_claude_mds($cwd);
+  return $p unless @files;
+  my $block = "⟦INJECTED-CLAUDE-MD⟧ 下面是【用户级 / 项目级 / 目录级】CLAUDE.md 原文。"
+    . "本后台 session 不保证自动加载它们，这里由派发方直接注入——等同你已加载，**务必逐条遵守**"
+    . "（语言=简体中文、分支/worktree 隔离、测试铁律、业务需求文档规则等全部以此为单一事实源）。\n";
+  for my $f (@files) {
+    my ($label, $path) = @$f;
+    my $c = read_raw_bytes($path);
+    next unless defined $c && length $c;
+    if (length($c) > $opt_cmd_maxbytes) {
+      $c = substr($c, 0, $opt_cmd_maxbytes) . "\n…[truncated at $opt_cmd_maxbytes bytes]…\n";
+    }
+    $block .= "\n========== [$label] $path ==========\n" . $c . "\n";
+  }
+  $block .= "⟦/INJECTED-CLAUDE-MD⟧\n\n";
+  # 首行哨兵（ASCII 子串 FLEET-WORKER 在字节串里精确可匹配）→ 插其后；否则置顶。
+  if ($p =~ /\A([^\n]*FLEET-WORKER[^\n]*\n)(.*)\z/s) {
+    return $1 . $block . $2;
+  }
+  return $block . $p;
+}
+
+# 读 daemon 控制密钥：--auth-key > 环境变量 > ~/.claude/daemon/control.key（2.1.169+ 鉴权）
+sub load_control_key {
+  return $opt_auth_key if defined $opt_auth_key && length $opt_auth_key;
+  for my $ev (qw(CLAUDE_DAEMON_CONTROL_KEY CLAUDE_BG_CONTROL_AUTH)) {
+    return $ENV{$ev} if defined $ENV{$ev} && length $ENV{$ev};
+  }
+  my $home = $ENV{HOME} // (getpwuid($<))[7];
+  return undef unless defined $home;
+  my $kf = "$home/.claude/daemon/control.key";
+  return undef unless -r $kf;
+  open my $fh, '<', $kf or return undef;
+  local $/; my $k = <$fh>; close $fh;
+  $k =~ s/^\s+//; $k =~ s/\s+$// if defined $k;
+  return (defined $k && length $k) ? $k : undef;
+}
+
+sub find_control_sock {
+  my $uid = $<;
+  my $base = "/tmp/cc-daemon-$uid";
+  return undef unless -d $base;
+  opendir my $dh, $base or return undef;
+  my @dirs = grep { /^[a-f0-9]{8}$/ && -d "$base/$_" } readdir $dh;
+  closedir $dh;
+  for my $d (sort @dirs) {
+    my $s = "$base/$d/control.sock";
+    return $s if -S $s;
+  }
+  return undef;
+}
+
+sub send_request {
+  my ($path, $obj) = @_;
+  my $s = IO::Socket::UNIX->new(Peer => $path, Type => SOCK_STREAM)
+    or do { warn "❌ connect $path: $!\n"; exit 2; };
+  # 关键：剥离 ambient :utf8 层，让 print 原样吐 UTF-8 字节，避免对已是 UTF-8 的内容二次编码。
+  binmode($s, ':raw');
+  my $line = to_json($obj) . "\n";
+  print $s $line;
+  my $reply = '';
+  eval {
+    local $SIG{ALRM} = sub { die "timeout\n" };
+    alarm 30;
+    while (my $l = <$s>) {
+      $reply .= $l;
+      last if length($reply) > 16384;
+    }
+    alarm 0;
+  };
+  close $s;
+  return $reply;
+}
+
+# 极简 JSON encoder（避免依赖 JSON::PP 之外的模块）—— 只支持本脚本要用的子集
+sub to_json {
+  my ($v) = @_;
+  my $r = ref($v);
+  if ($r eq 'HASH') {
+    return '{' . join(',', map { json_str($_) . ':' . to_json($v->{$_}) } sort keys %$v) . '}';
+  }
+  if ($r eq 'ARRAY') {
+    return '[' . join(',', map { to_json($_) } @$v) . ']';
+  }
+  if (!defined $v) { return 'null' }
+  if ($v =~ /^-?\d+(\.\d+)?$/) { return "$v" }
+  return json_str($v);
+}
+
+sub json_str {
+  my ($s) = @_;
+  $s =~ s/\\/\\\\/g;
+  $s =~ s/"/\\"/g;
+  $s =~ s/\n/\\n/g;
+  $s =~ s/\r/\\r/g;
+  $s =~ s/\t/\\t/g;
+  $s =~ s/([\x00-\x1f])/sprintf("\\u%04x", ord($1))/ge;
+  return qq("$s");
+}
+
+sub parse_json {
+  my ($s) = @_;
+  eval { require JSON::PP } or do {
+    # 退化解析：只取常见字段
+    my %h;
+    while ($s =~ /"(ok|op|short|pid|code|error|serverProto|via|messagingSock)":\s*(true|false|"([^"]*)"|(-?\d+))/g) {
+      my ($k, $raw, $sv, $nv) = ($1, $2, $3, $4);
+      $h{$k} = defined($sv) ? $sv : (defined($nv) ? 0+$nv : ($raw eq 'true' ? 1 : 0));
+    }
+    return \%h;
+  };
+  my $j = eval { JSON::PP->new->decode($s) };
+  return $j;
+}
+
+sub randhex {
+  my $n = shift;
+  my $h = '';
+  $h .= sprintf("%x", int(rand(16))) for 1..$n;
+  return $h;
+}
+
+sub uuid4 {
+  my @h = map { sprintf("%x", int(rand(16))) } 1..32;
+  $h[12] = '4';
+  $h[16] = (qw(8 9 a b))[int(rand(4))];
+  return join('', @h[0..7]) . '-' . join('', @h[8..11]) . '-' .
+         join('', @h[12..15]) . '-' . join('', @h[16..19]) . '-' .
+         join('', @h[20..31]);
+}
+
+sub die_usage { my $m=shift; warn "❌ $m\n"; print_usage(); exit 5 }
+
+sub print_usage {
+  print <<'EOF';
+cc-dispatch — 直接通过 daemon socket 派发 background session（等效 FleetView 手动派发）
+
+用法:
+  cc-dispatch --cwd <DIR> --name <NAME> --prompt <TEXT>
+  cc-dispatch --cwd <DIR> --name <NAME> --prompt-file <FILE>
+  echo "prompt..." | cc-dispatch --cwd <DIR> --name <NAME>
+
+选项:
+  --cwd <DIR>              工作目录（必填）
+  --name <NAME>            FleetView 显示名（必填）
+  --prompt <TEXT>          首条 prompt
+  --prompt-file <FILE>     从文件读 prompt
+  --agent <NAME>           agent（默认 claude）
+  --isolation worktree     用隔离 worktree（默认 none）
+  --inject-claude-md       开启 CLAUDE.md 注入（默认关，2.1.181 起）。会自动发现并把【用户级
+                           ~/.claude/CLAUDE.md + 从 cwd 向上到 git root 沿途每层 CLAUDE.md
+                           （目录级如 factory/、项目级如仓库根）】原文注入进 prompt。
+                           2.1.181 实测后台 session 已能按派发 cwd 自动加载三层 CLAUDE.md
+                           （14/14 spare 命中，见 PROTOCOL.md §11），故默认关、不与自动加载
+                           重复烧 token；仅当 daemon 版本回归致 worker 不守规范时再开。
+  --no-inject-claude-md    显式关闭注入（默认即关）。
+  --cmd-maxbytes <N>       单个 CLAUDE.md 注入字节上限（默认 131072）
+  --env KEY=VAL            注入被派发 session 的环境变量（可重复）
+                           子 session 编排里约定: --env FLEET_ROLE=worker
+  --sid-file <PATH>        派发成功后把 sessionId 写到此文件（推荐 <COORD_DIR>/<module>.sid）
+                           cc-fleet-status 据此用 SID 名册稳定关联，避免靠会变空的 session 名
+                           ⚠ 带 --sid-file 时会先过【复用兜底闸】(cc-fleet-coord --check-join)：
+                           把新模块写进已被别模块占用且超新鲜窗口的协调目录 → exit 6（疑似复用别任务 RQ）
+  --join                   确认是【同一任务的后续批次】，放行复用兜底闸（契约先行二次派发等才用）
+  --proto-version <N>      协议版本（默认 1）
+  --timeout-ms <N>         daemon 派发超时（默认 10000）
+  --socket <PATH>          指定 control.sock 路径（默认自动找）
+  --dry-run                只打印将发送的 request JSON，不连 daemon（测试用）
+  --json                   输出 daemon 原始返回
+  -h, --help               本帮助
+
+退出码:
+  0  成功
+  2  daemon 不可达 —— 应回退手动派发
+  3  schema/proto 不兼容 —— 应回退手动派发
+  4  daemon 业务错误
+  5  参数错误
+  6  复用兜底闸拦截（疑似复用别任务 RQ）—— 新任务用 cc-fleet-coord --alloc，同任务后续批次加 --join
+EOF
+}

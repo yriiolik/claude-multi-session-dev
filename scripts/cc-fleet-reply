@@ -1,0 +1,289 @@
+#!/usr/bin/env perl
+# cc-fleet-reply — 给某个【正在跑的子 session（worker）】发一条 user message（等价 FleetView 里给它回话）。
+#
+# 用途：worker blocked 在等授权/输入、或要纠偏 / 追加指令时，主 session 不必去 FleetView 手点，
+#       直接 `cc-fleet-reply <RQ> <module> "继续，按 X 改"` 把消息注入该 worker 的会话。
+#
+# 协议：daemon control socket 的 `reply` op（见 reference/PROTOCOL.md §5）：
+#   {"proto":1,"op":"reply","short":"<8hex>","text":"..."} → {"ok":true} / {"ok":false,"code":"ENOJOB"}
+#   ⚠ reply 用的是 daemon 的 **short（8 位 hex）**，不是 .sid 里记的 sessionId（UUID）。
+#     本脚本复用 `cc-fleet-status <RQ> --json`（单一事实源，与 cc-fleet-watch 同款）把
+#     <module> 解析成它【当前 live job 的 short】，再发 reply——绝不在这里另起一套 roster 关联。
+#
+# 用法:
+#   cc-fleet-reply <RQ> <module> "要发的话"          # 按 RQ 协调目录的 .sid 名册解析 module→short
+#   cc-fleet-reply <RQ> <module> --text-file F        # 文本从文件读
+#   echo "要发的话" | cc-fleet-reply <RQ> <module>    # 文本从 stdin
+#   cc-fleet-reply --short <8hex> "要发的话"          # 直接对某个 short 发（跳过解析）
+#   cc-fleet-reply <RQ> <module> --coord DIR "..."    # 显式协调目录
+#   cc-fleet-reply <RQ> <module> --dry-run "..."      # 只解析+打印将发送的 request，不连 daemon
+#
+# 退出码:
+#   0  发送成功（daemon 回 ok）
+#   2  daemon 不可达 / 无法解析出 live short（module 已 gone/不在跑 → 没有可发的对象）
+#   3  daemon 返回 ENOJOB（job 已结束）或 schema/proto 拒绝
+#   4  daemon 其他业务错误
+#   5  参数错误
+
+use strict;
+use warnings;
+use IO::Socket::UNIX;
+use File::Basename qw(dirname);
+use Cwd qw(abs_path);
+use Encode qw(encode_utf8);
+
+# 与 cc-dispatch 一致：按字节原样输出，源码里的中文/↳/emoji 已是 UTF-8 字节，避免二次编码乱码。
+binmode(STDOUT, ':raw');
+binmode(STDERR, ':raw');
+
+my ($rq, $module, $short, $coord, $text, $text_file, $dry_run, $help, $mock_status);
+my @pos;
+my @argv = @ARGV;
+while (@argv) {
+  my $a = shift @argv;
+  if    ($a eq '--short')       { $short = shift @argv }
+  elsif ($a eq '--coord')       { $coord = shift @argv }
+  elsif ($a eq '--text')        { $text = shift @argv }
+  elsif ($a eq '--text-file')   { $text_file = shift @argv }
+  elsif ($a eq '--mock-status') { $mock_status = shift @argv }  # 测试用：从文件读 cc-fleet-status --json
+  elsif ($a eq '--dry-run')     { $dry_run = 1 }
+  elsif ($a eq '-h' || $a eq '--help') { $help = 1 }
+  elsif ($a =~ /^--/)         { die_usage("未知参数: $a") }
+  else                        { push @pos, $a }
+}
+if ($help) { print_usage(); exit 0 }
+
+# 位置参数解析：
+#   --short 模式：  [text]
+#   RQ/module 模式：<RQ> <module> [text]
+if (defined $short) {
+  $text = shift @pos if !defined $text && @pos;
+} else {
+  $rq     = shift @pos if @pos;
+  $module = shift @pos if @pos;
+  $text   = shift @pos if !defined $text && @pos;
+  die_usage("缺 <RQ> 与 <module>（或用 --short <8hex>）") unless defined $rq && defined $module;
+}
+
+# 文本来源优先级：--text / 位置 text > --text-file > stdin
+if (!defined $text && defined $text_file) {
+  open my $fh, '<:raw', $text_file or die_usage("打不开 --text-file $text_file: $!");
+  local $/; $text = <$fh>; close $fh;
+} elsif (!defined $text && ! -t STDIN) {
+  local $/; $text = <STDIN>;
+}
+die_usage("缺要发送的文本（位置参数 / --text / --text-file / stdin）") unless defined $text && length $text;
+
+# 文本归一成 UTF-8 字节串（与 cc-dispatch 同策略）：带 flag 的编码回字节，原始字节原样。
+$text = utf8::is_utf8($text) ? encode_utf8($text) : $text;
+
+# --- 解析 short（除非 --short 直给）---
+my $resolved_state = '';
+if (!defined $short) {
+  my ($s, $st, $err) = resolve_short($rq, $module, $coord);
+  if (!defined $s) {
+    warn "❌ $err\n";
+    exit 2;
+  }
+  $short = $s; $resolved_state = $st // '';
+}
+die_usage("short 形如 8 位 hex，收到: $short") unless $short =~ /^[a-f0-9]{8}$/;
+
+# --- 构造 reply 请求 ---
+my $req = { proto => 1, op => 'reply', short => $short, text => $text };
+# 2.1.169+ 控制密钥鉴权：reply 是写操作，须带 auth=控制密钥（缺失则不带，兼容旧版）
+my $ckey = load_control_key();
+$req->{auth} = $ckey if defined $ckey && length $ckey;
+
+if ($dry_run) {
+  print "would reply → short=$short", ($resolved_state ? " (state=$resolved_state)" : ''), "\n";
+  print to_json($req), "\n";
+  exit 0;
+}
+
+my $sock = find_control_sock();
+unless ($sock && -S $sock) {
+  warn "❌ daemon control socket 找不到（先 `claude agents --json` 拉起 daemon）。\n";
+  exit 2;
+}
+
+my $resp = send_request($sock, $req);
+my $parsed = parse_json($resp);
+if (!$parsed) { warn "❌ daemon 返回不可解析: $resp\n"; exit 4 }
+
+if ($parsed->{ok}) {
+  my $who = defined $module ? "$module" : $short;
+  print "✅ 已发送给 $who (short=$short)\n";
+  exit 0;
+}
+
+my $code = $parsed->{code} // 'EUNKNOWN';
+my $errm = $parsed->{error} // 'unknown';
+if ($code eq 'ENOJOB') {
+  warn "⚠ job 已结束/不存在（short=$short）：$errm —— 该 worker 已不在跑，无法回复。去 cc-fleet-summary 收回执。\n";
+  exit 3;
+}
+if ($code eq 'EPROTO') {
+  warn "❌ proto 不匹配（server=", ($parsed->{serverProto}//'?'), "）：claude code 升级后协议变了，去 FleetView 手动回复或更新 PROTOCOL.md。\n";
+  exit 3;
+}
+warn "❌ daemon error: [$code] $errm\n";
+exit 4;
+
+# ---------------- helpers ----------------
+
+# 复用 cc-fleet-status --json 把 <module> 解析成它当前 live job 的 short（单一事实源）。
+# 返回 (short, state, undef) 成功 / (undef, undef, errmsg) 失败。
+sub resolve_short {
+  my ($rq, $mod, $coord) = @_;
+  my $data = status_jobs($rq, $coord);
+  return (undef, undef, $data) unless ref $data;   # status_jobs 出错时回字符串 errmsg
+
+  my $hit;
+  for my $j (@{$data->{jobs}}) {
+    next unless defined $j->{_module} && $j->{_module} eq $mod;
+    $hit = $j; last;
+  }
+  return (undef, undef, "$rq 名册里没有 module=$mod（确认派发时带了 --sid-file <COORD>/$mod.sid）") unless $hit;
+
+  my $st = $hit->{state} // '?';
+  # gone = roster 有、daemon 列表已无 → 它的 short 是 sessionId 前缀（非真 short），且已结束，不能 reply。
+  if ($st eq 'gone') {
+    return (undef, undef, "module=$mod 已 gone（结束/被回收）—— 没有在跑的会话可回复。去 cc-fleet-summary 收回执。");
+  }
+  my $s = $hit->{short} // '';
+  return (undef, undef, "module=$mod 解析不到有效 short（state=$st）") unless $s =~ /^[a-f0-9]{8}$/;
+  return ($s, $st, undef);
+}
+
+# 取 cc-fleet-status --json 的解析结果（hashref，含 {jobs:[...]}）；出错回字符串 errmsg。
+# --mock-status FILE 时从文件读（测试用），否则 shell out 到同目录 cc-fleet-status。
+sub status_jobs {
+  my ($rq, $coord) = @_;
+  my $out;
+  if (defined $mock_status) {
+    open my $fh, '<', $mock_status or return "打不开 --mock-status $mock_status: $!";
+    local $/; $out = <$fh>; close $fh;
+  } else {
+    my $status_bin = sibling('cc-fleet-status');
+    return "找不到同目录 cc-fleet-status（解析 module→short 依赖它）" unless -x $status_bin;
+    my @cmd = ($status_bin, $rq, '--json');
+    push @cmd, ('--coord', $coord) if defined $coord && length $coord;
+    my $pid = open(my $fh, '-|');
+    return "fork cc-fleet-status 失败: $!" unless defined $pid;
+    if ($pid == 0) { open(STDERR, '>', '/dev/null'); exec @cmd; exit 127 }
+    { local $/; $out = <$fh> }
+    close $fh;
+  }
+  my $data = parse_json($out);
+  return "cc-fleet-status 无 JSON 输出（daemon 不可达？先 `claude agents --json`）"
+    unless $data && ref($data->{jobs}) eq 'ARRAY';
+  return $data;
+}
+
+sub sibling {
+  my $name = shift;
+  my $dir = dirname(abs_path($0));
+  return "$dir/$name";
+}
+
+sub find_control_sock {
+  my $base = "/tmp/cc-daemon-$<";
+  return undef unless -d $base;
+  opendir my $dh, $base or return undef;
+  my @dirs = grep { /^[a-f0-9]{8}$/ && -d "$base/$_" } readdir $dh;
+  closedir $dh;
+  for my $d (sort @dirs) {
+    my $s = "$base/$d/control.sock";
+    return $s if -S $s;
+  }
+  return undef;
+}
+
+# 读 daemon 控制密钥：环境变量 > ~/.claude/daemon/control.key（2.1.169+ 鉴权）
+sub load_control_key {
+  for my $ev (qw(CLAUDE_DAEMON_CONTROL_KEY CLAUDE_BG_CONTROL_AUTH)) {
+    return $ENV{$ev} if defined $ENV{$ev} && length $ENV{$ev};
+  }
+  my $home = $ENV{HOME} // (getpwuid($<))[7];
+  return undef unless defined $home;
+  my $kf = "$home/.claude/daemon/control.key";
+  return undef unless -r $kf;
+  open my $fh, '<', $kf or return undef;
+  local $/; my $k = <$fh>; close $fh;
+  return undef unless defined $k;
+  $k =~ s/^\s+//; $k =~ s/\s+$//;
+  return length $k ? $k : undef;
+}
+
+sub send_request {
+  my ($path, $obj) = @_;
+  my $s = IO::Socket::UNIX->new(Peer => $path, Type => SOCK_STREAM)
+    or do { warn "❌ connect $path: $!\n"; exit 2 };
+  binmode($s, ':raw');   # 让 print 原样吐 UTF-8 字节，避免对已是字节的 text 二次编码
+  print $s to_json($obj) . "\n";
+  my $reply = '';
+  eval {
+    local $SIG{ALRM} = sub { die "timeout\n" };
+    alarm 30;
+    while (my $l = <$s>) { $reply .= $l; last if length($reply) > 65536 }
+    alarm 0;
+  };
+  close $s;
+  return $reply;
+}
+
+# 极简 JSON encoder（与 cc-dispatch 同款，只覆盖本脚本用到的子集）
+sub to_json {
+  my ($v) = @_;
+  my $r = ref($v);
+  if ($r eq 'HASH')  { return '{' . join(',', map { json_str($_) . ':' . to_json($v->{$_}) } sort keys %$v) . '}' }
+  if ($r eq 'ARRAY') { return '[' . join(',', map { to_json($_) } @$v) . ']' }
+  if (!defined $v)   { return 'null' }
+  if ($v =~ /^-?\d+(\.\d+)?$/) { return "$v" }
+  return json_str($v);
+}
+sub json_str {
+  my ($s) = @_;
+  $s =~ s/\\/\\\\/g; $s =~ s/"/\\"/g;
+  $s =~ s/\n/\\n/g;  $s =~ s/\r/\\r/g; $s =~ s/\t/\\t/g;
+  $s =~ s/([\x00-\x1f])/sprintf("\\u%04x", ord($1))/ge;
+  return qq("$s");
+}
+sub parse_json {
+  my ($s) = @_;
+  return undef unless defined $s && length $s;
+  eval { require JSON::PP } or do {
+    my %h;
+    while ($s =~ /"(ok|op|code|error|serverProto|short|state|_module|sessionId)":\s*(true|false|"((?:[^"\\]|\\.)*)"|(-?\d+))/g) {
+      my ($k, $raw, $sv, $nv) = ($1, $2, $3, $4);
+      $h{$k} = defined($sv) ? $sv : (defined($nv) ? 0+$nv : ($raw eq 'true' ? 1 : 0));
+    }
+    return \%h;
+  };
+  return eval { JSON::PP->new->utf8->decode($s) };
+}
+
+sub die_usage { my $m = shift; warn "❌ $m\n"; print_usage(); exit 5 }
+
+sub print_usage {
+  print <<'EOF';
+cc-fleet-reply — 给正在跑的子 session（worker）发一条 user message（等价 FleetView 里回它话）
+
+用法:
+  cc-fleet-reply <RQ> <module> "要发的话"        # 解析 module→当前 short 后发送
+  cc-fleet-reply <RQ> <module> --text-file F      # 文本从文件读
+  echo "..." | cc-fleet-reply <RQ> <module>       # 文本从 stdin
+  cc-fleet-reply --short <8hex> "要发的话"        # 直接对某个 short 发
+
+选项:
+  --short <8hex>   直接指定 daemon short（跳过 RQ/module 解析）
+  --coord DIR      显式协调目录（透传给 cc-fleet-status 做解析）
+  --text "..."     要发送的文本（等价位置参数）
+  --text-file F    从文件读文本
+  --dry-run        只解析+打印将发送的 request JSON，不连 daemon
+  -h, --help       本帮助
+
+退出码: 0=成功 / 2=daemon不可达或无live short / 3=ENOJOB(已结束)或proto拒 / 4=其他错误 / 5=参数错误
+EOF
+}

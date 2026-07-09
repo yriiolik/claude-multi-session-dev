@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+# cc-dispatch-batch — 把 tasks/<RQ>/modules/*.md 全部派发为 background sessions
+#
+# 用法:
+#   cc-dispatch-batch <RQ-id>
+#
+# 约定:
+#   - 仓库根有 tasks/<RQ-id>/modules/<module>.md
+#   - 仓库根有 modules/<module>/   作为模块代码目录
+#   - 派发出来的 session: name="<module>@<RQ-id>", cwd=modules/<module>/, prompt=任务卡全文
+#   - 派发后 sid 记录到 tasks/<RQ-id>/sessions/<module>.sid
+#
+# 失败时（cc-dispatch exit 2/3）打印 FleetView 手动派发清单作为兜底。
+
+set -euo pipefail
+
+# 解析参数：位置参数 = <RQ-id>；--join = 确认同一任务后续批次，放行复用兜底闸
+JOIN=""
+ARGS=()
+for a in "$@"; do
+  case "$a" in
+    --join) JOIN="--join" ;;
+    *) ARGS+=("$a") ;;
+  esac
+done
+RQ="${ARGS[0]:?用法: $0 <RQ-id> [--join]，例如 RQ-2026-0524-001}"
+
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+TASK_DIR="$REPO_ROOT/tasks/$RQ"
+MODULES_DIR="$TASK_DIR/modules"
+SESSION_DIR="$TASK_DIR/sessions"
+SCRIPT_DIR="$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")"
+DISPATCH_BIN="$SCRIPT_DIR/cc-dispatch"
+COORD_BIN="$SCRIPT_DIR/cc-fleet-coord"   # 复用兜底闸（--check-join）的单一事实源
+
+[[ -d "$MODULES_DIR" ]] || { echo "❌ 没找到任务目录: $MODULES_DIR" >&2; exit 1; }
+[[ -x "$DISPATCH_BIN" ]] || { echo "❌ 没找到 cc-dispatch: $DISPATCH_BIN" >&2; exit 1; }
+
+mkdir -p "$SESSION_DIR"
+
+# 收集所有任务卡（不用 mapfile，兼容 macOS 自带 bash 3.2）
+CARDS=()
+while IFS= read -r _card; do
+  [[ -n "$_card" ]] && CARDS+=("$_card")
+done < <(find "$MODULES_DIR" -maxdepth 1 -type f -name '*.md' | sort)
+[[ ${#CARDS[@]} -gt 0 ]] || { echo "❌ $MODULES_DIR 里没有 .md 任务卡" >&2; exit 1; }
+
+echo "▶ 准备派发 ${#CARDS[@]} 个模块 session ($RQ)"
+echo
+
+DEGRADED=0
+declare -a MANUAL_LIST
+
+for CARD in "${CARDS[@]}"; do
+  MODULE="$(basename "$CARD" .md)"
+  MODULE_DIR="$REPO_ROOT/modules/$MODULE"
+  SID_FILE="$SESSION_DIR/$MODULE.sid"
+  # ↳ 前缀标记"被派发的子 session"，与主 session 一眼区分（见 SKILL.md 命名约定）
+  NAME="↳$MODULE@$RQ"
+
+  if [[ ! -d "$MODULE_DIR" ]]; then
+    echo "⚠ skip $MODULE: $MODULE_DIR 不存在"
+    continue
+  fi
+
+  if [[ -f "$SID_FILE" ]]; then
+    echo "⚠ skip $MODULE: 已派发过（$(cat "$SID_FILE")），删 $SID_FILE 后重派"
+    continue
+  fi
+
+  # 复用兜底闸：把新模块写进【已被别模块占用且超新鲜窗口】的 sessions/ 目录 → 拦下（疑似复用别任务 RQ）。
+  # 同批并行派发在新鲜窗口内放行；超窗（多半是手拼旧 RQ 复用别任务目录）→ skip，提示用 --alloc 或 --join。
+  if [[ -x "$COORD_BIN" ]]; then
+    set +e
+    "$COORD_BIN" --check-join "$SESSION_DIR" "$MODULE" $JOIN
+    GRC=$?
+    set -e
+    if [[ $GRC -eq 6 ]]; then
+      echo "⚠ skip $MODULE: 协调目录疑似复用了别的任务的 RQ（见上）。新任务请 cc-fleet-coord --alloc 取新号；确属同一任务后续批次请加 --join 重跑。"
+      continue
+    fi
+  fi
+
+  echo "▶ dispatch $MODULE → cwd=modules/$MODULE/  name=$NAME"
+
+  # 在任务卡前拼一条 worker 哨兵行，确保子 session 可被取名 hook / 自身识别为 worker
+  TMP_PROMPT="$(mktemp -t "cc-batch-$MODULE.XXXXXX")"
+  {
+    echo "⟦FLEET-WORKER⟧ rq=$RQ module=$MODULE"
+    echo
+    cat "$CARD"
+  } > "$TMP_PROMPT"
+
+  # 把 prompt 写到临时文件再传给 cc-dispatch，避免命令行长度限制和 quote 噩梦
+  # --env 注入 FLEET_ROLE=worker：子 session 自我识别（别误以为自己是主 session）
+  set +e
+  OUTPUT="$("$DISPATCH_BIN" --cwd "$MODULE_DIR" --name "$NAME" \
+    --env FLEET_ROLE=worker --env FLEET_RQ="$RQ" --env FLEET_MODULE="$MODULE" \
+    --prompt-file "$TMP_PROMPT" 2>&1)"
+  RC=$?
+  set -e
+  rm -f "$TMP_PROMPT"
+  echo "$OUTPUT" | sed 's/^/    /'
+
+  if [[ $RC -eq 0 ]]; then
+    # 抽出 short 存盘
+    SHORT="$(echo "$OUTPUT" | sed -n 's/.*short=\([a-f0-9]*\).*/\1/p' | head -1)"
+    [[ -n "$SHORT" ]] && echo "$SHORT" > "$SID_FILE"
+  elif [[ $RC -eq 2 || $RC -eq 3 ]]; then
+    DEGRADED=1
+    MANUAL_LIST+=("$MODULE|$MODULE_DIR|$NAME|$CARD")
+  else
+    echo "❌ $MODULE 派发失败 (exit $RC) — 跳过，继续处理其他模块"
+  fi
+  echo
+done
+
+if [[ $DEGRADED -eq 1 ]]; then
+  cat <<HEADER
+
+╔══════════════════════════════════════════════════════════════════╗
+║  ⚠ cc-dispatch 自动派发失败（daemon 不可达或协议不兼容）         ║
+║  请在新 terminal 跑 \`claude agents\`，按下表手动派发：             ║
+╚══════════════════════════════════════════════════════════════════╝
+
+HEADER
+  printf "  %-20s %-50s %-25s %s\n" "MODULE" "CWD" "NAME" "PROMPT FILE"
+  printf "  %-20s %-50s %-25s %s\n" "------" "---" "----" "-----------"
+  for entry in "${MANUAL_LIST[@]}"; do
+    IFS='|' read -r mod cwd name card <<< "$entry"
+    printf "  %-20s %-50s %-25s %s\n" "$mod" "$cwd" "$name" "$card"
+  done
+  echo
+  echo "提示：FleetView 'New agent' 表单里 prompt 字段可粘贴上述 PROMPT FILE 的全文。"
+  exit 3
+fi
+
+echo "✅ 全部派发完成。查看状态: cc-fleet-status $RQ"

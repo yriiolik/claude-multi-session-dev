@@ -1,0 +1,165 @@
+#!/usr/bin/env bash
+# cc-fleet-summary — 把各 dispatched session 回填的「会话回执」汇总打印给主 session
+#
+# 每个被派发的 session 完成后会把简短总结写到 <COORD_DIR>/<module>.summary.md
+#（真实改动 / 预期变化 / 影响面 / 已知缺陷 / 自测结果 / L2 文档与双向 trace / 关键 commit）。
+#
+# ⭐ worktree / sandbox 安全：worker 常跑在隔离 worktree 里，受 sandbox 限制只能把回执写进
+#   它【自己 worktree】的 .fleet/<RQ>/，而不是主仓库路径。本脚本因此【多通道兜底】扫：
+#     1) canonical：<git-common-dir>/fleet/<RQ>   （worktree 无关、不进版本库）
+#     2) 主仓库 toplevel 的 .fleet/<RQ>（含 monorepo 子目录 */.fleet/<RQ>）
+#     3) 【每个 git worktree】内的 .fleet/<RQ>（worker 在自己 worktree 写的回执——主 session 不被
+#        sandbox 限制，能直接读到）
+#     4) 结构化布局 tasks/<RQ>/sessions
+#   —— 主 session 是 orchestrator、不被 sandbox 限制，能读所有 worktree，所以无论 worker 写哪，
+#      都能在这里收齐。绝不要因为「主路径上没出现 summary 文件」就以为 worker 没完成而无限等待。
+#
+# 用法:
+#   cc-fleet-summary <RQ-id>          # 多通道扫该 RQ 的所有回执（推荐）
+#   cc-fleet-summary <coord-dir>      # 指定协调目录为主，同时仍兜底扫 worktree
+#   cc-fleet-summary                  # 缺省找最近的协调目录
+#
+# 退出码:
+#   0  至少打印了一个回执
+#   1  没找到任何回执（配合 cc-fleet-status 看状态：still running 就等；done/gone 却没回执
+#      → 读该 session 最后一条消息，见末尾提示）
+#   2  连协调目录都定位不到
+
+set -uo pipefail
+
+ARG="${1:-}"
+EXPLICIT_DIR=""
+RQ=""
+if [[ -n "$ARG" && -d "$ARG" ]]; then
+  EXPLICIT_DIR="$ARG"; RQ="$(basename "$ARG")"
+elif [[ -n "$ARG" ]]; then
+  RQ="$ARG"
+fi
+
+COMMON_DIR="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
+TOP="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+
+CANDS=()
+add_dir() { [[ -n "${1:-}" && -d "$1" ]] && CANDS+=("$1"); }
+
+[[ -n "$EXPLICIT_DIR" ]] && add_dir "$EXPLICIT_DIR"
+
+if [[ -n "$RQ" ]]; then
+  add_dir "$COMMON_DIR/fleet/$RQ"
+  if [[ -n "$TOP" ]]; then
+    add_dir "$TOP/.fleet/$RQ"
+    add_dir "$TOP/tasks/$RQ/sessions"
+    add_dir "$TOP/tasks/$RQ"
+    for d in "$TOP"/*/.fleet/"$RQ";          do add_dir "$d"; done
+    for d in "$TOP"/*/tasks/"$RQ"/sessions;  do add_dir "$d"; done
+  fi
+  # 所有 git worktree 内的 .fleet/<RQ>（worker 在自己 worktree 里写的回执）
+  while IFS= read -r wt; do
+    [[ -z "$wt" ]] && continue
+    add_dir "$wt/.fleet/$RQ"
+    add_dir "$wt/tasks/$RQ/sessions"
+    for d in "$wt"/*/.fleet/"$RQ"; do add_dir "$d"; done
+  done < <(git worktree list --porcelain 2>/dev/null | awk '/^worktree /{print $2}' || true)
+  add_dir "./.fleet/$RQ"
+  for d in ./*/.fleet/"$RQ"; do add_dir "$d"; done
+fi
+
+# 无参数：取 .fleet 下最近修改的子目录
+if [[ ${#CANDS[@]} -eq 0 ]]; then
+  base="${TOP:-$PWD}"
+  for froot in "$base/.fleet" "$base"/*/.fleet; do
+    [[ -d "$froot" ]] || continue
+    latest="$(find "$froot" -mindepth 1 -maxdepth 1 -type d 2>/dev/null \
+      | while read -r d; do printf '%s\t%s\n' "$(stat -f %m "$d" 2>/dev/null || echo 0)" "$d"; done \
+      | sort -rn | head -1 | cut -f2-)"
+    [[ -n "$latest" ]] && { add_dir "$latest"; RQ="$(basename "$latest")"; break; }
+  done
+fi
+
+if [[ ${#CANDS[@]} -eq 0 ]]; then
+  echo "❌ 找不到协调目录（给 <coord-dir> 或 <RQ-id>，或在仓库根/子目录建 .fleet/<RQ>/）" >&2
+  exit 2
+fi
+
+# ---- 顺手修复已完成 worker 的 FleetView 显示退化（name=bg / 时长=0s）----
+# 收回执这一步必在 worker 完成后跑，是把磁盘 state.json 修回的可靠时机（完成态记录此后稳定不再被改写）。
+# best-effort：委托给同目录 cc-fleet-fix-display（单一事实源），找不到/失败都静默跳过，不影响收回执。
+if [[ -n "$RQ" ]]; then
+  SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+  if [[ -x "$SELF_DIR/cc-fleet-fix-display" ]]; then
+    "$SELF_DIR/cc-fleet-fix-display" "$RQ" --quiet 2>/dev/null || true
+  fi
+fi
+
+# ---- 收集回执（跨所有候选目录，按 module 去重，先命中者优先）----
+SEEN_RCPT=" "
+RCPT_MODS=()
+RCPT_PATHS=()
+for dir in "${CANDS[@]}"; do
+  while IFS= read -r f; do
+    [[ -z "$f" ]] && continue
+    mod="$(basename "$f" .summary.md)"
+    case "$SEEN_RCPT" in *" $mod "*) continue ;; esac
+    SEEN_RCPT="$SEEN_RCPT$mod "
+    RCPT_MODS+=("$mod"); RCPT_PATHS+=("$f")
+  done < <(find "$dir" -maxdepth 1 -type f -name '*.summary.md' 2>/dev/null | sort)
+done
+
+# ---- 已派发名册（*.sid）：用于发现「派了却没回执」的模块 ----
+SEEN_SID=" "
+SID_MODS=()
+for dir in "${CANDS[@]}"; do
+  while IFS= read -r sf; do
+    [[ -z "$sf" ]] && continue
+    m="$(basename "$sf" .sid)"
+    case "$SEEN_SID" in *" $m "*) continue ;; esac
+    SEEN_SID="$SEEN_SID$m "
+    SID_MODS+=("$m")
+  done < <(find "$dir" -maxdepth 1 -type f -name '*.sid' 2>/dev/null | sort)
+done
+
+echo "▶ RQ: ${RQ:-?}"
+echo "▶ 扫描通道: ${#CANDS[@]} 个候选目录（canonical + 主树 + 所有 worktree）"
+
+N="${#RCPT_MODS[@]}"
+if [[ "$N" -gt 0 ]]; then
+  echo "▶ 已收回执: $N 个"
+  echo
+  idx=0
+  while [[ $idx -lt $N ]]; do
+    mod="${RCPT_MODS[$idx]}"; f="${RCPT_PATHS[$idx]}"
+    echo "════════════════════════════════════════════════════════════════════"
+    echo "📦 模块: $mod   ($f)"
+    echo "════════════════════════════════════════════════════════════════════"
+    cat "$f"
+    echo
+    echo
+    idx=$((idx + 1))
+  done
+fi
+
+# ---- 派了却没回执的模块（醒目，避免误判"没完成"）----
+MISSING=()
+if [[ ${#SID_MODS[@]} -gt 0 ]]; then
+  for m in "${SID_MODS[@]}"; do
+    case "$SEEN_RCPT" in *" $m "*) ;; *) MISSING+=("$m") ;; esac
+  done
+fi
+if [[ ${#MISSING[@]} -gt 0 ]]; then
+  echo "⚠ 已派发但全通道未找到回执的模块（${#MISSING[@]} 个）："
+  for m in "${MISSING[@]}"; do echo "   - $m"; done
+  echo "   → 先跑 cc-fleet-status ${RQ:-<RQ>} 看状态："
+  echo "       · 还在 running/working ⇒ 正常，过会儿再收；"
+  echo "       · 已 done/gone 却没回执 ⇒ 该 session 没把回执落盘，"
+  echo "         直接读它的【最后一条消息】（FleetView / 通知里那条就是回执）。"
+  echo "   ⛔ 绝不要因为「主路径上没出现 summary 文件」就当 worker 没完成而无限等待。"
+  echo
+fi
+
+if [[ "$N" -eq 0 ]]; then
+  echo "（候选目录里还没有任何 *.summary.md 回执 —— 跑 cc-fleet-status ${RQ:-<RQ>} 看状态；"
+  echo "  done/gone 却没回执就读该 session 最后一条消息，别死等文件）" >&2
+  exit 1
+fi
+
+echo "提示：完成判定看 cc-fleet-status（按 SID 关联，不靠文件）；整体业务效果由主 session 据上述回执 + 验收 session 报告裁定。"

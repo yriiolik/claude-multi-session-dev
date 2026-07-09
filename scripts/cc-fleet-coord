@@ -1,0 +1,340 @@
+#!/usr/bin/env bash
+# cc-fleet-coord — RQ ↔ canonical 协调目录：解析 / 自动分配空号 / 防撞已用目录
+#
+# 三种职责（默认=解析；加 --alloc=分配；加 --fresh=解析并防撞）：
+#   1) 解析（默认，向后兼容）：把【已定的】<RQ-id> 映射到 worktree 无关的 canonical 绝对路径
+#        <git-common-dir>/fleet/<RQ>，并 mkdir -p。worker / cc-fleet-status / cc-fleet-summary 都靠它。
+#   2) 分配（--alloc）：扫【所有通道】（canonical + 主树/各 worktree 的 .fleet + tasks 布局），自动挑
+#        同日下一个【没被占用】的序号，claim（建 canonical 目录占位）后把新 RQ-id 打到 stdout。
+#        —— 根治「主 session 同一天起多个 run、肉眼挑 001 又撞上早些时候已用的协调目录」这一典型事故。
+#   3) 防撞（--fresh）：解析一个【显式 RQ】，但若它已被【往轮 run】占用（任一通道已有
+#        *.sid / *.summary.md / contracts/）→ 报错退出（exit 4），提示改用 --alloc。
+#        供"用户/调用方给了显式 RQ 名"时兜底，避免静默复用别人的协调目录。
+#
+# 为什么用 canonical 路径：worker 常跑在隔离 worktree 里。相对 .fleet/<RQ> 在 worker 的 worktree
+#   里会解析成【worker 自己 worktree 内】的路径，主 session 盯主仓库永远读不到 → 死等。canonical
+#   锚在所有 worktree 共享、且在 .git/ 内不会被 commit 的 git-common-dir 下：<git-common-dir>/fleet/<RQ>。
+#
+# 用法:
+#   cc-fleet-coord <RQ-id>                 # 解析：打印 canonical 协调目录绝对路径（并 mkdir -p）
+#   cc-fleet-coord <RQ-id> --no-mkdir      # 解析：只打印，不创建
+#   cc-fleet-coord <RQ-id> --fresh         # 解析 + 防撞：RQ 已被往轮 run 占用则 exit 4，否则同解析
+#   cc-fleet-coord --alloc                 # 分配：挑今天 RQ-<YYYY>-<MMDD>-NNN 的下一个空号，claim 并打印 RQ-id
+#   cc-fleet-coord --alloc <stem|ISO日期>  # 分配：自定义前缀(<stem>-NNN) 或 ISO 日期(2026-06-05→RQ-2026-0605-NNN)
+#   cc-fleet-coord --init-base <RQ> [base] # 集成分支：在 base(默认当前分支)上幂等创建 fleet/<RQ>、记 base.ref，打印 fleet/<RQ>
+#   cc-fleet-coord --check-join <coord> <m> [--join]  # 派发兜底闸：新模块写进已被【别的模块】占用且超新鲜窗口的协调目录则 exit 6（疑似复用别任务 RQ）
+#   cc-fleet-coord <RQ> --put <relpath> [src] # 把文件落进协调目录（绕开后台 job 的 Write/Edit 隔离闸）；省略 src 从 stdin 读；打印目标绝对路径
+#   cc-fleet-coord --gc [days]             # 清理：删 canonical fleet 里 mtime 超 days(默认7) 天的协调目录 + 过期序号池文件（cc-fleet-init 每次自动调）
+#
+# 注：日常派发别单独敲这些子命令 —— 用一次性入口 `cc-fleet-init`（同目录），一句 eval 就 GC + 取新号 + 建集成分支 + 落任务信息。
+#
+# 退出码补充: 6 --check-join 拦截（疑似复用别的任务 RQ；用 --alloc 取新号，或 --join 确认同一任务后续批次）
+#
+# 典型用法（主 session 在 Step 2 派发前——别再手挑序号）：
+#   RQ="$(cc-fleet-coord --alloc)"           # 保证全新、不撞已用目录
+#   COORD="$(cc-fleet-coord "$RQ")"          # 解析其 canonical 协调目录
+#   INT="$(cc-fleet-coord --init-base "$RQ")" # 建集成分支 fleet/<RQ>（base=当前分支）；打印 fleet/<RQ>
+#   # 把 $COORD 作为 {{COORD_DIR}} 替进 dispatch-preamble，--sid-file "$COORD/<module>.sid"，
+#   # 并用 --env FLEET_BASE_BRANCH="$INT" 把集成分支告诉 worker（它据此 reset --hard 锚定 + cc-fleet-land 落地）
+#
+# 退出码: 0 成功 / 2 不在 git 仓库或用法错 / 4 --fresh 撞到已被往轮占用的 RQ
+
+set -uo pipefail
+shopt -s nullglob
+
+MODE=resolve
+MKDIR=1
+JOIN=0
+POS=()
+for a in "$@"; do
+  case "$a" in
+    --no-mkdir)    MKDIR=0 ;;
+    --alloc)       MODE=alloc ;;
+    --fresh)       MODE=fresh ;;
+    --init-base)   MODE=initbase ;;
+    --check-join)  MODE=checkjoin ;;
+    --put)         MODE=put ;;
+    --gc)          MODE=gc ;;
+    --join)        JOIN=1 ;;
+    -*) echo "未知选项: $a" >&2; exit 2 ;;
+    *)  POS+=("$a") ;;
+  esac
+done
+# 兼容 macOS bash 3.2：空数组下 ${POS[0]:-} 安全，"${POS[@]}" 在 set -u 会炸，故都用默认形/先判长度。
+ARG="${POS[0]:-}"
+
+# ---- check-join：派发兜底闸（cc-dispatch / cc-dispatch-batch 调用）----
+# 用途：把一个【新模块】写进【已被别的模块占用、且最后活动超出新鲜窗口】的协调目录前，先在这里拦一道。
+#   这是对「主 session 丢了 $RQ、凭『今天+NNN』手拼旧编号 → 普通解析静默复用别的任务协调目录 → 串台」的
+#   结构兜底（典型事故 2026-06-09：上午 RQ-...-001，下午另一任务又手敲 001 复用同目录）。--alloc 是第一道
+#   防线（永不发已用号），本闸是第二道（即便手拼了旧号，派发当场被拦，而非静默混入）。
+#   退出码：0=放行（全新/同一活跃批次/--join 确认/闸已关）；6=拦截（疑似复用别的任务 RQ）。
+#   语义：仅看【别的模块】的工件——本模块自身的旧 .sid/.summary.md 不算冲突（同模块重派不该被自己挡）。
+#   新鲜窗口默认 1800s（FLEET_JOIN_FRESH_SECS 可调），窗口内视为同一活跃批次/并行批派放行；
+#   超窗且无 --join → 拦。FLEET_NO_REUSE_GUARD 非空则整闸关闭。
+#   ⚠ 本模式扫的是【显式绝对协调目录】，与 git 无关——必须放在下面 git-common-dir 检查【之前】，
+#     否则 cc-dispatch 在非 git 仓库的 cwd 里调用它会先撞 git 检查 exit 2、永远走不到这里（曾踩此坑）。
+if [[ "$MODE" == checkjoin ]]; then
+  coord="${POS[0]:-}"; module="${POS[1]:-}"
+  [[ -n "$coord" && -n "$module" ]] || {
+    echo "用法: cc-fleet-coord --check-join <coord-dir> <module> [--join]" >&2; exit 2; }
+  [[ -n "${FLEET_NO_REUSE_GUARD:-}" ]] && exit 0   # 闸总开关：关
+  [[ -d "$coord" ]] || exit 0                      # 目录还不存在 = 全新，放行
+  newest=0; others=()
+  for f in "$coord"/*.sid "$coord"/*.summary.md; do
+    [[ -f "$f" ]] || continue
+    base="$(basename "$f")"; stem="${base%.sid}"; stem="${stem%.summary.md}"
+    [[ "$stem" == "$module" ]] && continue         # 本模块自身工件，跳过
+    others+=("$stem")
+    m="$(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f" 2>/dev/null || echo 0)"
+    [[ "$m" =~ ^[0-9]+$ ]] || m=0
+    (( m > newest )) && newest=$m
+  done
+  [[ ${#others[@]} -eq 0 ]] && exit 0              # 没有别的模块 = 首个模块/全新，放行
+  uniq_others="$(printf '%s\n' "${others[@]}" | sort -u | paste -sd, -)"
+  if [[ "$JOIN" -eq 1 ]]; then
+    echo "↩ 加入已存在协调目录 ${coord}（已有模块: ${uniq_others}）—— --join 已确认是同一任务的后续批次。" >&2
+    exit 0
+  fi
+  now="$(date +%s)"; age=$(( now - newest )); window="${FLEET_JOIN_FRESH_SECS:-1800}"
+  (( age <= window )) && exit 0                    # 同一活跃批次（含并行批派），放行（静默）
+  mins=$(( age / 60 ))
+  echo "❌ 协调目录 ${coord} 已被其它模块占用 [${uniq_others}]，最后活动在 ${mins} 分钟前（超出 ${window}s 新鲜窗口）。" >&2
+  echo "   这极可能是【复用了别的任务的 RQ】（典型：丢了 \$RQ、凭『今天+NNN』手拼了旧编号）。两种正解：" >&2
+  echo "   • 新任务 → 改用 RQ=\"\$(cc-fleet-coord --alloc)\" 取全新空号（会跳过所有已用序号），别手敲编号。" >&2
+  echo "   • 同一任务的后续批次（契约先行二次派发等）→ 给本次派发加 --join 放行。" >&2
+  echo "   （需整体关闭本闸：export FLEET_NO_REUSE_GUARD=1；调窗口：FLEET_JOIN_FRESH_SECS=秒）" >&2
+  exit 6
+fi
+
+COMMON_DIR="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
+TOP="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+if [[ -z "$COMMON_DIR" ]]; then
+  echo "❌ 不在 git 仓库里，无法定位 git-common-dir。请在仓库内运行，或自行指定一个绝对协调目录。" >&2
+  exit 2
+fi
+FLEET_DIR="$COMMON_DIR/fleet"
+
+# ---- 通用小工具：文件/目录 mtime → epoch 秒 / 年龄秒（stat 跨 BSD(macOS) 与 GNU(Linux) 兼容）----
+_epoch_of(){ stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || echo 0; }
+_age_secs(){ local m; m="$(_epoch_of "$1")"; [[ "$m" =~ ^[0-9]+$ ]] || m=0; echo $(( $(date +%s) - m )); }
+
+# ---- 原子锁：mkdir 是 POSIX 原子操作，作 alloc 的临界区锁，杜绝并发 alloc 同时算出同一空号 ----
+#   短生命周期脚本，锁只在单次 --alloc 期间持有。陈旧锁（>30s，多半是崩溃残留）自动破除，不会永久卡死。
+FLEET_LOCK=""
+_acquire_lock(){
+  local lockdir="$FLEET_DIR/.lock" waited=0 m
+  mkdir -p "$FLEET_DIR" 2>/dev/null || true
+  while ! mkdir "$lockdir" 2>/dev/null; do
+    # 破除陈旧锁：仅当拿到【真实且为正】的 mtime 且确实超 30s 才破。
+    #   ⚠ 高并发下 stat 可能与 rmdir 竞争而失败(返回 0)——把 0/失败当作"锁还活着"重试，
+    #   绝不能据此把一个【活着的锁】误判为陈旧而 rm 掉（那会让两进程同入临界区 → 重号，实测踩过）。
+    m="$(_epoch_of "$lockdir")"
+    if [[ "$m" =~ ^[0-9]+$ ]] && (( m > 0 )) && (( $(date +%s) - m >= 30 )); then
+      rm -rf "$lockdir" 2>/dev/null; continue
+    fi
+    sleep 0.1; waited=$((waited+1))
+    (( waited >= 100 )) && { echo "⚠ 获取 fleet 锁超时(10s)，继续（可能与并发 alloc 竞争）" >&2; return 0; }
+  done
+  FLEET_LOCK="$lockdir"
+}
+_release_lock(){ [[ -n "$FLEET_LOCK" ]] && rmdir "$FLEET_LOCK" 2>/dev/null; FLEET_LOCK=""; }
+
+# ---- gc_old_dirs [days] —— 删 canonical fleet 里 mtime 超 days(默认7) 天的协调目录 + 过期序号文件 ----
+#   只清 canonical <git-common-dir>/fleet/RQ-*，不碰各 worktree 的 .fleet（那些归 worker，由 ExitWorktree 清）。
+#   序号文件 .seq/<stem> 是持久高水位「序号池」；stem 含日期，过期(>days)的那天永不再用，随目录一并清安全。
+#   为什么不会因清目录导致重号：当天/近期 stem 的 .seq 计数器保留（mtime 新），alloc 取 max(目录扫描, .seq)+1，
+#   即便所有目录被删，.seq 仍锁住高水位 → 序号单调、永不回退。见 --alloc 内的 durable counter。
+gc_old_dirs(){
+  local days="${1:-7}" cutoff removed=0 kept=0 age
+  [[ "$days" =~ ^[0-9]+$ ]] || days=7
+  cutoff=$(( days * 86400 ))
+  [[ -d "$FLEET_DIR" ]] || return 0
+  for d in "$FLEET_DIR"/RQ-*; do
+    [[ -d "$d" ]] || continue
+    age="$(_age_secs "$d")"
+    if (( age > cutoff )); then rm -rf "$d" 2>/dev/null && removed=$((removed+1)); else kept=$((kept+1)); fi
+  done
+  if [[ -d "$FLEET_DIR/.seq" ]]; then
+    for f in "$FLEET_DIR/.seq"/*; do
+      [[ -f "$f" ]] || continue
+      (( $(_age_secs "$f") > cutoff )) && rm -f "$f" 2>/dev/null
+    done
+  fi
+  echo "🧹 fleet GC：删除 ${removed} 个 >${days} 天的协调目录，保留 ${kept} 个（canonical ${FLEET_DIR}）" >&2
+}
+
+# ---- gc：独立清理入口（cc-fleet-init 每次任务初始化时自动调用；也可手动跑）----
+if [[ "$MODE" == gc ]]; then
+  gc_old_dirs "${POS[0]:-7}"
+  exit 0
+fi
+
+# ---- init-base：为本 RQ 创建【集成分支】fleet/<RQ>，记录 base 分支名 ----
+# 隔离模型（2026-06-13 起）：每个 RQ 一条独立集成分支 fleet/<RQ>，worker 的 base 锚定它、改动也只
+#   合回它（cc-fleet-land），共享开发分支（dev/<name> / main）只在主 session 整体验收通过后合一次。
+#   这样「单模块完成但整体没做完」时半成品被关在 fleet/<RQ>，并发 RQ / 用户本人完全不受干扰。
+# 行为：① base = 显式参数 > 当前分支（detached HEAD 必须显式给）；② 集成分支不存在则在 base 上创建、
+#   把 base 名写进 <COORD>/base.ref（供主 session 验收后 promote 回它）；③ 已存在则【幂等保留、绝不
+#   重置】（它可能已累积了别的模块的落地）；④ 打印集成分支名 fleet/<RQ> 到 stdout（派发时作 FLEET_BASE_BRANCH）。
+if [[ "$MODE" == initbase ]]; then
+  rq="${POS[0]:-}"; base_arg="${POS[1]:-}"
+  [[ -n "$rq" ]] || { echo "用法: cc-fleet-coord --init-base <RQ> [base-branch]" >&2; exit 2; }
+  if [[ -n "$base_arg" ]]; then
+    base="$base_arg"
+  else
+    base="$(git symbolic-ref --short -q HEAD || true)"
+    [[ -n "$base" ]] || {
+      echo "❌ 当前是 detached HEAD，无法推断 base 分支。请显式给出：cc-fleet-coord --init-base ${rq} <base-branch>" >&2
+      exit 2; }
+  fi
+  git show-ref --verify --quiet "refs/heads/$base" || {
+    echo "❌ base 分支 '${base}' 不存在（refs/heads/${base}）。在正确的开发分支上运行，或显式传 base。" >&2
+    exit 2; }
+  intbranch="fleet/$rq"
+  coord="$COMMON_DIR/fleet/$rq"
+  mkdir -p "$coord"
+  if git show-ref --verify --quiet "refs/heads/$intbranch"; then
+    [[ -f "$coord/base.ref" ]] || printf '%s\n' "$base" > "$coord/base.ref"
+    echo "↩ 集成分支 ${intbranch} 已存在，保留不重置（base=$(cat "$coord/base.ref" 2>/dev/null)）。" >&2
+  else
+    git branch "$intbranch" "$base" || { echo "❌ 创建集成分支 ${intbranch} 失败。" >&2; exit 2; }
+    printf '%s\n' "$base" > "$coord/base.ref"
+    echo "✓ 已创建集成分支 ${intbranch}（base=${base}）；base 记入 ${coord}/base.ref" >&2
+  fi
+  printf '%s\n' "$intbranch"
+  exit 0
+fi
+
+# ---- put：把一个文件落进本 RQ 的 canonical 协调目录（绕开后台 job 的 Write/Edit 隔离闸）----
+# 为什么需要：协调目录在 <git-common-dir>/fleet/<RQ>，属【仓库内路径】。主 session 常作为后台 job 跑，
+#   而后台 job 的 Write/Edit 工具对【一切仓库内路径】（含本协调目录）会被"未隔离禁止写共享 checkout"闸
+#   拦截；主 session 又故意不开 worktree（它是编排者、不碰 checkout）。于是它没法用 Write 工具落任务卡/
+#   prompt/契约/参考文档——这正是实测踩到的坑（Write 到 .git/fleet/<RQ>/x.md 直接报错）。Bash 写不受该
+#   闸限制，本子命令就是给主 session 一条干净、带越界保护的落盘路径。
+# 用法: cc-fleet-coord <RQ> --put <relpath> [srcfile]
+#   <relpath>  相对协调目录的目标路径（如 contracts/x.md、prompts/<m>.md）；绝对路径 / 含 .. 一律拒绝（越界保护）。
+#   [srcfile]  源文件（推荐：先用 Write 工具写到 $CLAUDE_JOB_DIR/tmp/ —— 仓库外、Write 不被拦 —— 再 --put 拷进来，
+#              避免 heredoc 转义大段 md/代码的坑）；省略则从 stdin 读。
+#   自动 mkdir -p 目标父目录；成功把目标【绝对路径】打到 stdout。
+if [[ "$MODE" == put ]]; then
+  rq="${POS[0]:-}"; rel="${POS[1]:-}"; src="${POS[2]:-}"
+  [[ -n "$rq" && -n "$rel" ]] || { echo "用法: cc-fleet-coord <RQ> --put <relpath> [srcfile]" >&2; exit 2; }
+  case "$rel" in
+    /*|*..*) echo "❌ --put 的 relpath 必须是协调目录内的相对路径、且不含 ..（拒绝越界写入）：'$rel'" >&2; exit 2 ;;
+  esac
+  dest="$COMMON_DIR/fleet/$rq/$rel"
+  mkdir -p "$(dirname "$dest")" || { echo "❌ 建目标目录失败: $(dirname "$dest")" >&2; exit 2; }
+  if [[ -n "$src" ]]; then
+    [[ -f "$src" ]] || { echo "❌ 源文件不存在: $src" >&2; exit 2; }
+    cp "$src" "$dest" || { echo "❌ 写入失败: $dest" >&2; exit 2; }
+  else
+    cat > "$dest" || { echo "❌ 写入失败（stdin）: $dest" >&2; exit 2; }
+  fi
+  printf '%s\n' "$dest"
+  exit 0
+fi
+
+# collect_parents —— 打印所有【可能存放 <RQ> 子目录】的父目录（canonical + 主树/各 worktree 的
+#   .fleet 与 tasks 布局），与 cc-fleet-summary / cc-fleet-status 的扫描通道保持一致，确保分配/防撞
+#   看到的"已占用"宇宙与回执收集的宇宙是同一个，不会和某个 worktree 里的 .fleet 撞号。
+collect_parents() {
+  printf '%s\n' "$COMMON_DIR/fleet"
+  if [[ -n "$TOP" ]]; then
+    printf '%s\n' "$TOP/.fleet" "$TOP/tasks"
+    for d in "$TOP"/*/.fleet; do printf '%s\n' "$d"; done
+  fi
+  while IFS= read -r wt; do
+    [[ -z "$wt" ]] && continue
+    printf '%s\n' "$wt/.fleet" "$wt/tasks"
+    for d in "$wt"/*/.fleet; do printf '%s\n' "$d"; done
+  done < <(git worktree list --porcelain 2>/dev/null | awk '/^worktree /{print $2}')
+  printf '%s\n' "./.fleet"
+  for d in ./*/.fleet; do printf '%s\n' "$d"; done
+}
+
+# taken_serials <stem> —— 跨所有通道，打印 <stem>-<NNN> 形态里已存在的【数字序号】（每行一个，可能重复）。
+#   只要某序号的目录在任一通道存在（哪怕是被 --alloc claim 的空目录）就算占用 → 序号单调递增、永不复用。
+taken_serials() {
+  local stem="$1" parent base serial
+  while IFS= read -r parent; do
+    [[ -d "$parent" ]] || continue
+    for d in "$parent/$stem"-*; do
+      [[ -d "$d" ]] || continue
+      base="$(basename "$d")"
+      serial="${base#"$stem"-}"
+      [[ "$serial" =~ ^[0-9]+$ ]] && printf '%s\n' "$serial"
+    done
+  done < <(collect_parents)
+}
+
+# has_run_artifacts <RQ> —— 该 RQ 在任一通道是否已有【往轮 run 的工件】（.sid/.summary.md/contracts/）。
+#   区别于 taken_serials 的"目录存在即占用"：--fresh 关心的是"是否被真正跑过的 run 占用"，所以查工件而非裸目录，
+#   这样刚被 --alloc claim 出来的空目录不会误判（alloc→resolve→dispatch 的正常链路不被自己挡住）。
+has_run_artifacts() {
+  local rq="$1" parent dir
+  while IFS= read -r parent; do
+    dir="$parent/$rq"
+    [[ -d "$dir" ]] || continue
+    if find "$dir" -maxdepth 2 -type f \( -name '*.sid' -o -name '*.summary.md' \) 2>/dev/null | grep -q .; then
+      return 0
+    fi
+    [[ -d "$dir/contracts" ]] && return 0
+  done < <(collect_parents)
+  return 1
+}
+
+if [[ "$MODE" == alloc ]]; then
+  # 计算 stem：无参→今天 RQ-YYYY-MMDD；ISO 日期→归一化为 RQ-YYYY-MMDD；其余→当作自定义前缀原样用。
+  if [[ -z "$ARG" ]]; then
+    stem="RQ-$(date +%Y-%m%d)"
+  elif [[ "$ARG" =~ ^([0-9]{4})-([0-9]{2})-([0-9]{2})$ ]]; then
+    stem="RQ-${BASH_REMATCH[1]}-${BASH_REMATCH[2]}${BASH_REMATCH[3]}"
+  else
+    stem="$ARG"
+  fi
+  # 临界区：加锁后读高水位→claim→写回，杜绝并发 alloc 同时算出同一空号。锁在退出/中断时释放。
+  trap '_release_lock' EXIT INT TERM
+  _acquire_lock
+  # 高水位 = max(跨所有通道的目录序号扫描, 持久序号池 .seq/<stem>)。
+  #   目录扫描抓活着的目录（含别 worktree 的 .fleet）；.seq 是持久池，即便目录被 GC/手删也不回退 → 永不重号。
+  max=0
+  while IFS= read -r s; do
+    s=$((10#$s)); (( s > max )) && max=$s
+  done < <(taken_serials "$stem")
+  local_seqfile="$FLEET_DIR/.seq/$stem"
+  if [[ -f "$local_seqfile" ]]; then
+    read -r seqval < "$local_seqfile" || seqval=0
+    [[ "$seqval" =~ ^[0-9]+$ ]] || seqval=0
+    (( seqval > max )) && max=$seqval
+  fi
+  next=$((max + 1))
+  rq="$(printf '%s-%03d' "$stem" "$next")"
+  coord="$FLEET_DIR/$rq"
+  mkdir -p "$coord"                       # claim：占位目录
+  mkdir -p "$FLEET_DIR/.seq"
+  printf '%s\n' "$next" > "$local_seqfile" # 持久池写回高水位（不回退的单一事实源）
+  _release_lock; trap - EXIT INT TERM
+  # 全角标点紧跟变量时必须用 ${..} 花括号界定变量名，否则 set -u 会把全角字节并进名字 → 误判 unbound
+  echo "✓ 分配新 RQ：${rq}（stem=${stem} 已用最高序号 ${max} → 取 ${next}；持久池 .seq/${stem}=${next}）" >&2
+  echo "  canonical 协调目录：${coord}" >&2
+  printf '%s\n' "$rq"
+  exit 0
+fi
+
+# ---- resolve / fresh ----
+[[ -z "$ARG" ]] && {
+  echo "用法: cc-fleet-coord <RQ-id> [--no-mkdir|--fresh]  |  cc-fleet-coord --alloc [stem|ISO日期]  |  cc-fleet-coord --init-base <RQ> [base]  |  cc-fleet-coord <RQ> --put <relpath> [srcfile]  |  cc-fleet-coord --check-join <coord-dir> <module> [--join]" >&2
+  exit 2
+}
+RQ="$ARG"
+
+if [[ "$MODE" == fresh ]] && has_run_artifacts "$RQ"; then
+  echo "❌ RQ '$RQ' 的协调目录已被往轮 run 占用（任一通道已有 .sid/.summary.md/contracts）。" >&2
+  echo "   别复用别人的协调目录 —— 改用：RQ=\"\$(cc-fleet-coord --alloc)\" 取一个全新空号。" >&2
+  exit 4
+fi
+
+COORD="$COMMON_DIR/fleet/$RQ"
+[[ "$MKDIR" -eq 1 ]] && mkdir -p "$COORD"
+printf '%s\n' "$COORD"

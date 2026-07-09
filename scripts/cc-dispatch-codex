@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Compatibility shim: "codex mode" now means Codex App visible mode.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+exec "$SCRIPT_DIR/cc-dispatch-codex-app" "$@"

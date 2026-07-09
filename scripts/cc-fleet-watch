@@ -1,0 +1,424 @@
+#!/usr/bin/env perl
+# cc-fleet-watch — 阻塞式监视一个 RQ 下所有被派发 session，把"完成"转成主 session 的【推送通知】。
+#
+# 解决的核心坑：「主 session 傻等、子 session 早结束却不知道」。
+#   旧做法是让主 session 自己"隔一阵跑一次 cc-fleet-status"——本质仍是手动轮询，模型没有唤醒信号，
+#   于是要么 sleep 死等、要么干脆呆等用户，子 session 早 done 了也察觉不到（10~20min 盲等）。
+#   cc-dispatch 派的是【独立 daemon session】，不被主 session 的 harness 跟踪，所以主 session 拿不到
+#   任何"完成"推送。本脚本是那座桥：交给 Claude Code 原生的 Monitor / Bash(run_in_background) 在后台跑，
+#   它每发现一个 session 结束就往 stdout 写一行 → harness 把每行变成推回主 session 的通知；进程退出
+#   则触发"完成"通知。于是「子 session 结束状态」被转成「主 session 的原生推送」，主 session 全程零轮询。
+#
+# 数据源 = cc-fleet-status <RQ> --json（单一事实源：复用其 SID 名册关联 / 状态分类 / 候选协调目录 /
+#   持久回执判定 receipt，绝不在这里另起一套关联逻辑，避免两边漂移）。
+#
+# ⭐ 持久回执闩锁（抗 daemon respawn——根治"做完却被翻回 running、主 session 死等不发完成通知"）：
+#   daemon 的 state 易失：一个早已 done 的后台 session 会被 spare 池 respawn/resume（state 翻回
+#   running+active、startedAt 重置、name 变空），把"done"擦掉。只看 state 就会把它当"还在跑"无限等。
+#   —— cc-fleet-status 会把【协调目录里带 result: 的持久回执】标成 receipt=1。本脚本据此把该模块
+#      立即判【已完成】（最高优先级、单调硬完成、不标 quiesced、resurrect 不撤销），推 ✅ 完成通知。
+#      实测事故：worker ic-viewer 09:48 写回执+合回 main+清 worktree 已彻底完成，11:27 被 daemon
+#      respawn 回 running+active，旧逻辑只看 state → watch 永远只发心跳不发完成 → 主 session 死等。
+#      回执闩锁后：watch 见 receipt=1 立即 ✅ 完成、推回主 session，respawn 翻不动它。
+#
+# 两种用法：
+#   ① Monitor 模式（默认，推荐）——主信号 + 兜底一体：
+#        每个模块一结束就推一行；每 <heartbeat> 秒无事件则推一条心跳（兜底，保证 <5min 必被唤醒一次）；
+#        全部结束推一条总结后退出。Monitor 把每行 stdout 推回主 session。
+#        Monitor 工具调用: command="…/cc-fleet-watch <RQ>", persistent=true
+#   ② wait 模式（--wait）——最纯粹的"结束状态"单次信号：
+#        静默阻塞直到全部结束，只打印一行总结后退出（退出 = 一次完成通知）。适合
+#        Bash(run_in_background): …/cc-fleet-watch <RQ> --wait    —— 作为独立于 Monitor 的兜底完成信号。
+#
+# 退出码（也是 Monitor/Bash 完成通知里带的 exit code）：
+#   0  全部 done/gone，无持续异常        → 进收回执 + 验收
+#   2  daemon 持续不可达（超过容忍时长）
+#   3  全部结束但存在持续异常（failed/error/killed） → 进定位回修
+#   注：blocked（等授权/输入）不算"结束"——会持续心跳提醒主 session 去 reply/授权，绝不静默吞掉。
+#
+# ⭐ tempo 静默判定（本次根治"做完却留在 working、主 session 死等"的核心）：
+#   daemon 每个 session 报【两个正交维度】——
+#     · state = done/working/running/...  由【分类器读 worker 最后一条消息文本】推出
+#         （打了 result: → done；最后一条是叙述/半截话 → 还是 working）；
+#     · tempo = active / idle             = agent 循环【此刻是否在产出】（TUI 转圈=active，回到等输入=idle）。
+#   旧逻辑只看 state：把 state∈{running,working,starting} 一律当"还在跑"，于是一个【活早干完、
+#   只是最后一条没打 result: 】的 worker 会永远 state=working+tempo=idle，watch 死等它。
+#   —— 真正"还要不要等"的判据是 tempo，不是 state。所以这里：
+#     · tempo=active（或 tempo 缺失，按"在跑"保守处理）→ 真在跑，继续等；
+#     · tempo=idle 持续 ≥ --stall-idle 秒（且 ≥2 连续轮去抖）→ 判【静默 quiesced】= 循环已停、
+#       不会再自己产出，纳入"结束"（settle），不管 state 是 working 还是 done。退出总结会把它和
+#       硬 done 区分标注（💤 …需核验），让主 session 去收回执/核验，而不是无限等。
+#     · 去抖必要性（实测）：idle 可能是【瞬时】——worker 可能短暂回到等输入后又被唤醒继续干
+#       （如等它自己起的后台 E2E 完成）。所以①要连续 idle 够久才判静默；②一旦被判静默的模块
+#       又出现 tempo=active，立刻【撤销静默】(resurrect) 继续等。两者保证既不死等、也不误杀。
+#
+# 选项：
+#   --coord DIR        透传给 cc-fleet-status（显式协调目录）
+#   --interval SEC     轮询间隔（默认 20）
+#   --stall-idle SEC   run-class（running/working/starting）持续 tempo=idle 多久判为"静默已结束"
+#                      （默认 240；设 0 = 只要连续 2 轮 idle 即判静默，测试用）。复活会撤销该判定。
+#   --heartbeat SEC    多久没有事件就发一条心跳（默认 240，<5min 兜底 SLA；设 0 = 每轮都心跳，测试用）
+#   --wait             wait 模式（静默阻塞，仅末尾打印一行总结）
+#   --fail-checks N    failed/error/killed 连续 N 轮才判定为"持续异常"（默认 2，吸收瞬时 API 抖动）
+#   --grace SEC        daemon 连续不可达多久才放弃退 2（默认 300）
+#   --max-loops N      最多轮询多少轮后强制退出（默认无限；测试/保险用）
+#   --once             只跑一轮就退（测试用，配合 --mock-json）
+#   --mock-json FILE   用文件内容代替真实 cc-fleet-status 输出（测试用；多个快照用单独一行 @@@ 分隔，
+#                      每快照可选首行 #rc=N 指定模拟的 status 退出码）
+#   -h, --help
+
+use strict;
+use warnings;
+use File::Basename qw(dirname);
+use Cwd qw(abs_path);
+use utf8;   # 源码里的中文/emoji（✅❌⏸…）按【字符】解析，与 JSON::PP 解出的字符串同域，拼接不乱码
+
+# 行缓冲：每行 stdout 必须立即可见（Monitor 靠逐行读取触发通知；不刷新会被管道缓冲拖几分钟）。
+# 输出层统一 UTF-8：源码字面量(use utf8=字符) + JSON 解出的字符 都在字符域，到这里编码一次成字节。
+$| = 1;
+binmode(STDOUT, ':encoding(UTF-8)');
+
+my %opt = (
+  interval    => 20,
+  heartbeat   => 240,
+  'fail-checks' => 2,
+  grace       => 300,
+  'stall-idle' => 240,   # run-class 持续 tempo=idle ≥ 此秒数 → 判"静默已结束"（去抖见下）
+);
+my ($rq, $coord, $wait, $once, $mock_json, $max_loops, $help);
+my @argv = @ARGV;
+while (@argv) {
+  my $a = shift @argv;
+  if    ($a eq '--coord')       { $coord = shift @argv }
+  elsif ($a eq '--interval')    { $opt{interval} = shift @argv }
+  elsif ($a eq '--stall-idle')  { $opt{'stall-idle'} = shift @argv }
+  elsif ($a eq '--heartbeat')   { $opt{heartbeat} = shift @argv }
+  elsif ($a eq '--fail-checks') { $opt{'fail-checks'} = shift @argv }
+  elsif ($a eq '--grace')       { $opt{grace} = shift @argv }
+  elsif ($a eq '--max-loops')   { $max_loops = shift @argv }
+  elsif ($a eq '--wait')        { $wait = 1 }
+  elsif ($a eq '--once')        { $once = 1 }
+  elsif ($a eq '--mock-json')   { $mock_json = shift @argv }
+  elsif ($a eq '-h' || $a eq '--help') { $help = 1 }
+  elsif ($a =~ /^-/)            { die "未知参数: $a（--help 看用法）\n" }
+  else                          { $rq = $a }
+}
+if ($help) { print_help(); exit 0 }
+die "用法: $0 <RQ-id> [--wait] [--interval N] [--heartbeat N] ...（--help 看全部）\n" unless defined $rq;
+
+require JSON::PP;
+my $JSON = JSON::PP->new->utf8;   # ->utf8: decode 吃 UTF-8【字节】、产出【字符】串（与 use utf8 同域）
+
+my $self_dir   = dirname(abs_path($0));
+my $status_bin = "$self_dir/cc-fleet-status";
+
+# 加载 mock 快照序列（测试用）
+my @mock_snaps;
+if (defined $mock_json) {
+  open my $fh, '<', $mock_json or die "open $mock_json: $!\n";  # 读原始字节，交给 JSON->utf8 解
+  local $/; my $blob = <$fh>; close $fh;
+  @mock_snaps = split /^@@@\s*$/m, $blob;
+}
+
+# --- 状态机（跨轮持久） ---
+my %settled;        # module => 1 一旦判定该模块"结束"（done/gone/持续异常/静默）就标记，不再重复报
+my %had_failure;    # module => 1 该模块结束时是异常
+my %quiesced;       # module => 1 该模块是"静默结束"（run-class 持续 idle，非硬 done）→ 退出总结单列、提示核验
+my %fail_count;     # module => 连续异常轮数（吸收瞬时抖动）
+my %idle_since;     # module => 首次进入 tempo=idle 的单调时刻（tempo=active 或结束时清空）
+my %idle_polls;     # module => 连续 idle 轮数（去抖：单次 idle 不判静默，防瞬时回等输入误杀）
+my %notified_state; # module => 上次为"非结束但值得报"的状态发过的通知（如 blocked），避免每轮重复刷
+my %known;          # module => 1 见过的模块（防 0 模块时被误判"全部结束"而秒退）
+my $last_emit  = mono_now();
+my $daemon_down_since;     # daemon 持续不可达起点
+my $daemon_warned = 0;     # 本次不可达是否已经报过一次
+
+my $loops = 0;
+while (1) {
+  $loops++;
+  my ($jobs, $rc, $err) = fetch_status();
+
+  if ($rc == 2) {
+    # daemon 不可达：瞬时抖动很常见，不立刻退；累计超过 --grace 才放弃
+    $daemon_down_since //= mono_now();
+    my $down = mono_now() - $daemon_down_since;
+    if (!$wait && !$daemon_warned) {
+      emit("⚠ daemon 不可达，重试中…（${down}s；超过 $opt{grace}s 才放弃）" . ($err ? " [$err]" : ''));
+      $daemon_warned = 1;
+    }
+    if ($down >= $opt{grace}) {
+      emit("❌ daemon 持续不可达 ${down}s，放弃监视（先 `claude agents --json` 拉起 daemon 再重开 watch）");
+      exit 2;
+    }
+    last if $once;
+    nap();
+    next;
+  }
+  if ($daemon_down_since) {            # 从不可达恢复
+    emit("✅ daemon 恢复，继续监视") unless $wait;
+    $daemon_down_since = undef;
+    $daemon_warned = 0;
+  }
+
+  # 逐模块判定（cc-fleet-status 已用 SID 名册把 roster 模块都列出，gone 也在内）
+  my $settled_before = scalar keys %settled;   # 本轮起点：用于检测"本轮有无新模块结算"→触发显示修复
+  for my $j (@$jobs) {
+    my $mod   = $j->{_module} // $j->{name} // $j->{short} // '?';
+    my $state = $j->{state}   // '?';
+    my $tempo = lc($j->{tempo} // '');
+    $known{$mod} = 1;
+
+    # ⭐ 持久回执闩锁（抗 respawn，最高优先级）：cc-fleet-status 标了 receipt=1 表示协调目录里已有
+    #   带 result: 的持久回执 = 该模块【已彻底完成】。即便 daemon 此刻把它 respawn 回 running+active
+    #   （甚至瞬时 failed），也按回执判完成——这是【单调硬完成】，不标 quiesced、resurrect 不会撤销，
+    #   从根上解决"worker 做完被 spare 池 respawn、state 翻回 running、watch 死等不发完成通知"。
+    if (!$settled{$mod} && $j->{receipt}) {
+      $settled{$mod} = 1;
+      delete $fail_count{$mod}; delete $notified_state{$mod};
+      delete $idle_since{$mod}; $idle_polls{$mod} = 0;
+      delete $quiesced{$mod};   # 回执闩锁是硬完成，不是"静默待核验"
+      my $hint = ($state =~ /^(running|working|starting)$/i) ? "（daemon 报 $state 多为 respawn）"
+               : ($state =~ /^(done|gone)$/i ? '' : "（daemon 报 $state，以回执为准）");
+      emit("✅ $mod 已完成 — 回执在案$hint") unless $wait;
+      next;
+    }
+    # 注：已 receipt 闩锁的模块在后续轮 !$settled 为假 → 跳过上面闩锁块，再由下方 `next if $settled` 单调略过；
+    #     它不标 quiesced，故 resurrect 永不撤销它（respawn 翻回 running 也不反悔）。
+
+    # 复活（resurrect）：只对【静默】判定生效——被判静默的模块若又出现真活跃（tempo=active 且 run-class），
+    # 说明那次 idle 是瞬时（worker 回到等输入后又被唤醒继续干，如实测 39bf5db9），撤销静默、继续等。
+    # 硬 done/gone/异常是终态，不在此撤销（信任分类器/异常判定）。
+    if ($settled{$mod} && $quiesced{$mod}) {
+      if ($tempo ne 'idle' && classify($state) eq 'run') {
+        delete $settled{$mod}; delete $quiesced{$mod};
+        delete $idle_since{$mod}; $idle_polls{$mod} = 0;
+        $notified_state{$mod} = '';
+        emit("▶ $mod 又活跃了（tempo=active）— 撤销静默判定，继续监视") unless $wait;
+      }
+    }
+    next if $settled{$mod};
+    my $cls = classify($state);
+    # ⭐ 2.1.167：worker 等输入/授权时 daemon 报 state=working + **tempo=blocked**（不是 state=blocked）。
+    #   若只看 state 会把它当 run-class 的 active 在跑 → 主 session 死等不去回复。把 tempo=blocked 也
+    #   归入 blocked 路径：提醒去 cc-fleet-reply 回它 / cc-fleet-kill 取消，且绝不判它"还在跑/静默"。
+    $cls = 'blocked' if $cls eq 'run' && $tempo eq 'blocked';
+
+    if ($cls eq 'good') {                       # done / gone → 结束（成功）
+      $settled{$mod} = 1;
+      delete $fail_count{$mod}; delete $notified_state{$mod};
+      emit("✅ $mod $state — 已结束") unless $wait;
+    }
+    elsif ($cls eq 'bad') {                      # failed/error/killed → 连续 N 轮才算持续异常
+      $fail_count{$mod}++;
+      if ($fail_count{$mod} >= $opt{'fail-checks'}) {
+        $settled{$mod} = 1; $had_failure{$mod} = 1;
+        my $d = trim_detail($j->{detail});
+        emit("❌ $mod $state — 持续异常$d") unless $wait;
+      }
+      # 未达阈值：可能瞬时抖动（如 UNKNOWN_CERTIFICATE_VERIFICATION），静默等下一轮自愈
+    }
+    elsif ($cls eq 'blocked') {                  # 等授权/输入：不算结束，但要尽快提醒主 session 去处理
+      $fail_count{$mod} = 0;
+      delete $idle_since{$mod}; $idle_polls{$mod} = 0;   # 进 blocked 清空 idle 计数（不与静默判定串味）
+      if (($notified_state{$mod} // '') ne 'blocked') {
+        $notified_state{$mod} = 'blocked';
+        my $d = trim_detail($j->{detail});
+        emit("⏸ $mod blocked（等输入/授权）— `cc-fleet-reply $rq $mod \"…\"` 回它 / `cc-fleet-kill $rq $mod` 取消 / 疑似降级坏模型就 `cc-fleet-respawn $rq $mod --prompt-file <卡>` 换新 session 重派$d") unless $wait;
+      }
+    }
+    else {                                       # running/working/starting —— 再按 tempo 细分
+      $fail_count{$mod} = 0;
+      if ($tempo ne 'idle') {
+        # 真在跑（active；或 tempo 缺失/未知，保守按"在跑"，绝不凭缺字段误判静默）
+        delete $idle_since{$mod}; $idle_polls{$mod} = 0;
+        if (($notified_state{$mod} // '') eq 'blocked') {
+          emit("▶ $mod 已恢复运行") unless $wait;
+        }
+        $notified_state{$mod} = '';
+      } else {
+        # tempo=idle：循环已停。去抖后判"静默已结束"——多半是做完没打 result:，也可能卡住。
+        $idle_since{$mod} //= mono_now();
+        $idle_polls{$mod} = ($idle_polls{$mod} // 0) + 1;
+        my $idle_for = mono_now() - $idle_since{$mod};
+        if ($idle_polls{$mod} >= 2 && $idle_for >= $opt{'stall-idle'}) {
+          $settled{$mod} = 1; $quiesced{$mod} = 1;
+          delete $notified_state{$mod};
+          my $d = trim_detail($j->{detail});
+          emit(sprintf("💤 %s %s+idle 已静默 %ds — 循环已停（多半做完只是没打 result:，也可能卡住），纳入收回执核验$d",
+            $mod, $state, int($idle_for))) unless $wait;
+        }
+        # 未达去抖/阈值：静待下一轮，不刷屏（心跳兜底会带"空闲待判"计数）
+      }
+    }
+  }
+
+  # ⭐ 本轮有新模块结算 → 立刻修复它们在 FleetView 的显示退化（完成态被 daemon 重写成 name=bg、
+  #   时长=0s；fix-display 用名册名 + transcript 时间把磁盘 state.json 修回，best-effort 幂等）。
+  fix_display() if (scalar keys %settled) > $settled_before;
+
+  # 是否全部结束：见过的模块都 settled，且至少见过一个（防 .sid 名册为空时秒退）
+  my $total = scalar keys %known;
+  my $done  = scalar keys %settled;
+  if ($total > 0 && $done == $total) {
+    fix_display();   # 退出前再兜一次，保证全部已完成 worker 的显示都修过（幂等）
+    my $fails = scalar keys %had_failure;
+    my $quies = scalar keys %quiesced;
+    my $bad   = $fails > 0;
+    my $qnote = $quies > 0 ? sprintf("，含静默未打result %d 个需核验", $quies) : '';
+    my $emoji = $bad ? '⚠' : ($quies > 0 ? '🟡' : '🎉');
+    my $summary = sprintf("%s %s 全部结束：%d/%d（异常 %d%s）→ 跑 cc-fleet-summary %s 收回执",
+      $emoji, $rq, $done, $total, $fails, $qnote, $rq);
+    print "$summary\n";
+    exit($bad ? 3 : 0);
+  }
+
+  if ($total == 0 && !$wait && (mono_now() - $last_emit) >= $opt{heartbeat}) {
+    emit("⚠ 尚未发现 $rq 的 session（.sid 名册为空？确认派发时带了 --sid-file，或用 --coord 指定协调目录）");
+  }
+
+  last if $once;
+
+  # 心跳兜底：超过 heartbeat 秒没发过任何事件就报一条进度，保证主 session 至少每 <5min 被唤醒一次
+  if (!$wait && $total > 0 && (mono_now() - $last_emit) >= $opt{heartbeat}) {
+    emit(progress_line($rq, $jobs, $total, $done));
+  }
+
+  last if defined $max_loops && $loops >= $max_loops;
+  nap();
+}
+
+# --max-loops / --once 兜底出口（未达"全部结束"）
+{
+  my $total = scalar keys %known;
+  my $done  = scalar keys %settled;
+  my $bad   = scalar(keys %had_failure) > 0;
+  print sprintf("⏳ %s 监视结束（未全部完成）：%d/%d settled%s\n",
+    $rq, $done, $total, ($bad ? '，含异常' : ''));
+  exit($bad ? 3 : 1);
+}
+
+# ---------------- helpers ----------------
+
+# 把 daemon/状态枚举归到四类（与 cc-fleet-status 的退出码语义对齐，但把 blocked 单列出来主动提醒）：
+#   good  = done / gone（结束，成功）
+#   bad   = failed / error / killed / dead / crashed（潜在持续异常）
+#   blocked = blocked（等输入/授权，可恢复，不算结束）
+#   run   = running / working / starting（进行中）
+sub classify {
+  my $s = lc(shift // '');
+  return 'good'    if $s eq 'done' || $s eq 'gone';
+  return 'run'     if $s =~ /^(running|working|starting)$/;
+  return 'blocked' if $s eq 'blocked';
+  return 'bad';     # 其余一律按异常处理（failed/error/killed/…）
+}
+
+sub progress_line {
+  my ($rq, $jobs, $total, $done) = @_;
+  my ($run, $idlewait, $blocked, $bad) = (0, 0, 0, 0);
+  for my $j (@$jobs) {
+    next if $j->{receipt};   # 回执在案 = 已完成（计入 $done），display 上不再算"在跑/阻塞"
+    my $c  = classify($j->{state});
+    my $tp = lc($j->{tempo} // '');
+    if    ($c eq 'run')     { $tp eq 'idle' ? $idlewait++ : ($tp eq 'blocked' ? $blocked++ : $run++) }
+    elsif ($c eq 'blocked') { $blocked++ }
+    elsif ($c eq 'bad')     { $bad++ }
+  }
+  return sprintf("⏳ %s 进度 %d/%d 结束（运行 %d / 空闲待判 %d / 阻塞 %d / 待判异常 %d）",
+    $rq, $done, $total, $run, $idlewait, $blocked, $bad);
+}
+
+sub emit { my $m = shift; print "$m\n"; $last_emit = mono_now(); }
+
+# 修复已完成 worker 的 FleetView 显示退化（name=bg / 时长=0s）——委托给同目录 cc-fleet-fix-display
+# （单一事实源；它自己再读 cc-fleet-status 名册定位 job 并改 state.json）。best-effort：
+#   · mock-json 测试模式不碰真实 job；找不到脚本/失败都静默跳过，绝不影响监视主流程。
+#   · --quiet：仅在真改了东西时才打印一行（会被 Monitor 转成一条"已修复显示"通知，信息有用且不刷屏）。
+sub fix_display {
+  return if defined $mock_json;
+  my $bin = "$self_dir/cc-fleet-fix-display";
+  return unless -x $bin;
+  my @cmd = ($bin, $rq, '--quiet');
+  push @cmd, ('--coord', $coord) if defined $coord;
+  eval { system { $cmd[0] } @cmd; 1 };   # 失败吞掉，不打断监视
+}
+
+sub trim_detail {
+  my $d = shift // '';   # 字符串（JSON->utf8 解出的字符），按字符裁剪安全
+  $d =~ s/\s+/ /g; $d =~ s/^\s+//; $d =~ s/\s+$//;
+  return '' unless length $d;
+  $d = substr($d, 0, 60) . '…' if length($d) > 60;
+  return "（$d）";
+}
+
+# 取一份状态快照：真实模式调 cc-fleet-status --json；mock 模式吃下一个快照。
+# 返回 (\@jobs, $status_rc, $err)
+sub fetch_status {
+  if (defined $mock_json) {
+    return ([], 2, 'mock 已耗尽') unless @mock_snaps;
+    my $blk = shift @mock_snaps;
+    my $rc = 1;
+    $rc = $1 if $blk =~ /^\s*#rc=(\d+)\s*$/m;
+    $blk =~ s/^\s*#rc=\d+\s*$//m;
+    $blk =~ s/^\s+//;
+    return ([], $rc, 'empty') unless length $blk;
+    my $data = eval { $JSON->decode($blk) };
+    return ([], 2, "mock JSON 解析失败: $@") unless $data;
+    return ($data->{jobs} || [], $rc, undef);
+  }
+  my @cmd = ($status_bin, $rq, '--json');
+  push @cmd, ('--coord', $coord) if defined $coord;
+  my $out = '';
+  my $pid = open(my $fh, '-|');
+  if (!defined $pid) { return ([], 2, "fork 失败: $!") }
+  if ($pid == 0) { open(STDERR, '>', '/dev/null'); exec @cmd; exit 127 }
+  { local $/; $out = <$fh> }
+  close $fh;
+  my $rc = $? >> 8;
+  my $data = eval { $JSON->decode($out) };
+  if (!$data) {
+    # status 没吐 JSON（exit 2 时只 warn 到 stderr、stdout 空）→ 这一轮拿不到数据，按"不可达/重试"处理
+    return ([], 2, "status 无 JSON 输出 (rc=$rc)");
+  }
+  return ($data->{jobs} || [], $rc, undef);
+}
+
+# 单调时钟（不受系统改时影响）；CLOCK_MONOTONIC 不可用时退回 time()
+sub mono_now {
+  my $t = eval { require Time::HiRes; Time::HiRes::clock_gettime(Time::HiRes::CLOCK_MONOTONIC()) };
+  return defined $t ? $t : time();
+}
+
+sub nap {
+  return if $once;
+  my $s = $opt{interval} + 0;
+  return if $s <= 0;
+  eval { require Time::HiRes; Time::HiRes::sleep($s); 1 } or sleep($s);
+}
+
+sub print_help {
+  print <<'EOF';
+cc-fleet-watch — 阻塞监视一个 RQ 下所有被派发 session，把"完成"转成主 session 的推送通知。
+
+用法:
+  cc-fleet-watch <RQ>            # Monitor 模式：每模块结束推一行 + 心跳兜底 + 全部结束退出
+  cc-fleet-watch <RQ> --wait     # wait 模式：静默阻塞，仅末尾打印一行总结后退出（单次完成信号）
+
+推荐挂载方式（主 session）:
+  Monitor 工具:  command 设为 "…/cc-fleet-watch <RQ>", persistent=true   （主信号 + ≤5min 心跳兜底）
+  或 Bash run_in_background:  …/cc-fleet-watch <RQ> --wait               （独立的单次完成信号兜底）
+
+选项:
+  --coord DIR     透传给 cc-fleet-status（显式协调目录）
+  --interval SEC  轮询间隔（默认 20）
+  --stall-idle SEC run-class 持续 tempo=idle 多久判"静默已结束"（默认 240；0=连续2轮idle即判）。复活会撤销
+  --heartbeat SEC 多久无事件发一条心跳（默认 240，<5min 兜底；0=每轮都心跳）
+  --wait          wait 模式（静默，仅末尾一行）
+  --fail-checks N failed/error 连续 N 轮才判持续异常（默认 2，吸收瞬时抖动）
+  --grace SEC     daemon 连续不可达多久才放弃退 2（默认 300）
+  --max-loops N   最多轮询 N 轮后强制退出（默认无限）
+  --once          只跑一轮就退（测试用）
+  --mock-json F   用文件代替 cc-fleet-status 输出（测试用，多快照用单行 @@@ 分隔，每块可 #rc=N）
+
+退出码: 0=全部完成无异常 / 1=未完成(max-loops/once) / 2=daemon 持续不可达 / 3=全部结束但有持续异常
+EOF
+}

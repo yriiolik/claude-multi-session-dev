@@ -1,0 +1,424 @@
+#!/usr/bin/env perl
+# cc-fleet-status — 查询 daemon list，打印某 RQ 下被派发 session 的状态表
+#
+# 关联键（防主 session 死等的关键）：
+#   优先用「协调目录里记录的 SID 名册（roster）」关联，而不是用会变的 session 名。
+#   每次派发把 short / sessionId 记进 <COORD_DIR>/<module>.sid（cc-dispatch --sid-file 自动做）。
+#   本脚本读这些 .sid 作 roster，按 daemon job 的 sessionId 或 short 匹配（兼容 UUID 与 8hex）。
+#   —— session 完成后 daemon 里的 name 可能变空，靠 name 过滤会漏掉已完成的 session、
+#      让主 session 误判"还没跑完"而无限等待；用稳定的 SID 关联则不会。
+#   roster 为空时（没记 .sid）才退回旧的 name=…@<RQ> 过滤。
+#
+# 用法:
+#   cc-fleet-status <RQ-id>              # 用 <RQ> 的协调目录 .sid 名册关联（推荐）
+#   cc-fleet-status <RQ-id> --coord D    # 显式指定协调目录读 .sid
+#   cc-fleet-status --all                # 列出所有 background session
+#   cc-fleet-status <RQ-id> --json       # JSON 输出给主 session 解析
+#
+# 退出码:
+#   0  全部 done/gone（无在跑、无异常）—— 可进入收回执 + 验收
+#   1  有 session 还在 running/working/starting
+#   2  daemon 不可达
+#   3  有 session 处于异常终止态（failed/error/killed 等）
+#      ⚠ 注意 failed 可能是瞬时 API 抖动（如 UNKNOWN_CERTIFICATE_VERIFICATION），会自愈成 done；
+#        见到 3 先隔一会儿再查一次确认，不要一见 failed 就进回修循环。
+#
+# ⭐ 持久回执闩锁（抗 daemon respawn——本次根治"做完却被翻回 running、主 session 死等"的核心）：
+#   daemon 的 state 是【易失】的——一个早已 done 的后台 session 会被 daemon 的 spare 池
+#   respawn/resume（state 翻回 running+active、startedAt 重置、name 变空），把"done"擦掉。
+#   只看 state 就会把这种【做完又被 respawn】的 worker 当"还在跑"无限等。
+#   —— 所以本脚本把 canonical 协调目录里的【持久回执】作为第二条权威完成信号：
+#      若 roster 模块在协调目录有 `<module>.summary.md` 且【首个非空行以 `result:` 开头】
+#      （preamble 规定 worker 完成时落盘、且 result: 是"我彻底做完"的硬标记，区别于
+#       failed:/needs input: 半截回执），即判该模块【已完成】——不管 daemon 此刻报什么 state。
+#      该信号【持久、单调】：respawn 抹不掉文件，所以完成判定抗 respawn。json 里带 receipt 字段，
+#      cc-fleet-watch 据此把"做完被 respawn"的 worker 立即判完成、推完成通知（不再死等）。
+#
+# 名词:
+#   gone = roster 里有、但 daemon 列表已无此 session（已结束/被回收）。
+#          这是"已结束、去收回执"，不是"还在跑"——绝不让它把主 session 卡住。
+#   receipt = 协调目录里带 result: 的持久回执已在案（= 已完成，抗 respawn；见上方"持久回执闩锁"）。
+
+use strict;
+use warnings;
+use IO::Socket::UNIX;
+
+my $rq;
+my $all = 0;
+my $json_out = 0;
+my $coord;
+my $mock_list;   # 测试用：从文件读 daemon list（{"jobs":[...]} 或裸数组），绕过 socket
+for (my $i = 0; $i <= $#ARGV; $i++) {
+  my $a = $ARGV[$i];
+  if    ($a eq '--all')       { $all = 1 }
+  elsif ($a eq '--json')      { $json_out = 1 }
+  elsif ($a eq '--coord')     { $coord = $ARGV[++$i] }
+  elsif ($a eq '--mock-list') { $mock_list = $ARGV[++$i] }
+  elsif ($a =~ /^-/)          { die "unknown flag: $a\n" }
+  else                        { $rq = $a }
+}
+die "用法: $0 <RQ-id> [--coord DIR] | --all\n" unless $all || defined $rq;
+
+my @all_jobs;
+if (defined $mock_list) {
+  # 测试通道：jobs 来自文件，不连 daemon
+  open(my $fh, '<', $mock_list) or do { warn "❌ 打不开 --mock-list 文件: $mock_list\n"; exit 2 };
+  local $/; my $blob = <$fh>; close $fh;
+  my $d = eval { require JSON::PP; JSON::PP->new->decode($blob) };
+  unless ($d) { warn "❌ --mock-list JSON 解析失败\n"; exit 2 }
+  @all_jobs = @{ ref($d) eq 'ARRAY' ? $d : ($d->{jobs} // []) };
+} else {
+  my $sock = find_sock() or do {
+    warn "❌ daemon 不可达。先跑一次 `claude agents --json` 启动 daemon。\n";
+    exit 2;
+  };
+
+  my $reply = ask($sock, '{"proto":1,"op":"list"}');
+  my $data  = parse_json($reply);
+  unless ($data && $data->{ok} && ref($data->{jobs}) eq 'ARRAY') {
+    warn "❌ daemon list 返回异常: $reply\n";
+    exit 2;
+  }
+  @all_jobs = @{$data->{jobs}};
+}
+
+# ---- 选取本 RQ 的 jobs ----
+my @jobs;
+my %roster;        # module => token（来自 .sid）
+my $roster_used = 0;
+
+if ($all) {
+  @jobs = @all_jobs;
+} else {
+  %roster = collect_roster($rq, $coord);
+  if (%roster) {
+    $roster_used = 1;
+    my %seen_mod;
+    # 每个 roster token 找一个匹配的 live job
+    for my $mod (sort keys %roster) {
+      my $tok = $roster{$mod};
+      my $hit;
+      for my $j (@all_jobs) {
+        if (job_matches_token($j, $tok)) { $hit = $j; last }
+      }
+      if ($hit) {
+        $hit->{_module} = $mod;
+        push @jobs, $hit;
+        $seen_mod{$mod} = 1;
+      }
+    }
+    # roster 里有、但 daemon 列表已无 → gone（已结束，去收回执）
+    for my $mod (sort keys %roster) {
+      next if $seen_mod{$mod};
+      push @jobs, {
+        name      => "↳$mod",
+        _module   => $mod,
+        state     => 'gone',
+        tempo     => '-',
+        short     => substr($roster{$mod}, 0, 8),
+        sessionId => $roster{$mod},
+        detail    => '（daemon 列表已无此 session：已结束/被回收 → 去 cc-fleet-summary 收回执）',
+      };
+    }
+  } else {
+    # 没有 .sid 名册 → 退回旧的按 name 过滤（不如 SID 稳，name 可能在完成后变空）
+    for my $j (@all_jobs) {
+      my $name = $j->{name} // '';
+      push @jobs, $j if $name =~ /\@\Q$rq\E$/;
+    }
+  }
+}
+
+# ---- 持久回执闩锁：给每个已知模块标 receipt（协调目录有 result: 回执 = 已完成，抗 respawn）----
+# 只对 roster 模式（知道 _module 名）生效；--all 模式模块名未知，不标。
+unless ($all) {
+  my @dirs = coord_dir_list($rq, $coord);
+  for my $j (@jobs) {
+    my $mod = $j->{_module};
+    next unless defined $mod && length $mod;
+    $j->{receipt} = receipt_done($mod, \@dirs) ? 1 : 0;
+  }
+}
+
+if ($json_out) {
+  print to_json({ok=>1, rq=>$rq, rosterUsed=>($roster_used?1:0), jobs=>\@jobs}), "\n";
+  exit summary_exit(\@jobs);
+}
+
+if (!@jobs) {
+  if ($roster_used) {
+    print "（$rq 名册里的 session 在 daemon 列表中都标记为 gone 或未找到——去 cc-fleet-summary 收回执）\n";
+  } else {
+    print "（没找到 $rq 下的 session；若已派发，请确认派发时把 short/sessionId 记进了 <COORD_DIR>/<module>.sid，\n";
+    print "  这样本脚本能用 SID 名册稳定关联，而不必靠会变空的 session 名）\n";
+  }
+  exit 1;
+}
+
+# ---- 表格输出 ----
+printf "%-3s  %-25s  %-10s  %-10s  %-8s  %s\n", "#", "NAME", "STATE", "TEMPO", "SHORT", "DETAIL";
+printf "%-3s  %-25s  %-10s  %-10s  %-8s  %s\n", "---", "----", "-----", "-----", "-----", "------";
+my $i = 0;
+for my $j (sort { ($a->{_module}//$a->{name}//'') cmp ($b->{_module}//$b->{name}//'') } @jobs) {
+  $i++;
+  my $detail = $j->{detail} // '';
+  $detail =~ s/\n/ /g;
+  $detail = substr($detail, 0, 70) . '…' if length($detail) > 70;
+  # 回执在案但 daemon 仍报在跑 = respawn-after-done，醒目标出（别被 state 误导）
+  if ($j->{receipt} && (($j->{state} // '') =~ /^(running|working|starting)$/)) {
+    $detail = "🧾已完成(回执在案,daemon报在跑多为respawn) $detail";
+  } elsif ($j->{receipt}) {
+    $detail = "🧾回执在案 $detail";
+  } elsif ((lc($j->{tempo} // '') eq 'blocked') || (($j->{state} // '') eq 'blocked')) {
+    $detail = "⏸等输入(可 cc-fleet-reply 回复) $detail";
+  }
+  my $name = $j->{name} // '';
+  $name = "↳" . $j->{_module} if (!length $name) && defined $j->{_module};
+  printf "%-3d  %-25s  %-10s  %-10s  %-8s  %s\n",
+    $i,
+    truncate_str($name, 25),
+    $j->{state} // '?',
+    $j->{tempo} // '?',
+    $j->{short} // '?',
+    $detail;
+}
+
+my $rc = summary_exit(\@jobs);
+my $total = scalar @jobs;
+my %by_state;
+$by_state{$_->{state} // '?'}++ for @jobs;
+my $summary = join ' / ', map { "$_:$by_state{$_}" } sort keys %by_state;
+my $gone = $by_state{gone} // 0;
+# 静默候选：run-class（running/working/starting）但 tempo=idle —— agent 循环已停（TUI 已回等输入态）。
+# 单次快照判不出"持续 idle"，但要把它点出来，免得人/模型把"working"误当"还在跑"而死等
+# （持续静默的最终判定与自动结束由 cc-fleet-watch 的 --stall-idle 去抖完成）。
+my @quiet = grep {
+  (($_->{state} // '') =~ /^(running|working|starting)$/) && (lc($_->{tempo} // '') eq 'idle')
+} @jobs;
+# 等输入候选：2.1.167 用 tempo=blocked 表达"等授权/输入"（state 仍 working），也兼容 state=blocked。
+# 这类 worker 在等主 session 回复——用 cc-fleet-reply 回它 / cc-fleet-kill 取消，别当它在跑而死等。
+my @blocked = grep {
+  !$_->{receipt} && ( (lc($_->{tempo} // '') eq 'blocked') || (($_->{state} // '') eq 'blocked') )
+} @jobs;
+# respawn-after-done：回执在案但 daemon 仍报在跑/异常 —— 已被回执闩锁判完成，但要点出来免得人困惑
+my @respawned = grep {
+  $_->{receipt} && (($_->{state} // '') !~ /^(done|gone)$/)
+} @jobs;
+print "\n";
+if ($rc == 0) {
+  my $tail = $gone ? "（含 $gone 个 gone=已结束，去 cc-fleet-summary 收回执确认）" : '';
+  print "✅ 无在跑/无异常 ($total)$tail。可进入收回执 + 验收阶段。\n";
+  if (@respawned) {
+    my $names = join ', ', map { $_->{_module} // $_->{short} // '?' } @respawned;
+    printf "   🧾 其中 %d 个【回执在案、daemon 仍报 %s】= 做完后被 respawn —— 按持久回执判已完成：%s\n",
+      scalar @respawned, join('/', do { my %s; $s{$_->{state}//'?'}=1 for @respawned; sort keys %s }), $names;
+  }
+}
+elsif ($rc == 1) {
+  print "⏳ 进行中 — $summary\n";
+  if (@blocked) {
+    my $names = join ', ', map { $_->{_module} // $_->{short} // '?' } @blocked;
+    printf "   ⏸ 其中 %d 个在**等输入/授权**（tempo=blocked）：%s\n", scalar @blocked, $names;
+    print  "      → 用 `cc-fleet-reply $rq <module> \"…\"` 回它，或 `cc-fleet-kill $rq <module>` 取消（别当它在跑而死等）。\n";
+  }
+  if (@quiet) {
+    my $names = join ', ', map { $_->{_module} // $_->{short} // '?' } @quiet;
+    printf "   💤 其中 %d 个 state=working/running 但 **tempo=idle**（循环已停，多半已做完只是没打 result:）：%s\n", scalar @quiet, $names;
+    print  "      → 别当它还在跑；持续空闲就去 cc-fleet-summary 收回执 / 读其最后一条消息核验。\n";
+    print  "      （cc-fleet-watch 会按 --stall-idle 去抖后自动把持续静默者判为已结束并唤醒你）\n";
+  }
+}
+elsif ($rc == 3) {
+  print "❌ 有异常 — $summary（看上方 DETAIL）\n";
+  print "   ⚠ failed/error 可能是瞬时 API 抖动（会自愈成 done）。先隔一会儿再 `cc-fleet-status $rq` 复查一次，\n";
+  print "     确认是持续异常再进回修；别一见 failed 就误判。\n";
+}
+exit $rc;
+
+
+# --- helpers ---
+
+sub summary_exit {
+  my $jobs = shift;
+  my ($any_run, $any_bad) = (0, 0);
+  for my $j (@$jobs) {
+    # 持久回执闩锁优先：协调目录有 result: 回执 = 已完成（抗 respawn）—— 无论 daemon 此刻报什么 state。
+    # 一个做完又被 daemon respawn 回 running/active（甚至瞬时 failed）的 worker，靠它免被误判"还在跑/异常"。
+    next if $j->{receipt};
+    my $s = $j->{state} // '';
+    if    ($s eq 'done' || $s eq 'gone')                  { next }
+    elsif ($s =~ /^(running|working|starting|blocked)$/)  { $any_run = 1 }  # blocked=等输入,非异常→进行中
+    else                                                   { $any_bad = 1 }
+  }
+  return 3 if $any_bad;
+  return 1 if $any_run;
+  return 0;
+}
+
+# 一个 job 是否匹配 roster token（兼容：token 为完整 UUID sessionId / 8hex short / 二者前缀）
+sub job_matches_token {
+  my ($job, $tok) = @_;
+  return 0 unless defined $tok && length $tok;
+  my $sid   = $job->{sessionId} // '';
+  my $short = $job->{short}     // '';
+  return 1 if length($sid)   && $sid   eq $tok;
+  return 1 if length($short) && $short eq $tok;
+  # 前缀容错（token 至少 6 位，避免误命中）
+  if (length($tok) >= 6) {
+    return 1 if length($sid)   && index($sid, $tok)   == 0;
+    return 1 if length($short) && index($short, $tok) == 0;
+    return 1 if index($tok, $short) == 0 && length($short) >= 6;  # token=uuid、job 只有 short
+  }
+  return 0;
+}
+
+# 协调目录候选列表（explicit 优先 + canonical/主树/结构化候选），collect_roster 与 receipt_done 共用，避免漂移
+sub coord_dir_list {
+  my ($rq, $explicit) = @_;
+  my @dirs;
+  push @dirs, $explicit if defined $explicit && length $explicit;
+  push @dirs, candidate_coord_dirs($rq);
+  return @dirs;
+}
+
+# 持久回执完成判定：协调目录里 <module>.summary.md 存在、且【首个非空行以 result: 开头】→ 已完成（抗 respawn）。
+# 只认 result: 首行——preamble 规定 worker 彻底做完才落这份带 result: 的回执；failed:/needs input: 半截回执不算。
+sub receipt_done {
+  my ($mod, $dirs) = @_;
+  for my $d (@$dirs) {
+    next unless defined $d && length $d;
+    my $path = "$d/$mod.summary.md";
+    next unless -f $path;
+    open(my $fh, '<', $path) or next;
+    while (my $line = <$fh>) {
+      $line =~ s/^\x{EF}\x{BB}\x{BF}//;   # 容忍 UTF-8 BOM
+      next if $line =~ /^\s*$/;            # 跳过前导空行
+      close $fh;
+      return 1 if $line =~ /^\s*result:/i;
+      last;                                # 首个非空行不是 result: → 这份不算 done（failed:/needs input:/草稿）
+    }
+    close $fh;
+  }
+  return 0;
+}
+
+# 从 <RQ> 的协调目录读 *.sid，返回 module => token
+sub collect_roster {
+  my ($rq, $explicit) = @_;
+  my %r;
+  my @dirs = coord_dir_list($rq, $explicit);
+  my %seen_dir;
+  for my $d (@dirs) {
+    next unless defined $d && -d $d;
+    next if $seen_dir{$d}++;
+    opendir(my $dh, $d) or next;
+    for my $f (readdir $dh) {
+      next unless $f =~ /^(.+)\.sid$/;
+      my $mod = $1;
+      next if exists $r{$mod};
+      my $path = "$d/$f";
+      open(my $fh, '<', $path) or next;
+      my $tok = <$fh>;
+      close $fh;
+      next unless defined $tok;
+      $tok =~ s/^\s+//; $tok =~ s/\s+$//;
+      $tok =~ s/\t.*$//;   # 容忍 "short<TAB>sessionId" 记录格式，取第一个
+      $r{$mod} = $tok if length $tok;
+    }
+    closedir $dh;
+  }
+  return %r;
+}
+
+# 候选协调目录（worktree 无关）：git-common-dir/fleet/<RQ> 优先，其次主 toplevel、结构化布局、cwd 本地
+sub candidate_coord_dirs {
+  my $rq = shift;
+  my @c;
+  my $common = git_out('rev-parse', '--path-format=absolute', '--git-common-dir');
+  push @c, "$common/fleet/$rq" if $common;
+  my $top = git_out('rev-parse', '--show-toplevel');
+  if ($top) {
+    push @c, "$top/.fleet/$rq";
+    push @c, "$top/tasks/$rq/sessions";
+    push @c, "$top/tasks/$rq";
+    # monorepo：项目常在子目录（如 factory/），.fleet 落子目录里
+    push @c, glob("$top/*/.fleet/$rq");
+    push @c, glob("$top/*/tasks/$rq/sessions");
+  }
+  push @c, "./.fleet/$rq";
+  push @c, glob("./*/.fleet/$rq");
+  return @c;
+}
+
+sub git_out {
+  my @args = @_;
+  my $out = `git @args 2>/dev/null`;
+  return undef unless defined $out;
+  chomp $out;
+  return length($out) ? $out : undef;
+}
+
+sub find_sock {
+  my $base = "/tmp/cc-daemon-$<";
+  return undef unless -d $base;
+  opendir my $dh, $base or return undef;
+  my @dirs = grep { /^[a-f0-9]{8}$/ && -d "$base/$_" } readdir $dh;
+  closedir $dh;
+  for my $d (sort @dirs) {
+    my $s = "$base/$d/control.sock";
+    return $s if -S $s;
+  }
+  return undef;
+}
+
+sub ask {
+  my ($path, $req) = @_;
+  my $s = IO::Socket::UNIX->new(Peer => $path, Type => SOCK_STREAM) or return '';
+  print $s "$req\n";
+  my $r = '';
+  eval {
+    local $SIG{ALRM} = sub { die "to\n" };
+    alarm 5;
+    while (my $l = <$s>) { $r .= $l; last if length($r) > 1024*1024; }
+    alarm 0;
+  };
+  close $s;
+  return $r;
+}
+
+sub parse_json {
+  my $s = shift;
+  if (eval { require JSON::PP }) {
+    return eval { JSON::PP->new->decode($s) };
+  }
+  # 兜底: 只解析顶层 ok/jobs 数组（成员对象用很粗的 regex 提取关键字段）
+  my %r = (ok => ($s =~ /"ok":true/ ? 1 : 0), jobs => []);
+  my @obj;
+  while ($s =~ /\{("short":"[a-f0-9]+".*?"source":"[^"]*"(?:[^{}]|\{[^{}]*\})*?)\}/g) {
+    my $blob = $1;
+    my %j;
+    while ($blob =~ /"(\w+)":\s*(?:"((?:[^"\\]|\\.)*)"|(-?\d+))/g) {
+      $j{$1} = defined($2) ? $2 : 0+$3;
+    }
+    push @obj, \%j;
+  }
+  $r{jobs} = \@obj;
+  return \%r;
+}
+
+sub truncate_str {
+  my ($s, $n) = @_;
+  return $s if length($s) <= $n;
+  return substr($s, 0, $n-1) . '…';
+}
+
+sub to_json {
+  my $v = shift;
+  my $r = ref($v);
+  if ($r eq 'HASH')  { return '{' . join(',', map { qq("$_":) . to_json($v->{$_}) } sort keys %$v) . '}' }
+  if ($r eq 'ARRAY') { return '[' . join(',', map { to_json($_) } @$v) . ']' }
+  return 'null' unless defined $v;
+  return "$v" if $v =~ /^-?\d+(\.\d+)?$/;
+  $v =~ s/\\/\\\\/g; $v =~ s/"/\\"/g; $v =~ s/\n/\\n/g;
+  return qq("$v");
+}

@@ -1,0 +1,296 @@
+#!/usr/bin/env node
+// cc-fleet-status-codex-app — status for Codex App visible worker threads.
+
+const fs = require("fs");
+const path = require("path");
+const { execFileSync, spawnSync } = require("child_process");
+
+let rq = "";
+let coord = "";
+let jsonOut = false;
+let codexBin = "";
+let startAppServer = false;
+
+function usage() {
+  console.error("cc-fleet-status-codex-app <RQ-id> [--coord DIR] [--json] [--codex-bin PATH] [--start-app-server]");
+}
+
+for (let i = 2; i < process.argv.length; i++) {
+  const a = process.argv[i];
+  if (a === "--coord") coord = process.argv[++i] || "";
+  else if (a === "--json") jsonOut = true;
+  else if (a === "--codex-bin") codexBin = process.argv[++i] || "";
+  else if (a === "--start-app-server") startAppServer = true;
+  else if (a === "-h" || a === "--help") { usage(); process.exit(0); }
+  else if (a.startsWith("-")) { console.error(`unknown flag: ${a}`); process.exit(5); }
+  else rq = a;
+}
+
+if (!rq) {
+  usage();
+  process.exit(5);
+}
+
+function gitOut(args) {
+  try {
+    return execFileSync("git", args, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+  } catch {
+    return "";
+  }
+}
+
+function defaultCoord() {
+  const common = gitOut(["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+  return common ? path.join(common, "fleet", rq) : "";
+}
+
+function parseEnv(file) {
+  const out = {};
+  for (const line of fs.readFileSync(file, "utf8").split(/\r?\n/)) {
+    if (!line.trim() || line.trim().startsWith("#")) continue;
+    const idx = line.indexOf("=");
+    if (idx < 0) continue;
+    out[line.slice(0, idx)] = line.slice(idx + 1);
+  }
+  return out;
+}
+
+function updateEnvFile(file, updates) {
+  const input = fs.readFileSync(file, "utf8").split(/\r?\n/);
+  const seen = new Set();
+  const lines = input.map((line) => {
+    const idx = line.indexOf("=");
+    if (idx <= 0) return line;
+    const key = line.slice(0, idx);
+    if (!Object.prototype.hasOwnProperty.call(updates, key)) return line;
+    seen.add(key);
+    return `${key}=${updates[key]}`;
+  });
+  const insertAt = lines.length && lines[lines.length - 1] === "" ? lines.length - 1 : lines.length;
+  const extra = [];
+  for (const [key, value] of Object.entries(updates)) {
+    if (!seen.has(key)) extra.push(`${key}=${value}`);
+  }
+  lines.splice(insertAt, 0, ...extra);
+  fs.writeFileSync(file, `${lines.join("\n").replace(/\n*$/, "")}\n`);
+}
+
+function appendDetail(job, text) {
+  job.detail = job.detail ? `${job.detail}；${text}` : text;
+}
+
+function receiptDone(file) {
+  if (!file || !fs.existsSync(file)) return false;
+  const lines = fs.readFileSync(file, "utf8").replace(/^\uFEFF/, "").split(/\r?\n/);
+  const first = lines.find((line) => line.trim());
+  return !!first && /^result:/i.test(first.trim());
+}
+
+function discoverCallBin() {
+  const selfDir = __dirname;
+  return process.env.CODEX_APP_CALL_BIN || path.join(selfDir, "cc-codex-app-call");
+}
+
+function discoverPinBin() {
+  const selfDir = __dirname;
+  return process.env.CODEX_APP_PIN_BIN || path.join(selfDir, "cc-codex-app-pin");
+}
+
+function callApp(method, params) {
+  const callBin = discoverCallBin();
+  const tmp = path.join(coord, "app-json", `.status-${process.pid}-${Math.random().toString(16).slice(2)}.json`);
+  fs.mkdirSync(path.dirname(tmp), { recursive: true });
+  fs.writeFileSync(tmp, JSON.stringify(params));
+  const args = [];
+  if (codexBin) args.push("--codex-bin", codexBin);
+  if (startAppServer) args.push("--start-app-server");
+  args.push(method, tmp);
+  const res = spawnSync(callBin, args, {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+    maxBuffer: 64 * 1024 * 1024,
+  });
+  try { fs.unlinkSync(tmp); } catch {}
+  if (res.status !== 0) {
+    throw new Error((res.stderr || res.stdout || `app call failed ${res.status}`).trim());
+  }
+  return JSON.parse(res.stdout);
+}
+
+function classifyFromThread(job, thread) {
+  job.appStatus = thread?.status?.type || "unknown";
+  const turns = Array.isArray(thread?.turns) ? thread.turns : [];
+  const latestTurn = turns.length ? turns[turns.length - 1] : null;
+  job.turnStatus = latestTurn?.status || "";
+
+  if (latestTurn?.status === "inProgress" || thread?.status?.type === "active") {
+    const flags = thread?.status?.activeFlags || [];
+    if (flags.includes("waitingOnApproval")) {
+      job.state = "blocked";
+      job.detail = "Codex App thread 等待 approval / 输入";
+    } else {
+      job.state = "running";
+      job.detail = `Codex App thread active turn=${latestTurn?.id || job.turn_id || "-"}`;
+    }
+    return;
+  }
+  if (latestTurn?.status === "failed" || thread?.status?.type === "systemError") {
+    job.state = "failed";
+    job.detail = "Codex App thread failed/systemError";
+    return;
+  }
+  if (latestTurn?.status === "interrupted") {
+    job.state = "failed";
+    job.detail = "Codex App turn interrupted";
+    return;
+  }
+  if (latestTurn?.status === "completed" || ["idle", "notLoaded"].includes(thread?.status?.type)) {
+    job.state = "done";
+    job.detail = "Codex App thread 已空闲/完成；如无回执请读最后消息核验";
+    return;
+  }
+  job.state = "unknown";
+  job.detail = `Codex App thread 状态未知: ${job.appStatus}`;
+}
+
+function ensureLiveLoaded(job) {
+  if (job.state !== "running" && job.state !== "blocked") return;
+  const threadId = job.thread_id || job.id;
+  if (!threadId) return;
+  try {
+    callApp("thread/resume", { threadId });
+    job.live_loaded = 1;
+    appendDetail(job, "已确保 live loaded");
+  } catch (e) {
+    job.live_loaded = 0;
+    appendDetail(job, `live 加载失败: ${String(e.message || e).slice(0, 120)}`);
+  }
+}
+
+function ensureSidebarVisible(job) {
+  const threadId = job.thread_id || job.id;
+  if (!threadId) return;
+  try {
+    callApp("thread/unarchive", { threadId });
+    job.visibility_unarchived = 1;
+  } catch (e) {
+    job.visibility_unarchived = 0;
+    appendDetail(job, `unarchive 兜底失败: ${String(e.message || e).slice(0, 120)}`);
+  }
+}
+
+function autoUnpinIfReceiptDone(job) {
+  if (job.visibility_pinned !== "1") return;
+  if (job.visibility_unpinned === "1") return;
+  if (job.state !== "done" || job.receipt !== 1) return;
+  const threadId = job.thread_id || job.id;
+  if (!threadId) return;
+  const pinBin = discoverPinBin();
+  const res = spawnSync(pinBin, ["unpin", threadId], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  if (res.status === 0) {
+    const now = String(Math.floor(Date.now() / 1000));
+    try {
+      updateEnvFile(job.meta, {
+        visibility_unpinned: "1",
+        visibility_unpinned_at: now,
+      });
+      job.visibility_unpinned = "1";
+      job.visibility_unpinned_at = now;
+      appendDetail(job, "已自动取消临时 pin");
+    } catch (e) {
+      appendDetail(job, `自动取消 pin 已执行，但写回元数据失败: ${String(e.message || e).slice(0, 120)}`);
+    }
+  } else {
+    const msg = (res.stderr || res.stdout || `pin helper exit ${res.status}`).trim();
+    appendDetail(job, `自动取消临时 pin 失败: ${msg.slice(0, 120)}`);
+  }
+}
+
+coord = coord || defaultCoord();
+if (!coord || !fs.existsSync(coord) || !fs.statSync(coord).isDirectory()) {
+  console.error(`❌ 找不到协调目录: ${coord || "<unknown>"}`);
+  process.exit(2);
+}
+
+const files = fs.readdirSync(coord).filter((f) => f.endsWith(".codex-app.env")).sort();
+const jobs = files.map((f) => {
+  const full = path.join(coord, f);
+  const meta = parseEnv(full);
+  meta.module = meta.module || f.replace(/\.codex-app\.env$/, "");
+  meta.meta = full;
+  return meta;
+});
+
+let appUnavailable = false;
+for (const job of jobs) {
+  const summary = job.summary_file || path.join(coord, `${job.module}.summary.md`);
+  job.receipt = receiptDone(summary) ? 1 : 0;
+  if (job.receipt) {
+    job.state = "done";
+    job.detail = `🧾回执在案 ${summary}`;
+    ensureSidebarVisible(job);
+    autoUnpinIfReceiptDone(job);
+    continue;
+  }
+  const threadId = job.thread_id || job.id;
+  if (!threadId) {
+    job.state = "lost";
+    job.detail = "缺少 thread_id";
+    continue;
+  }
+  try {
+    const data = callApp("thread/read", { threadId, includeTurns: true });
+    classifyFromThread(job, data.thread);
+    ensureSidebarVisible(job);
+    ensureLiveLoaded(job);
+    autoUnpinIfReceiptDone(job);
+  } catch (e) {
+    appUnavailable = true;
+    job.state = "unknown";
+    job.detail = `无法读取 Codex App thread: ${String(e.message || e).slice(0, 160)}`;
+  }
+}
+
+function summaryExit() {
+  if (!jobs.length) return 1;
+  let run = false, bad = false, unknown = false;
+  for (const j of jobs) {
+    if (j.state === "done") continue;
+    if (j.state === "running" || j.state === "blocked") run = true;
+    else if (j.state === "unknown") unknown = true;
+    else bad = true;
+  }
+  if (bad) return 3;
+  if (unknown && appUnavailable) return 2;
+  if (unknown) return 3;
+  if (run) return 1;
+  return 0;
+}
+
+const rc = summaryExit();
+if (jsonOut) {
+  console.log(JSON.stringify({ ok: rc !== 2, rq, coord, jobs }));
+  process.exit(rc);
+}
+
+if (!jobs.length) {
+  console.log(`（${rq} 下没有 Codex App worker 元数据；请用 cc-dispatch-codex-app 派发）`);
+  process.exit(1);
+}
+
+console.log(`${"#".padEnd(3)}  ${"MODULE".padEnd(22)}  ${"STATE".padEnd(10)}  ${"THREAD".padEnd(36)}  DETAIL`);
+console.log(`${"---".padEnd(3)}  ${"------".padEnd(22)}  ${"-----".padEnd(10)}  ${"------".padEnd(36)}  ------`);
+jobs
+  .slice()
+  .sort((a, b) => String(a.module).localeCompare(String(b.module)))
+  .forEach((j, idx) => {
+    const detail = String(j.detail || "").replace(/\n/g, " ").slice(0, 100);
+    console.log(`${String(idx + 1).padEnd(3)}  ${String(j.module || "?").slice(0, 22).padEnd(22)}  ${String(j.state || "?").padEnd(10)}  ${String(j.thread_id || j.id || "-").slice(0, 36).padEnd(36)}  ${detail}`);
+  });
+
+console.log("");
+if (rc === 0) console.log("✅ Codex App worker 无在跑/无异常。可进入 cc-fleet-summary + 验收阶段。");
+else if (rc === 1) console.log(`⏳ Codex App worker 进行中: ${jobs.filter((j) => j.state === "running" || j.state === "blocked").map((j) => j.module).join(", ")}`);
+else if (rc === 2) console.log("❌ Codex App app-server 不可达；已有 result: 回执仍可用，未回执线程需启动 app-server 后再查。");
+else console.log(`❌ Codex App worker 有异常: ${jobs.filter((j) => !["done", "running", "blocked"].includes(j.state)).map((j) => j.module).join(", ")}`);
+process.exit(rc);

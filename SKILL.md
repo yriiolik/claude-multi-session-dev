@@ -1,14 +1,19 @@
 ---
 name: multi-session-dev
 description: >-
+  ⚠ 用户一旦说"用多 session / 多 session 模式 / 多个 session / fleet 编排"来完成某个开发任务，
+  **动手前第一件事就是调用（加载）本技能、之后按它编排，绝不自己直接读/改/跑代码去干**——这一步最容易漏，
+  别把"多 session 模式完成 XX"当普通任务自己上手。
   多 session 协作开发编排（仅供"主 session"用）。当**发起需求的主 session**想把一个开发需求
   按模块拆开、派发给多个独立后台 session（默认 Claude Code；用户明确要求 codex /
   codex-app / App 可见模式时走 Codex App 脚本）并行开发、最后由主 session 做整体业务效果
   验收时使用：主 session 只负责把业务需求归属到项目既有模块（识别受影响模块/数据流/实现策略，模块
   划分是项目自带的、只映射不自创，**一个模块派一个子 session、绝不合并**）、为有接口
-  交互的模块安排契约先行或提供方先行、从验收口径设计 e2e 测试场景、派发/监控/验收，绝不自己写/调/测/读代码；
+  交互的模块安排契约先行或提供方先行、从验收口径设计 e2e 测试场景、派发/监控/验收，绝不自己写/调/测/读代码。
+  ⚠ 派发开发 worker 只用 `cc-dispatch` 脚本（Codex/App 可见模式 `cc-dispatch-codex-app`），绝不用内置
+  `Agent`/Task 工具——`Agent` 仅限只读探查；误用 `Agent` 派"去改代码"的 worker 是本技能最高频错误。
   每个被派发的 session 完成后回填一份简短回执（真实改动/预期变化/影响面/缺陷）。触发词：用多
-  session 完成任务、多 session 完成这个需求、用多个 session 干活、多 session 开发、模块拆分派发、
+  session 完成任务、用多 session 模式完成（下面/这个）任务、多 session 完成这个需求、用多个 session 干活、多 session 开发、模块拆分派发、
   fleet 编排、主 session 指挥、background session 并行开发、契约先行、cc-dispatch、codex 模式、codex-app 模式、App 可见模式。
   ⚠ 被派发的**子 session（worker，名字带 ↳ 前缀 / 环境变量 FLEET_ROLE=worker / 首条消息带
   ⟦FLEET-WORKER⟧ 哨兵）不要使用本技能**——你是干活的 worker，按任务卡写代码+自测+回执即可。
@@ -33,6 +38,30 @@ worker 该做的：**按收到的任务卡在自己范围内写代码 + 自测 +
 **不要**再调用 `cc-dispatch` 往下派发、**不要**拒绝写代码、**不要**把活又拆给别人。
 本技能下面所有"编排"动作只属于主 session。确认自己是主 session（名字无 ↳、无 FLEET_ROLE、
 是人直接发起的会话）后再继续。
+
+## ⛔ 主 session 第一铁律：派发开发 worker = 跑 `cc-dispatch`，永远不是 `Agent`/Task 工具 ⭐
+
+**这是本技能最高频、最致命的错误，也是你现在最该记住的一条。** 你被要求"用多 session 完成任务"后，
+会**本能地伸手去调内置 `Agent`（Task）工具**并行——因为它是你平时做并行工作的默认工具，连 harness 都在
+提示"launch multiple agents in one message"。**在本技能里，这个本能是错的。** `Agent` 起的是**挂在你名下、
+FleetView（`claude agents`）里根本看不见的 subagent**，不是独立 session：无法独立合回、收不到回执、watcher
+监控不到——整套 fleet 编排全部失效。**"用多 session" 从字面上就要求真正的独立 session，subagent 不满足。**
+
+**动手前对一次这条对照（唯一判据 = worker 要不要改代码）：**
+- **要让某模块"去改代码 / 实现 / 开发 / 修 bug / 建文档并落地"** → 唯一动作是**派发脚本**：先 `cc-fleet-init`
+  取 RQ，再 `cc-dispatch`（Codex/App 可见模式 `cc-dispatch-codex-app`）。**不是 `Agent`，哪怕 `run_in_background:true`。**
+- **只想"读代码 / 摸现状 / 确认某字段·接口·数据流"（纯只读、不落任何代码）** → 才用 `Agent`（`Explore`）拿结论。
+  这是 `Agent` 在本技能里**唯一**合法用途。
+
+> ⚠ **harness 那句"launch multiple agents in one message for parallel work"不适用于派发开发 worker。**
+> 在本技能里，"并行开多个 worker" = **在一条消息里连发多条 `cc-dispatch` 命令**，**不是**连发多个 `Agent`
+> 工具调用。别把这条通用并行建议套到派发上——它只对只读探查成立。
+
+**派发后立刻做一次机械验证（漏做 = 没派）**：跑 `claude agents` 或 `cc-fleet-status "$RQ"`，**逐个模块确认
+看到对应的 `↳<module>@<RQ>` 条目**。看不到（或只有一个无名 `source=spare` 的 running 条目）→ **你刚才误用了
+`Agent` 工具**，那个"worker"只是你名下一个隐形 subagent。**立刻停手，改用 `cc-dispatch` 重派。**
+
+完整机制、可见性对照表与降级细节见下文「角色铁律 · 派发通道铁律」。
 
 ## 何时激活本技能
 

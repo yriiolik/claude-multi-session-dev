@@ -9,10 +9,10 @@ let rq = "";
 let coord = "";
 let jsonOut = false;
 let codexBin = "";
-let startAppServer = false;
+let startAppServer = true;
 
 function usage() {
-  console.error("cc-fleet-status-codex-app <RQ-id> [--coord DIR] [--json] [--codex-bin PATH] [--start-app-server]");
+  console.error("cc-fleet-status-codex-app <RQ-id> [--coord DIR] [--json] [--codex-bin PATH] [--no-start-app-server]");
 }
 
 for (let i = 2; i < process.argv.length; i++) {
@@ -21,6 +21,7 @@ for (let i = 2; i < process.argv.length; i++) {
   else if (a === "--json") jsonOut = true;
   else if (a === "--codex-bin") codexBin = process.argv[++i] || "";
   else if (a === "--start-app-server") startAppServer = true;
+  else if (a === "--no-start-app-server") startAppServer = false;
   else if (a === "-h" || a === "--help") { usage(); process.exit(0); }
   else if (a.startsWith("-")) { console.error(`unknown flag: ${a}`); process.exit(5); }
   else rq = a;
@@ -134,6 +135,11 @@ function classifyFromThread(job, thread) {
     }
     return;
   }
+  if (job.terminated === "1") {
+    job.state = "stopped";
+    job.detail = `Codex App session 已由主控停止${job.terminated_turn_id ? ` turn=${job.terminated_turn_id}` : ""}`;
+    return;
+  }
   if (latestTurn?.status === "failed" || thread?.status?.type === "systemError") {
     job.state = "failed";
     job.detail = "Codex App thread failed/systemError";
@@ -169,7 +175,7 @@ function ensureLiveLoaded(job) {
 
 function ensureSidebarVisible(job) {
   const threadId = job.thread_id || job.id;
-  if (!threadId) return;
+  if (!threadId || job.terminated_archived === "1") return;
   try {
     callApp("thread/unarchive", { threadId });
     job.visibility_unarchived = 1;
@@ -186,7 +192,11 @@ function autoUnpinIfReceiptDone(job) {
   const threadId = job.thread_id || job.id;
   if (!threadId) return;
   const pinBin = discoverPinBin();
-  const res = spawnSync(pinBin, ["unpin", threadId], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  const args = [];
+  if (codexBin) args.push("--codex-bin", codexBin);
+  if (startAppServer) args.push("--start-app-server");
+  args.push("unpin", threadId);
+  const res = spawnSync(pinBin, args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
   if (res.status === 0) {
     const now = String(Math.floor(Date.now() / 1000));
     try {
@@ -292,5 +302,5 @@ console.log("");
 if (rc === 0) console.log("✅ Codex App worker 无在跑/无异常。可进入 cc-fleet-summary + 验收阶段。");
 else if (rc === 1) console.log(`⏳ Codex App worker 进行中: ${jobs.filter((j) => j.state === "running" || j.state === "blocked").map((j) => j.module).join(", ")}`);
 else if (rc === 2) console.log("❌ Codex App app-server 不可达；已有 result: 回执仍可用，未回执线程需启动 app-server 后再查。");
-else console.log(`❌ Codex App worker 有异常: ${jobs.filter((j) => !["done", "running", "blocked"].includes(j.state)).map((j) => j.module).join(", ")}`);
+else console.log(`❌ Codex App worker 有异常或已停止: ${jobs.filter((j) => !["done", "running", "blocked"].includes(j.state)).map((j) => j.module).join(", ")}`);
 process.exit(rc);

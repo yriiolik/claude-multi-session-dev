@@ -1,74 +1,77 @@
 #!/usr/bin/env node
-// cc-codex-app-pin — local visibility fallback for Codex App worker threads.
+// cc-codex-app-pin — pin/unpin threads through the supported app-server API.
 
-const fs = require("fs");
 const path = require("path");
+const { spawnSync } = require("child_process");
 
-const action = process.argv[2] || "";
-const threadId = process.argv[3] || "";
-const valid = new Set(["pin", "unpin", "is-pinned"]);
+let action = "";
+let threadId = "";
+let codexBin = "";
+let startAppServer = false;
 
 function usage() {
-  console.error("cc-codex-app-pin <pin|unpin|is-pinned> <thread-id>");
+  console.error("cc-codex-app-pin [--codex-bin PATH] [--start-app-server] <pin|unpin|is-pinned> <thread-id>");
 }
 
-if (!valid.has(action) || !threadId) {
+for (let i = 2; i < process.argv.length; i++) {
+  const a = process.argv[i];
+  if (a === "--codex-bin") codexBin = process.argv[++i] || "";
+  else if (a === "--start-app-server") startAppServer = true;
+  else if (a === "-h" || a === "--help") { usage(); process.exit(0); }
+  else if (!action) action = a;
+  else if (!threadId) threadId = a;
+  else { usage(); process.exit(5); }
+}
+
+if (!new Set(["pin", "unpin", "is-pinned"]).has(action) || !threadId) {
   usage();
   process.exit(5);
 }
 
-const home = process.env.CODEX_HOME || path.join(process.env.HOME || "", ".codex");
-const statePath = process.env.CODEX_APP_GLOBAL_STATE || path.join(home, ".codex-global-state.json");
-const backupPath = `${statePath}.bak`;
-const key = "pinned-thread-ids";
-
-function readState() {
-  try {
-    return JSON.parse(fs.readFileSync(statePath, "utf8"));
-  } catch (e) {
-    throw new Error(`cannot read Codex App global state ${statePath}: ${e.message || e}`);
+function callApp(method, params) {
+  const helper = process.env.CODEX_APP_CALL_BIN || path.join(__dirname, "cc-codex-app-call");
+  const args = [];
+  if (codexBin) args.push("--codex-bin", codexBin);
+  if (startAppServer) args.push("--start-app-server");
+  args.push(method, "-");
+  const result = spawnSync(helper, args, {
+    input: JSON.stringify(params),
+    encoding: "utf8",
+    stdio: ["pipe", "pipe", "pipe"],
+    maxBuffer: 64 * 1024 * 1024,
+  });
+  if (result.status !== 0) {
+    throw new Error((result.stderr || result.stdout || `app call failed ${result.status}`).trim());
   }
+  return JSON.parse(result.stdout);
 }
 
-function writeState(state) {
-  let mode = 0o600;
-  try {
-    mode = fs.statSync(statePath).mode & 0o777;
-  } catch {}
-  try {
-    if (fs.existsSync(statePath)) fs.copyFileSync(statePath, backupPath);
-  } catch {}
-  const tmp = `${statePath}.tmp-${process.pid}-${Date.now()}`;
-  fs.writeFileSync(tmp, JSON.stringify(state), { mode });
-  fs.renameSync(tmp, statePath);
+function sleep(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
-let state;
-try {
-  state = readState();
-} catch (e) {
-  console.error(e.message || String(e));
-  process.exit(2);
+function updatePinned(value) {
+  let lastError;
+  for (const delay of [0, 100, 300, 750]) {
+    if (delay) sleep(delay);
+    try {
+      return callApp("thread/metadata/update", { threadId, isPinned: value });
+    } catch (error) {
+      lastError = error;
+      const message = String(error.message || error);
+      if (!/gitInfo must include|not found|not yet available/i.test(message)) throw error;
+    }
+  }
+  throw lastError;
 }
-
-if (!Array.isArray(state[key])) state[key] = [];
-const before = state[key].includes(threadId);
 
 try {
   if (action === "is-pinned") {
-    console.log(before ? "1" : "0");
-  } else if (action === "pin") {
-    if (!before) {
-      state[key].push(threadId);
-      writeState(state);
-    }
-    console.log("pinned");
-  } else if (action === "unpin") {
-    if (before) {
-      state[key] = state[key].filter((id) => id !== threadId);
-      writeState(state);
-    }
-    console.log("unpinned");
+    const result = callApp("thread/read", { threadId, includeTurns: false });
+    console.log(result?.thread?.isPinned ? "1" : "0");
+  } else {
+    updatePinned(action === "pin");
+    console.log(action === "pin" ? "pinned" : "unpinned");
   }
 } catch (e) {
   console.error(e.message || String(e));

@@ -78,14 +78,28 @@ FleetView（`claude agents`）里根本看不见的 subagent，不是独立 sess
 
 ## codex / App 可见模式总纲（用户明确要求时）
 
-**唯一差异：把所有 `cc-dispatch` / `cc-fleet-status` / `cc-fleet-watch` / `cc-fleet-reply` 换成对应的
+**唯一差异：把所有 `cc-dispatch` / `cc-fleet-status` / `cc-fleet-watch` / `cc-fleet-reply` / `cc-fleet-kill` 换成对应的
 `-codex-app` 变体**，其余 RQ、集成分支、任务卡、sid、回执、验收流程**全不变**。下文正文只写默认 Claude 模式命令，
 不再逐处并列——需要 codex 模式时按本条替换即可。
 
 - 触发：用户明确说「codex / codex-app / App 可见 / 子 session 要在 Codex App 里看到」。
-- 旧命令 `cc-dispatch-codex` / `cc-fleet-status-codex` / `cc-fleet-watch-codex` 只是兼容别名，等同 `-codex-app`。
-- 模型/思考深度沿用当前 Codex 设置，默认速度 1x；**只有用户明确要求「快速模式」才加 `--fast`**，其它 Codex 专用
-  参数默认不传。Codex App 的可见性/prompt 注入/服务连接等实现细节由脚本自动处理，技能层不展开、不手调。
+- `cc-dispatch-codex`、`cc-fleet-status-codex`、`cc-fleet-watch-codex`、`cc-fleet-read-codex`、
+  `cc-fleet-reply-codex`、`cc-fleet-kill-codex` 是短别名，均等同 `-codex-app`。
+- Codex session 点查最新结果用 `cc-fleet-read-codex-app <RQ> <module>`；结束用
+  `cc-fleet-kill-codex-app <RQ> <module>`（整个 RQ 用 `--all`，需要从侧栏隐藏再加 `--archive`）。
+- 外部查看：Codex App 侧栏直接显示这些非 ephemeral、已命名 thread；CLI 用 `codex resume --all` 看全局列表。
+  编排视角下的最新状态仍以 `cc-fleet-status-codex-app` / `cc-fleet-read-codex-app` 为准。
+- 首次使用或 Codex 升级后先跑 `cc-codex-doctor --start-app-server`；它会自动读取 session 路由。只检查已经在跑的
+  daemon 才用 `--check-app-server`。配置与升级规则见 `reference/codex-integration.md`。
+- 所有 Codex 派发都由脚本读取 `$CODEX_HOME/multi-session-dev.json`（默认 `~/.codex/multi-session-dev.json`），
+  自动应用 target 的 provider、model 与 `reasoningEffort`。
+  **Agent 不得根据任务卡拼接 provider、model 或 key 参数**；操作者用 `cc-codex-session-config select <target>` 统一切换。
+  配置不存在或 `active=inherit` 时沿用当前 Codex 设置。
+- 模型/provider/思考深度由路由目标或当前 Codex 设置决定，默认**不传 service tier**，兼容 DeepSeek Responses API。只有用户明确
+  要求快速模式、且当前 provider 明确支持 `priority` 时才加 `--fast`；DeepSeek 不加。App 可见性、prompt 注入、
+  app-server 自动启动等细节由脚本处理。
+- provider 必须预先写入 Codex `config.toml`，实际 key 只放 daemon 可见的认证环境或 Codex 认证配置；不得放进路由
+  文件、任务卡、`--env` 或命令行。多 key、切换与 daemon 重启规则见 `reference/codex-integration.md`。
 
 ## 主 session 的六步职责
 
@@ -478,7 +492,8 @@ git for-each-ref --format='%(refname:short)' "refs/remotes/origin/fleet/$RQ/*" \
 ## 脚本速查
 
 脚本固定装在 `~/.claude/skills/multi-session-dev/scripts/`（从任意 cwd 都用绝对路径调）。codex/App 可见模式把
-`cc-dispatch`/`cc-fleet-status`/`cc-fleet-watch`/`cc-fleet-reply` 换成对应 `-codex-app` 变体（见「codex 模式总纲」）。
+`cc-dispatch`/`cc-fleet-status`/`cc-fleet-watch`/`cc-fleet-reply`/`cc-fleet-kill` 换成对应 `-codex-app`
+变体（见「codex 模式总纲」）。
 
 | 命令 | 作用 |
 |---|---|
@@ -487,6 +502,11 @@ git for-each-ref --format='%(refname:short)' "refs/remotes/origin/fleet/$RQ/*" \
 | `cc-fleet-coord <RQ> --fresh` | **防撞**解析：该 RQ 已被往轮占用（有 `.sid`/`.summary.md`/`contracts`）则 `exit 4`。用户给显式 RQ 时兜底 |
 | `cc-fleet-coord <RQ> --put <relpath> [src]` | **把文件落进协调目录**（绕开后台 job 的 Write/Edit 隔离闸）。配 `Write` 到 `$CLAUDE_JOB_DIR/tmp/` 再 `--put` 用 |
 | `cc-fleet-coord --gc [days]` / `--alloc [stem]` / `--init-base <RQ> [base]` / `--check-join …` | `cc-fleet-init` 拆开的底层子命令，供高级编排。`--alloc` **只取 stdout 别 `2>&1`** |
+| `cc-codex-session-config init/show/validate/select <target>` | 管理统一 Codex session 路由（默认 `~/.codex/multi-session-dev.json`）；文件只存 target/provider/model/认证环境变量名，拒绝保存 key。Agent 只读取，不代替操作者切换 |
+| `cc-codex-doctor [--deepseek] [--deepseek-provider ID] [--model MODEL]` | Codex worker 只读预检：默认自动读取统一路由，并检查 CLI、官方 app-server proxy、live handshake、DeepSeek provider / models.json / 认证 / 冲突字段；显式 provider/model 参数只供人工诊断 |
+| `cc-fleet-read-codex-app <RQ> <module>` | 读取某个 Codex session 的最新持久化快照：thread/turn 状态、最近命令与输出、最新 agent 回复。`--json` 稳定摘要，`--raw` 完整 `thread/read` 响应 |
+| `cc-fleet-reply-codex-app <RQ> <module> "…"` | 回复既有 Codex session：运行中用 `turn/steer`，空闲/已停止用 `turn/start` 新增 turn；真实 cwd 始终指向 worker worktree |
+| `cc-fleet-kill-codex-app <RQ> <module>` / `<RQ> --all` | 结束 Codex session 的运行中 turn（`turn/interrupt`）并标记 `stopped`；默认仍留在 App 侧栏，加 `--archive` 才归档 |
 | `cc-dispatch … --sid-file "$COORD/<m>.sid"` | 派发一个后台 session 并记 sid（**必带 --sid-file**）。疑似复用别任务 RQ → `exit 6`（新任务用 `cc-fleet-init`，同任务后续批次加 `--join`）。`--help` 看全部选项 |
 | `cc-dispatch-batch <RQ>` | 结构化布局批派整个 RQ（自动记 sid + 带 ↳名/FLEET_*/哨兵；**任务卡需自包含**，不自动拼 preamble） |
 | `cc-fleet-status <RQ>` / `--all` / `--json` | **按 SID 名册**关联的状态表（exit 0=无在跑无异常 / 1=进行中 / 2=daemon 不可达 / 3=异常；`gone`=已结束）。**带 `result:` 的 canonical 回执 = `receipt=1` / 🧾 = 已完成（抗 respawn），即便 daemon 仍报 running** |
@@ -523,7 +543,9 @@ Claude Code 升级可能让 daemon 协议变动。信号 = `cc-dispatch` 退出�
   `claude agents`，照清单在 FleetView 手动「New agent」派发，**方法论流程不变**。要修脚本照 `reference/PROTOCOL.md`
   §9「协议升级应对剧本」更新 `cc-dispatch` 的字段构造（通常改 3-5 行）。
 - codex 模式的问题优先看 `cc-dispatch-codex-app` / `cc-fleet-status-codex-app` / `cc-fleet-watch-codex-app` /
-  `cc-fleet-reply-codex-app` 的报错与 `--help`；底层兼容策略只在脚本内维护，Claude 模式不受 Codex 脚本变动影响。
+  `cc-fleet-read-codex-app` / `cc-fleet-reply-codex-app` / `cc-fleet-kill-codex-app` 的报错与 `--help`，并跑
+  `cc-codex-session-config validate` 和 `cc-codex-doctor --start-app-server`。doctor 会自动识别活动 DeepSeek target。
+  底层兼容策略只在脚本内维护，Claude 模式不受 Codex 脚本变动影响。
 
 ## 参考文件（reference/，按需展开）
 
@@ -536,6 +558,7 @@ Claude Code 升级可能让 daemon 协议变动。信号 = `cc-dispatch` 退出�
 | `pitfalls.md` | ⭐死等四根因复盘 + RQ 编号串台事故 + 灰度坏模型识别细节 + CLAUDE.md 自动加载历史 |
 | `fleet-display.md` | FleetView `bg`/`0s` 显示自愈的根因与三层修复、回归用例 |
 | `PROTOCOL.md` | daemon 协议参考（cc-dispatch 失效时照它修） |
+| `codex-integration.md` | Codex 版本基线、DeepSeek Responses API 配置约束、app-server 调用契约与升级检查 |
 
 ## 注意事项
 

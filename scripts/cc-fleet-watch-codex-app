@@ -12,10 +12,10 @@ let heartbeat = 240;
 let maxLoops = 0;
 let once = false;
 let codexBin = "";
-let startAppServer = false;
+let startAppServer = true;
 
 function usage() {
-  console.error("cc-fleet-watch-codex-app <RQ-id> [--coord DIR] [--wait] [--interval SEC] [--heartbeat SEC] [--max-loops N]");
+  console.error("cc-fleet-watch-codex-app <RQ-id> [--coord DIR] [--wait] [--interval SEC] [--heartbeat SEC] [--max-loops N] [--no-start-app-server]");
 }
 
 for (let i = 2; i < process.argv.length; i++) {
@@ -28,6 +28,7 @@ for (let i = 2; i < process.argv.length; i++) {
   else if (a === "--max-loops") maxLoops = Number(process.argv[++i] || "0");
   else if (a === "--codex-bin") codexBin = process.argv[++i] || "";
   else if (a === "--start-app-server") startAppServer = true;
+  else if (a === "--no-start-app-server") startAppServer = false;
   else if (a === "-h" || a === "--help") { usage(); process.exit(0); }
   else if (a.startsWith("-")) { console.error(`unknown flag: ${a}`); process.exit(5); }
   else rq = a;
@@ -41,6 +42,7 @@ if (!rq) {
 const statusBin = path.join(__dirname, "cc-fleet-status-codex-app");
 const settled = new Set();
 const failed = new Set();
+const stopped = new Set();
 const known = new Set();
 let lastEmit = Date.now();
 let loops = 0;
@@ -81,6 +83,10 @@ while (true) {
     if (s === "done") {
       settled.add(m);
       if (!wait) emit(`✅ ${m} Codex App worker 已完成`);
+    } else if (s === "stopped") {
+      settled.add(m);
+      stopped.add(m);
+      if (!wait) emit(`⏹ ${m} Codex App worker 已由主控停止`);
     } else if (s === "failed" || s === "lost" || s === "unknown") {
       settled.add(m);
       failed.add(m);
@@ -95,6 +101,10 @@ while (true) {
   if (total > 0 && done >= total) {
     if (failed.size) {
       emit(`❌ Codex App fleet ${rq} 全部结束，但 ${failed.size} 个异常`);
+      process.exit(3);
+    }
+    if (stopped.size) {
+      emit(`⏹ Codex App fleet ${rq} 全部结束，其中 ${stopped.size} 个由主控停止`);
       process.exit(3);
     }
     emit(`✅ Codex App fleet ${rq} 全部完成（${done}/${total}）`);

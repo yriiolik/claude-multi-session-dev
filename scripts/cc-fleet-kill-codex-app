@@ -1,0 +1,167 @@
+#!/usr/bin/env node
+// cc-fleet-kill-codex-app — interrupt active Codex turns and mark sessions as explicitly stopped.
+
+const fs = require("fs");
+const path = require("path");
+const { execFileSync, spawnSync } = require("child_process");
+
+let rq = "";
+let moduleName = "";
+let all = false;
+let archive = false;
+let coord = "";
+let codexBin = "";
+let startAppServer = true;
+let jsonOut = false;
+
+function usage() {
+  console.error(`cc-fleet-kill-codex-app <RQ> <module> [options]
+       cc-fleet-kill-codex-app <RQ> --all [options]
+  --archive              archive the thread after interrupting it
+  --json                 output JSON
+  --coord DIR            override coordination directory
+  --codex-bin PATH       use this Codex CLI binary
+  --start-app-server     start app-server when needed (default)
+  --no-start-app-server  only connect to an existing app-server`);
+}
+
+for (let i = 2; i < process.argv.length; i++) {
+  const a = process.argv[i];
+  if (a === "--all") all = true;
+  else if (a === "--archive") archive = true;
+  else if (a === "--json") jsonOut = true;
+  else if (a === "--coord") coord = process.argv[++i] || "";
+  else if (a === "--codex-bin") codexBin = process.argv[++i] || "";
+  else if (a === "--start-app-server") startAppServer = true;
+  else if (a === "--no-start-app-server") startAppServer = false;
+  else if (a === "-h" || a === "--help") { usage(); process.exit(0); }
+  else if (a.startsWith("-")) { console.error(`unknown flag: ${a}`); process.exit(5); }
+  else if (!rq) rq = a;
+  else if (!moduleName) moduleName = a;
+  else { console.error(`unexpected argument: ${a}`); process.exit(5); }
+}
+if (!rq || (all === !!moduleName)) {
+  usage();
+  process.exit(5);
+}
+
+function gitOut(args) {
+  try { return execFileSync("git", args, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim(); }
+  catch { return ""; }
+}
+function defaultCoord() {
+  const common = gitOut(["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+  return common ? path.join(common, "fleet", rq) : "";
+}
+function parseEnv(file) {
+  const out = {};
+  for (const line of fs.readFileSync(file, "utf8").split(/\r?\n/)) {
+    const idx = line.indexOf("=");
+    if (idx > 0 && !line.trim().startsWith("#")) out[line.slice(0, idx)] = line.slice(idx + 1);
+  }
+  return out;
+}
+function updateEnvFile(file, updates) {
+  const lines = fs.readFileSync(file, "utf8").split(/\r?\n/);
+  const seen = new Set();
+  for (let i = 0; i < lines.length; i++) {
+    const idx = lines[i].indexOf("=");
+    if (idx <= 0) continue;
+    const key = lines[i].slice(0, idx);
+    if (Object.prototype.hasOwnProperty.call(updates, key)) {
+      lines[i] = `${key}=${updates[key]}`;
+      seen.add(key);
+    }
+  }
+  while (lines.length && !lines[lines.length - 1]) lines.pop();
+  for (const [key, value] of Object.entries(updates)) if (!seen.has(key)) lines.push(`${key}=${value}`);
+  const tmp = `${file}.tmp-${process.pid}`;
+  fs.writeFileSync(tmp, `${lines.join("\n")}\n`);
+  fs.renameSync(tmp, file);
+}
+function callApp(method, params) {
+  const callBin = process.env.CODEX_APP_CALL_BIN || path.join(__dirname, "cc-codex-app-call");
+  const tmpDir = path.join(coord, "app-json");
+  fs.mkdirSync(tmpDir, { recursive: true });
+  const tmp = path.join(tmpDir, `.kill-${process.pid}-${Math.random().toString(16).slice(2)}.json`);
+  fs.writeFileSync(tmp, JSON.stringify(params));
+  const args = [];
+  if (codexBin) args.push("--codex-bin", codexBin);
+  if (startAppServer) args.push("--start-app-server");
+  args.push(method, tmp);
+  const res = spawnSync(callBin, args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], maxBuffer: 64 * 1024 * 1024 });
+  try { fs.unlinkSync(tmp); } catch {}
+  if (res.status !== 0) throw new Error((res.stderr || res.stdout || `app call failed ${res.status}`).trim());
+  return res.stdout.trim() ? JSON.parse(res.stdout) : {};
+}
+
+coord = coord || defaultCoord();
+if (!coord || !fs.existsSync(coord)) {
+  console.error(`❌ 找不到协调目录: ${coord || "<unknown>"}`);
+  process.exit(2);
+}
+const files = all
+  ? fs.readdirSync(coord).filter((f) => f.endsWith(".codex-app.env")).sort()
+  : [`${moduleName}.codex-app.env`];
+if (!files.length || files.some((file) => !fs.existsSync(path.join(coord, file)))) {
+  console.error(`❌ 找不到 Codex App worker 元数据: ${moduleName || rq}`);
+  process.exit(2);
+}
+
+const results = [];
+let unavailable = false;
+for (const fileName of files) {
+  const metaPath = path.join(coord, fileName);
+  const meta = parseEnv(metaPath);
+  const module = meta.module || fileName.replace(/\.codex-app\.env$/, "");
+  const threadId = meta.thread_id || meta.id;
+  const result = { module, threadId, interrupted: false, alreadyIdle: false, archived: false };
+  if (!threadId) {
+    result.error = "missing thread_id";
+    results.push(result);
+    unavailable = true;
+    continue;
+  }
+  try {
+    const read = callApp("thread/read", { threadId, includeTurns: true });
+    const turns = Array.isArray(read?.thread?.turns) ? read.thread.turns : [];
+    const activeTurn = turns.slice().reverse().find((turn) => turn?.status === "inProgress");
+    if (activeTurn) {
+      try {
+        callApp("turn/interrupt", { threadId, turnId: activeTurn.id });
+        result.interrupted = true;
+        result.turnId = activeTurn.id;
+      } catch (interruptError) {
+        // The turn may finish between thread/read and turn/interrupt. Treat that
+        // race as already idle, but preserve real interrupt failures.
+        const reread = callApp("thread/read", { threadId, includeTurns: true });
+        const stillActive = (Array.isArray(reread?.thread?.turns) ? reread.thread.turns : [])
+          .some((turn) => turn?.id === activeTurn.id && turn?.status === "inProgress");
+        if (stillActive) throw interruptError;
+        result.alreadyIdle = true;
+      }
+    } else result.alreadyIdle = true;
+    if (archive) {
+      callApp("thread/archive", { threadId });
+      result.archived = true;
+    }
+    updateEnvFile(metaPath, {
+      terminated: "1",
+      terminated_at: String(Math.floor(Date.now() / 1000)),
+      terminated_turn_id: result.turnId || "",
+      terminated_archived: archive ? "1" : "0",
+    });
+  } catch (e) {
+    result.error = String(e.message || e);
+    unavailable = true;
+  }
+  results.push(result);
+}
+
+if (jsonOut) console.log(JSON.stringify({ ok: !unavailable, rq, results }));
+else for (const result of results) {
+  if (result.error) console.error(`❌ ${result.module}: ${result.error}`);
+  else if (result.interrupted) console.log(`⏹ 已结束 ${result.module} thread=${result.threadId} turn=${result.turnId}${result.archived ? "（已归档）" : ""}`);
+  else console.log(`⏹ ${result.module} 当前无运行中的 turn，已标记为停止${result.archived ? "并归档" : ""}`);
+}
+process.exit(unavailable ? 2 : 0);

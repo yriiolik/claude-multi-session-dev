@@ -120,7 +120,14 @@ dispatch_cmd=( "$DISPATCH_BIN"
 if [ ${#PASSTHRU[@]} -gt 0 ]; then dispatch_cmd+=( "${PASSTHRU[@]}" ); fi
 dispatch_cmd+=( --prompt-file "$PROMPT_FILE" )
 
-kill_cmd=( "$SELF_DIR/cc-fleet-kill" "$RQ" "$MODULE" --signal "$SIGNAL" --coord "$COORD" )
+case "$DISPATCH" in
+  cc-dispatch-codex-app|cc-dispatch-codex)
+    kill_cmd=( "$SELF_DIR/cc-fleet-kill-codex-app" "$RQ" "$MODULE" --coord "$COORD" )
+    ;;
+  *)
+    kill_cmd=( "$SELF_DIR/cc-fleet-kill" "$RQ" "$MODULE" --signal "$SIGNAL" --coord "$COORD" )
+    ;;
+esac
 
 # ---- dry-run：只打印计划 ----
 if [ "$DRY_RUN" -eq 1 ]; then

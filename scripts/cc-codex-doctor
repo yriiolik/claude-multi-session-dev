@@ -1,0 +1,256 @@
+#!/usr/bin/env node
+// cc-codex-doctor — read-only preflight for the Codex worker backend.
+
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
+const { spawnSync } = require("child_process");
+
+let codexBin = process.env.CODEX_CLI_PATH || "";
+let requireDeepSeek = false;
+let deepSeekProviderId = "";
+let requestedModel = "";
+let checkAppServer = false;
+let startAppServer = false;
+let jsonOut = false;
+
+function usage() {
+  console.error(`cc-codex-doctor [--codex-bin PATH] [--deepseek] [--deepseek-provider ID] [--model MODEL] [--check-app-server] [--start-app-server] [--json]
+
+Read-only checks for Codex CLI >= 0.144.0, app-server proxy support, and the
+active DeepSeek Responses API/model-catalog configuration. --start-app-server
+may start the local daemon while checking it.`);
+}
+
+for (let i = 2; i < process.argv.length; i++) {
+  const a = process.argv[i];
+  if (a === "--codex-bin") codexBin = process.argv[++i] || "";
+  else if (a === "--deepseek") requireDeepSeek = true;
+  else if (a === "--deepseek-provider") { deepSeekProviderId = process.argv[++i] || ""; requireDeepSeek = true; }
+  else if (a === "--model") requestedModel = process.argv[++i] || "";
+  else if (a === "--check-app-server") checkAppServer = true;
+  else if (a === "--start-app-server") { checkAppServer = true; startAppServer = true; }
+  else if (a === "--json") jsonOut = true;
+  else if (a === "-h" || a === "--help") { usage(); process.exit(0); }
+  else { usage(); process.exit(5); }
+}
+
+const checks = [];
+function record(name, status, detail) { checks.push({ name, status, detail }); }
+function pass(name, detail) { record(name, "pass", detail); }
+function warn(name, detail) { record(name, "warn", detail); }
+function fail(name, detail) { record(name, "fail", detail); }
+
+let routing = null;
+if (!requireDeepSeek && !deepSeekProviderId && !requestedModel) {
+  const resolver = path.join(__dirname, "cc-codex-session-config");
+  const result = spawnSync(resolver, ["resolve", "--json"], { encoding: "utf8" });
+  if (result.status !== 0) {
+    fail("session-routing", (result.stderr || result.stdout || "routing config invalid").trim());
+  } else {
+    try {
+      routing = JSON.parse(result.stdout);
+      pass("session-routing", `${routing.active} (${routing.mode})`);
+    } catch (error) {
+      fail("session-routing", `无法解析 resolver 输出: ${error.message}`);
+    }
+  }
+}
+
+function executable(file) {
+  try { fs.accessSync(file, fs.constants.X_OK); return true; } catch { return false; }
+}
+
+function discoverCodex() {
+  if (codexBin) return executable(codexBin) ? codexBin : "";
+  const home = process.env.HOME || os.homedir();
+  const bundled = [
+    path.join(home, ".local", "bin", "codex"),
+    "/Applications/ChatGPT.app/Contents/Resources/codex",
+    "/Applications/Codex.app/Contents/Resources/codex",
+    path.join(home, ".codex", "plugins", ".plugin-appserver", "codex"),
+  ].find(executable);
+  if (bundled) return bundled;
+  const which = spawnSync("sh", ["-c", "command -v codex"], { encoding: "utf8" });
+  if (which.status === 0 && executable(which.stdout.trim())) return which.stdout.trim();
+  return "";
+}
+
+function semverAtLeast(actual, minimum) {
+  const a = actual.split(".").map((v) => Number(v));
+  const b = minimum.split(".").map((v) => Number(v));
+  for (let i = 0; i < 3; i++) {
+    if ((a[i] || 0) > (b[i] || 0)) return true;
+    if ((a[i] || 0) < (b[i] || 0)) return false;
+  }
+  return true;
+}
+
+function stripComment(line) {
+  let quote = "";
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if ((c === '"' || c === "'") && line[i - 1] !== "\\") {
+      quote = quote === c ? "" : (quote || c);
+    } else if (c === "#" && !quote) {
+      return line.slice(0, i);
+    }
+  }
+  return line;
+}
+
+function unquote(value) {
+  const v = value.trim();
+  if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) {
+    return v.slice(1, -1);
+  }
+  return v;
+}
+
+function parseSimpleToml(text) {
+  const values = {};
+  let section = "";
+  for (const raw of text.split(/\r?\n/)) {
+    const line = stripComment(raw).trim();
+    if (!line) continue;
+    const sectionMatch = line.match(/^\[([^\]]+)\]$/);
+    if (sectionMatch) { section = sectionMatch[1].trim(); continue; }
+    const keyMatch = line.match(/^([A-Za-z0-9_.-]+)\s*=\s*(.+)$/);
+    if (!keyMatch) continue;
+    const key = section ? `${section}.${keyMatch[1]}` : keyMatch[1];
+    values[key] = unquote(keyMatch[2]);
+  }
+  return values;
+}
+
+function expandUser(value) {
+  if (!value) return "";
+  if (value === "~") return process.env.HOME || os.homedir();
+  if (value.startsWith("~/")) return path.join(process.env.HOME || os.homedir(), value.slice(2));
+  return value;
+}
+
+const resolvedBin = discoverCodex();
+let version = "";
+if (!resolvedBin) {
+  fail("codex-bin", "找不到可执行的 Codex CLI");
+} else {
+  pass("codex-bin", resolvedBin);
+  const result = spawnSync(resolvedBin, ["--version"], { encoding: "utf8" });
+  const match = `${result.stdout || ""} ${result.stderr || ""}`.match(/codex-cli\s+(\d+\.\d+\.\d+)/);
+  version = match ? match[1] : "";
+  if (!version) fail("codex-version", "无法解析 codex --version");
+  else if (!semverAtLeast(version, "0.144.0")) fail("codex-version", `${version} < DeepSeek 模型目录要求的 0.144.0`);
+  else pass("codex-version", version);
+
+  const proxyHelp = spawnSync(resolvedBin, ["app-server", "proxy", "--help"], { encoding: "utf8" });
+  if (proxyHelp.status === 0) pass("app-server-proxy", "支持官方 app-server proxy transport");
+  else fail("app-server-proxy", "当前 Codex 不支持 `app-server proxy`");
+}
+
+const codexHome = process.env.CODEX_HOME || path.join(process.env.HOME || os.homedir(), ".codex");
+const configPath = path.join(codexHome, "config.toml");
+let config = {};
+if (!fs.existsSync(configPath)) {
+  if (requireDeepSeek) fail("config", `不存在 ${configPath}`);
+  else warn("config", `不存在 ${configPath}，将使用 Codex 内置默认配置`);
+} else {
+  try {
+    config = parseSimpleToml(fs.readFileSync(configPath, "utf8"));
+    pass("config", configPath);
+  } catch (e) {
+    fail("config", `读取失败: ${e.message || e}`);
+  }
+}
+
+const provider = config.model_provider || "openai";
+const routedFixed = routing && routing.mode === "fixed";
+const perSessionProvider = !!deepSeekProviderId || routedFixed;
+const selectedProvider = deepSeekProviderId || (routedFixed ? routing.modelProvider : provider);
+const selectedPrefix = `model_providers.${selectedProvider}.`;
+const selectedBaseUrl = config[`${selectedPrefix}base_url`] || "";
+if (routedFixed && !selectedBaseUrl) {
+  fail("session-routing-provider", `target ${routing.active} 的 provider=${selectedProvider} 未在 config.toml 中定义`);
+}
+const deepSeekActive = requireDeepSeek || routing?.providerType === "deepseek" || (!perSessionProvider && provider === "deepseek") || /^https:\/\/api\.deepseek\.com\/?$/.test(selectedBaseUrl);
+if (deepSeekActive) {
+  if (perSessionProvider) pass("deepseek-provider", `逐 session provider=${selectedProvider}`);
+  else if (provider === selectedProvider) pass("deepseek-provider", `model_provider=${selectedProvider}`);
+  else fail("deepseek-provider", `当前 model_provider=${provider}`);
+
+  const prefix = selectedPrefix;
+  const baseUrl = config[`${prefix}base_url`] || "";
+  if (/^https:\/\/api\.deepseek\.com\/?$/.test(baseUrl)) pass("deepseek-base-url", baseUrl);
+  else fail("deepseek-base-url", `应为 https://api.deepseek.com/，实为 ${baseUrl || "<missing>"}`);
+
+  const wireApi = config[`${prefix}wire_api`] || "";
+  if (wireApi === "responses") pass("deepseek-wire-api", "responses");
+  else fail("deepseek-wire-api", `应为 responses，实为 ${wireApi || "<missing>"}`);
+
+  const envKey = config[`${prefix}env_key`] || "";
+  const directToken = config[`${prefix}experimental_bearer_token`] || "";
+  if (envKey) {
+    if (process.env[envKey]) pass("deepseek-auth", `env_key=${envKey}（环境变量已设置）`);
+    else fail("deepseek-auth", `env_key=${envKey}，但当前环境未设置该变量`);
+  } else if (directToken && !/[<>]|your|你的/i.test(directToken)) {
+    warn("deepseek-auth", "使用 experimental_bearer_token；可用 env_key=DEEPSEEK_API_KEY 降低明文密钥暴露");
+  } else {
+    fail("deepseek-auth", "未配置可用的 env_key 或 experimental_bearer_token");
+  }
+
+  const model = requestedModel || (routedFixed ? routing.model : "") || (perSessionProvider ? "deepseek-v4-flash" : config.model || "");
+  if (model === "deepseek-v4-flash") pass("deepseek-model", model);
+  else if (model === "deepseek-v4-pro") warn("deepseek-model", `${model}；当前 DeepSeek Codex 文档仍只明确保证 flash`);
+  else fail("deepseek-model", `不支持或未选择 DeepSeek Codex 模型: ${model || "<missing>"}`);
+
+  const catalogPath = expandUser(config.model_catalog_json || "");
+  if (!catalogPath || !fs.existsSync(catalogPath)) {
+    fail("model-catalog", `找不到 ${catalogPath || "model_catalog_json"}`);
+  } else {
+    try {
+      const catalog = JSON.parse(fs.readFileSync(catalogPath, "utf8"));
+      const models = Array.isArray(catalog.models) ? catalog.models : [];
+      const selected = models.find((item) => item && item.slug === model);
+      if (!selected) fail("model-catalog", `目录中没有 ${model}`);
+      else if (selected.minimal_client_version && version && !semverAtLeast(version, selected.minimal_client_version)) {
+        fail("model-catalog", `${model} 要求 Codex >= ${selected.minimal_client_version}`);
+      } else {
+        pass("model-catalog", `${catalogPath} (${model})`);
+      }
+    } catch (e) {
+      fail("model-catalog", `JSON 无效: ${e.message || e}`);
+    }
+  }
+
+  if (config.service_tier && perSessionProvider) warn("deepseek-service-tier", "顶层 service_tier 已设置；逐 session DeepSeek 派发会显式清除它");
+  else if (config.service_tier) fail("deepseek-service-tier", "DeepSeek provider 不应设置顶层 service_tier");
+  else pass("deepseek-service-tier", "未强制 service_tier");
+  if (config.model_reasoning_summary) warn("deepseek-reasoning-summary", "建议删除顶层 model_reasoning_summary，交给 models.json 的 none");
+}
+
+if (checkAppServer && resolvedBin) {
+  const helper = path.join(__dirname, "cc-codex-app-call");
+  const args = ["--codex-bin", resolvedBin];
+  if (startAppServer) args.push("--start-app-server");
+  args.push("config/read", "-");
+  const result = spawnSync(helper, args, {
+    input: "{}",
+    encoding: "utf8",
+    stdio: ["pipe", "pipe", "pipe"],
+    timeout: 45000,
+  });
+  if (result.status === 0) pass("app-server-live", "initialize/config/read 成功");
+  else fail("app-server-live", (result.stderr || result.stdout || "连接失败").trim().slice(0, 500));
+}
+
+const ok = !checks.some((item) => item.status === "fail");
+if (jsonOut) {
+  console.log(JSON.stringify({ ok, codexBin: resolvedBin || null, version: version || null, provider, routing, checks }));
+} else {
+  for (const item of checks) {
+    const icon = item.status === "pass" ? "✅" : item.status === "warn" ? "⚠" : "❌";
+    console.log(`${icon} ${item.name}: ${item.detail}`);
+  }
+  console.log(ok ? "\nCodex worker preflight 通过。" : "\nCodex worker preflight 未通过，请先修复上述错误。");
+}
+process.exit(ok ? 0 : 2);

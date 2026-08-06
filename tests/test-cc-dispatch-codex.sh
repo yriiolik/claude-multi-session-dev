@@ -38,24 +38,68 @@ INT="$(cd "$R" && "$COORD" --init-base "$RQ" 2>/dev/null)"
 CDIR="$(cd "$R" && "$COORD" "$RQ" 2>/dev/null)"
 
 CASE="dispatch_shim_dry_run默认走codex_app"
-OUT="$("$DISPATCH" --cwd "$R/pkg" --name "↳mod@$RQ" \
+OUT="$(CODEX_HOME="$R/codex-home" "$DISPATCH" --cwd "$R/pkg" --name "↳mod@$RQ" \
   --env FLEET_ROLE=worker --env FLEET_RQ="$RQ" --env FLEET_MODULE=mod --env FLEET_BASE_BRANCH="$INT" \
   --sid-file "$CDIR/mod.sid" --prompt-file "$R/card.md" --codex-bin /usr/bin/true --pin-policy never --dry-run 2>&1)"
 RC=$?
 [ "$RC" -eq 0 ] && ok || fail "dry-run 退出码应为 0，实得 $RC"
 assert_has "app visible cwd:"
-assert_has "serviceTier: default"
+assert_has "serviceTier: <inherit>"
 assert_has "visibility pin policy: never"
 assert_no "codex exec"
 assert_no "service_tier=\"default\""
 
 CASE="dispatch_shim_fast走priority"
-OUT="$("$DISPATCH" --cwd "$R/pkg" --name "↳mod@$RQ" \
+OUT="$(CODEX_HOME="$R/codex-home" "$DISPATCH" --cwd "$R/pkg" --name "↳mod@$RQ" \
   --env FLEET_ROLE=worker --env FLEET_RQ="$RQ" --env FLEET_MODULE=mod --env FLEET_BASE_BRANCH="$INT" \
   --sid-file "$CDIR/mod.sid" --prompt-file "$R/card.md" --codex-bin /usr/bin/true --pin-policy never --fast --dry-run 2>&1)"
 RC=$?
 [ "$RC" -eq 0 ] && ok || fail "fast dry-run 退出码应为 0，实得 $RC"
 assert_has "serviceTier: priority"
+
+CASE="deepseek拒绝fast_service_tier"
+mkdir -p "$R/deepseek-codex"
+cat > "$R/deepseek-codex/config.toml" <<'EOF'
+model = "deepseek-v4-flash"
+model_provider = "deepseek"
+EOF
+OUT="$(CODEX_HOME="$R/deepseek-codex" "$DISPATCH" --cwd "$R/pkg" --name "↳mod@$RQ" \
+  --env FLEET_ROLE=worker --env FLEET_RQ="$RQ" --env FLEET_MODULE=mod --env FLEET_BASE_BRANCH="$INT" \
+  --sid-file "$CDIR/mod.sid" --prompt-file "$R/card.md" --codex-bin /usr/bin/true --pin-policy never --fast --dry-run 2>&1)"
+RC=$?
+[ "$RC" -eq 5 ] && ok || fail "DeepSeek --fast 应退出 5，实得 $RC"
+assert_has "DeepSeek Codex provider 不支持"
+
+CASE="deepseek占位key拒绝派发"
+mkdir -p "$R/deepseek-placeholder"
+cat > "$R/deepseek-placeholder/config.toml" <<'EOF'
+[model_providers.deepseek]
+name = "deepseek"
+base_url = "https://api.deepseek.com/"
+wire_api = "responses"
+experimental_bearer_token = "<你的 DeepSeek API Key>"
+EOF
+cat > "$R/deepseek-placeholder/multi-session-dev.json" <<'EOF'
+{
+  "version": 1,
+  "active": "ds-4-flash",
+  "targets": {
+    "ds-4-flash": {
+      "mode": "fixed",
+      "modelProvider": "deepseek",
+      "model": "deepseek-v4-flash",
+      "reasoningEffort": "high",
+      "providerType": "deepseek"
+    }
+  }
+}
+EOF
+OUT="$(CODEX_HOME="$R/deepseek-placeholder" "$DISPATCH" --cwd "$R/pkg" --name "↳mod@$RQ" \
+  --env FLEET_ROLE=worker --env FLEET_RQ="$RQ" --env FLEET_MODULE=mod --env FLEET_BASE_BRANCH="$INT" \
+  --sid-file "$CDIR/mod.sid" --prompt-file "$R/card.md" --codex-bin /usr/bin/true --pin-policy never --dry-run 2>&1)"
+RC=$?
+[ "$RC" -eq 8 ] && ok || fail "占位 key 应退出 8，实得 $RC"
+assert_has "仍是 DeepSeek API Key 占位符"
 
 CASE="status_watch_shim读codex_app元数据"
 cat > "$CDIR/mod.codex-app.env" <<EOF
@@ -81,6 +125,32 @@ RC=$?
 assert_has "Codex App fleet $RQ 全部完成"
 
 CASE="codex_app派发隐藏长规则只显示短任务卡"
+mkdir -p "$R/codex-home"
+cat > "$R/codex-home/config.toml" <<'EOF'
+service_tier = "priority"
+[model_providers.deepseek_work]
+name = "deepseek-work"
+base_url = "https://api.deepseek.com/"
+wire_api = "responses"
+env_key = "DEEPSEEK_API_KEY_WORK"
+EOF
+cat > "$R/codex-home/multi-session-dev.json" <<'EOF'
+{
+  "version": 1,
+  "active": "deepseek-work",
+  "targets": {
+    "inherit": { "mode": "inherit" },
+    "deepseek-work": {
+      "mode": "fixed",
+      "modelProvider": "deepseek_work",
+      "model": "deepseek-v4-flash",
+      "reasoningEffort": "high",
+      "providerType": "deepseek",
+      "authEnv": "DEEPSEEK_API_KEY_WORK"
+    }
+  }
+}
+EOF
 RQ2="$(cd "$R" && "$COORD" --alloc 2>/dev/null)"
 INT2="$(cd "$R" && "$COORD" --init-base "$RQ2" 2>/dev/null)"
 CDIR2="$(cd "$R" && "$COORD" "$RQ2" 2>/dev/null)"
@@ -108,7 +178,7 @@ else console.log("{}");
 NODE
 chmod +x "$FAKE_APP"
 
-OUT="$(CODEX_APP_CALL_BIN="$FAKE_APP" FAKE_APP_LOG="$FAKE_LOG" "$DISPATCH" --cwd "$R/pkg" --name "↳vis@$RQ2" \
+OUT="$(CODEX_HOME="$R/codex-home" DEEPSEEK_API_KEY_WORK=secret CODEX_APP_CALL_BIN="$FAKE_APP" FAKE_APP_LOG="$FAKE_LOG" "$DISPATCH" --cwd "$R/pkg" --name "↳vis@$RQ2" \
   --env FLEET_ROLE=worker --env FLEET_RQ="$RQ2" --env FLEET_MODULE=vis --env FLEET_BASE_BRANCH="$INT2" \
   --sid-file "$CDIR2/vis.sid" --prompt-file "$R/card.md" --codex-bin /usr/bin/true --pin-policy never --json 2>&1)"
 RC=$?
@@ -146,9 +216,16 @@ if (!String(start.params.developerInstructions || "").includes("dir rules")) pro
 if (start.params.threadSource !== "user") process.exit(15);
 if (String(turn.params.input?.[0]?.text || "").includes("project rules")) process.exit(13);
 if (!resume || resume.params.threadId !== "thread-visible-test") process.exit(14);
+if (!String(turn.params.cwd || "").includes("/.claude/worktrees/")) process.exit(16);
+if (start.params.modelProvider !== "deepseek_work" || start.params.model !== "deepseek-v4-flash") process.exit(17);
+if (start.params.serviceTier !== null) process.exit(18);
+if (turn.params.serviceTier !== null || turn.params.summary !== "none") process.exit(19);
+if (turn.params.effort !== "high") process.exit(20);
 NODE
 RC=$?
 [ "$RC" -eq 0 ] && ok || fail "thread-start/turn/resume 参数不符合预期，node rc=$RC"
+grep -q '^session_routing_active=deepseek-work$' "$CDIR2/vis.codex-app.env" && ok || fail "元数据未记录自动 routing target"
+grep -q '^reasoning_effort=high$' "$CDIR2/vis.codex-app.env" && ok || fail "元数据未记录 reasoning effort"
 
 echo
 echo "==== cc-dispatch-codex shim 测试：PASS=$PASS FAIL=$FAIL ===="

@@ -1,0 +1,173 @@
+#!/usr/bin/env node
+// Resolve and manage the Codex worker routing config without ever storing API keys.
+
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
+
+const codexHome = process.env.CODEX_HOME || path.join(process.env.HOME || os.homedir(), ".codex");
+const configPath = process.env.CODEX_MULTI_SESSION_CONFIG || path.join(codexHome, "multi-session-dev.json");
+const command = process.argv[2] || "resolve";
+const args = process.argv.slice(3);
+
+function usage() {
+  console.error(`cc-codex-session-config <command>
+  resolve [--json|--tsv]  resolve the active target (default: JSON)
+  show                  print the config with no secret values
+  validate              validate the config and active target
+  init                  create a safe starter config; never overwrites
+  select <target>       atomically change the active target
+  path                  print the config path
+  template              print a starter JSON document`);
+}
+
+function starter() {
+  return {
+    version: 1,
+    active: "inherit",
+    targets: {
+      inherit: {
+        mode: "inherit",
+        description: "Use the current Codex model/provider configuration",
+      },
+      "deepseek-flash": {
+        mode: "fixed",
+        modelProvider: "deepseek",
+        model: "deepseek-v4-flash",
+        reasoningEffort: "high",
+        providerType: "deepseek",
+        authEnv: "DEEPSEEK_API_KEY",
+        description: "DeepSeek Codex worker; provider/auth is defined in config.toml",
+      },
+    },
+  };
+}
+
+function plainObject(value) {
+  return value && typeof value === "object" && !Array.isArray(value);
+}
+
+function cleanString(value, label, { required = false, pattern = null } = {}) {
+  if (value == null || value === "") {
+    if (required) throw new Error(`${label} is required`);
+    return "";
+  }
+  if (typeof value !== "string" || /[\r\n\t]/.test(value)) throw new Error(`${label} must be a one-line string`);
+  if (pattern && !pattern.test(value)) throw new Error(`${label} has an invalid value: ${value}`);
+  return value;
+}
+
+function validate(document, source) {
+  if (!plainObject(document)) throw new Error(`${source}: root must be a JSON object`);
+  const rootAllowed = new Set(["version", "active", "targets"]);
+  for (const key of Object.keys(document)) if (!rootAllowed.has(key)) throw new Error(`${source}: unknown root field ${key}`);
+  if (document.version !== 1) throw new Error(`${source}: version must be 1`);
+  const active = cleanString(document.active, "active", { required: true, pattern: /^[A-Za-z0-9._-]+$/ });
+  if (!plainObject(document.targets) || !Object.keys(document.targets).length) throw new Error(`${source}: targets must be a non-empty object`);
+  const targetAllowed = new Set(["mode", "modelProvider", "model", "reasoningEffort", "providerType", "authEnv", "description"]);
+  const targets = {};
+  for (const [name, raw] of Object.entries(document.targets)) {
+    cleanString(name, "target name", { required: true, pattern: /^[A-Za-z0-9._-]+$/ });
+    if (!plainObject(raw)) throw new Error(`${source}: target ${name} must be an object`);
+    for (const key of Object.keys(raw)) {
+      if (!targetAllowed.has(key)) throw new Error(`${source}: target ${name} contains forbidden/unknown field ${key}; store keys only in Codex auth config`);
+    }
+    const mode = raw.mode || "fixed";
+    if (!new Set(["inherit", "fixed"]).has(mode)) throw new Error(`${source}: target ${name}.mode must be inherit or fixed`);
+    const target = {
+      mode,
+      modelProvider: cleanString(raw.modelProvider, `${name}.modelProvider`, { required: mode === "fixed", pattern: /^[A-Za-z0-9._-]+$/ }),
+      model: cleanString(raw.model, `${name}.model`, { required: mode === "fixed" }),
+      reasoningEffort: cleanString(raw.reasoningEffort, `${name}.reasoningEffort`, { pattern: /^[A-Za-z0-9._-]+$/ }),
+      providerType: cleanString(raw.providerType, `${name}.providerType`, { pattern: /^[A-Za-z0-9._-]+$/ }),
+      authEnv: cleanString(raw.authEnv, `${name}.authEnv`, { pattern: /^[A-Za-z_][A-Za-z0-9_]*$/ }),
+      description: cleanString(raw.description, `${name}.description`),
+    };
+    targets[name] = target;
+  }
+  if (!targets[active]) throw new Error(`${source}: active target does not exist: ${active}`);
+  return { version: 1, active, targets };
+}
+
+function load({ allowMissing = true } = {}) {
+  if (!fs.existsSync(configPath)) {
+    if (!allowMissing) throw new Error(`config does not exist: ${configPath}`);
+    return { document: validate(starter(), "built-in defaults"), source: "built-in", exists: false };
+  }
+  let parsed;
+  try { parsed = JSON.parse(fs.readFileSync(configPath, "utf8")); }
+  catch (error) { throw new Error(`${configPath}: invalid JSON: ${error.message}`); }
+  return { document: validate(parsed, configPath), source: configPath, exists: true };
+}
+
+function resolved() {
+  const loaded = load();
+  const target = loaded.document.targets[loaded.document.active];
+  return {
+    ok: true,
+    configPath,
+    configExists: loaded.exists,
+    source: loaded.source,
+    active: loaded.document.active,
+    mode: target.mode,
+    modelProvider: target.modelProvider || null,
+    model: target.model || null,
+    reasoningEffort: target.reasoningEffort || null,
+    providerType: target.providerType || null,
+    authEnv: target.authEnv || null,
+    authEnvSet: target.authEnv ? !!process.env[target.authEnv] : null,
+  };
+}
+
+function writeAtomic(document, { exclusive = false } = {}) {
+  fs.mkdirSync(path.dirname(configPath), { recursive: true, mode: 0o700 });
+  const data = `${JSON.stringify(document, null, 2)}\n`;
+  if (exclusive) {
+    const fd = fs.openSync(configPath, "wx", 0o600);
+    try { fs.writeFileSync(fd, data); } finally { fs.closeSync(fd); }
+    return;
+  }
+  const tmp = `${configPath}.tmp-${process.pid}`;
+  fs.writeFileSync(tmp, data, { mode: 0o600 });
+  fs.renameSync(tmp, configPath);
+  fs.chmodSync(configPath, 0o600);
+}
+
+try {
+  if (command === "path") {
+    console.log(configPath);
+  } else if (command === "template") {
+    console.log(JSON.stringify(starter(), null, 2));
+  } else if (command === "init") {
+    writeAtomic(starter(), { exclusive: true });
+    console.log(`created ${configPath}`);
+  } else if (command === "select") {
+    const name = args[0] || "";
+    if (!name || args.length !== 1) { usage(); process.exit(5); }
+    const loaded = load({ allowMissing: false });
+    if (!loaded.document.targets[name]) throw new Error(`unknown target: ${name}`);
+    loaded.document.active = name;
+    writeAtomic(loaded.document);
+    console.log(`active=${name}`);
+  } else if (command === "show") {
+    const loaded = load();
+    console.log(JSON.stringify({ configPath, configExists: loaded.exists, ...loaded.document }, null, 2));
+  } else if (command === "validate") {
+    const value = resolved();
+    console.log(`valid active=${value.active} mode=${value.mode} provider=${value.modelProvider || "inherit"} model=${value.model || "inherit"}`);
+  } else if (command === "resolve") {
+    const value = resolved();
+    const format = args[0] || "--json";
+    if (format === "--json") console.log(JSON.stringify(value));
+    else if (format === "--tsv") {
+      const field = (item) => item == null || item === "" ? "-" : String(item);
+      console.log([value.active, value.mode, value.modelProvider, value.model, value.reasoningEffort, value.providerType, value.authEnv, value.source].map(field).join("\t"));
+    } else { usage(); process.exit(5); }
+  } else {
+    usage();
+    process.exit(5);
+  }
+} catch (error) {
+  console.error(`❌ ${error.message || error}`);
+  process.exit(2);
+}

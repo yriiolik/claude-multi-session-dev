@@ -13,7 +13,8 @@
 - 可见性：这个 thread 会出现在 Codex App 线程列表里，标题应为 `↳{{MODULE}}@{{RQ}}`。
   为了让 App 侧栏能按项目归类，本 thread 的 App cwd 锚定在 `{{APP_VISIBLE_CWD}}`。
 - 模型 / 思考深度：沿用当前 Codex App / Codex 配置；不要自行切模型或改 reasoning。
-- 速度档位：{{CODEX_SPEED}}。默认 1x；只有主 session 明确要求快速模式时才是 fast。
+- 速度档位：{{CODEX_SPEED}}。默认 1x 且不覆盖 service tier；只有主 session 明确要求快速模式、provider 支持
+  `priority` 时才是 fast。DeepSeek provider 不使用 fast。
 - 权限：本 thread 以全自动开发 worker 为目标，approval policy 由派发方设为 `never`；你仍必须自觉遵守项目规则和范围边界。
 
 ## CLAUDE.md 规则
@@ -35,8 +36,8 @@
 - App 侧栏锚点目录：`{{APP_VISIBLE_CWD}}`
 - 真实 worker 工作目录：`{{WORKTREE_CWD}}`
 
-重要：App 侧栏锚点目录只用于让用户在 Codex App 里看见这个 thread。你真正执行命令、读取文件、编辑文件、
-提交代码时，必须显式使用真实 worker 工作目录 `{{WORKTREE_CWD}}`，不要改动 `{{APP_VISIBLE_CWD}}`。
+重要：App 侧栏锚点目录只用于创建阶段的项目归类；派发脚本会在首个 turn 把 cwd 切到真实 worker 工作目录
+`{{WORKTREE_CWD}}`，后续 turn 也保持该 cwd。不要改动 `{{APP_VISIBLE_CWD}}`。
 
 角色判断：
 - 开发型（默认，含 `-fix`）：在范围内写代码 + 自测 + commit + `cc-fleet-land`。
@@ -50,7 +51,7 @@
 
 1. 基于 `{{INT_BRANCH}}` 创建独立 worker 分支与隔离 worktree。
 2. 把 worktree 强制对齐到 `{{INT_BRANCH}}`。
-3. 让 Codex App thread 在 `{{APP_VISIBLE_CWD}}` 下可见，但真实工作目录是 `{{WORKTREE_CWD}}`。
+3. 用 `{{APP_VISIBLE_CWD}}` 创建可见 thread，并在首个 turn 前把运行 cwd 切到 `{{WORKTREE_CWD}}`。
 
 你开始工作后先核对：
 

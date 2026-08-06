@@ -31,7 +31,9 @@ git clone git@github.com:yriiolik/claude-multi-session-dev.git ~/.claude/skills/
 ## 目录结构
 
 - `SKILL.md` — 技能主文档（触发条件、编排流程、全部命令与陷阱）。
-- `scripts/` — fleet 编排命令（`cc-dispatch*` 派发、`cc-fleet-*` 初始化/监控/回执/收尾/复活/回复/终止；`*-codex` / `*-codex-app` 为 Codex 后端变体）。
+- `scripts/` — fleet 编排命令（`cc-dispatch*` 派发、`cc-fleet-*` 初始化/监控/读取/回执/收尾/复活/回复/终止；`*-codex` / `*-codex-app` 为 Codex app-server 后端变体）。
+- `scripts/cc-codex-session-config` — 统一管理 Codex worker 路由；默认读取 `~/.codex/multi-session-dev.json`，只保存 provider/model 与认证环境变量名，不保存 key。
+- `scripts/cc-codex-doctor` — Codex/DeepSeek worker 后端只读预检；首次使用和 Codex 升级后先运行。
 - `reference/` — 协议与模板（`PROTOCOL.md`、`dispatch-preamble.md`、`task-card-template.md`、`contract-first.md`、`doc-traceability.md` 等）。
 - `tests/` — 各命令的 shell 端到端测试。
 

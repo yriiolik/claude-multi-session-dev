@@ -15,6 +15,7 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 COORD_BIN="$SCRIPT_DIR/cc-fleet-coord"
 APP_CALL_BIN="${CODEX_APP_CALL_BIN:-$SCRIPT_DIR/cc-codex-app-call}"
 PIN_BIN="${CODEX_APP_PIN_BIN:-$SCRIPT_DIR/cc-codex-app-pin}"
+SESSION_CONFIG_BIN="${CODEX_SESSION_CONFIG_BIN:-$SCRIPT_DIR/cc-codex-session-config}"
 PREAMBLE_TMPL="$ROOT_DIR/reference/codex-app-dispatch-preamble.md"
 
 OPT_CWD=""
@@ -26,13 +27,15 @@ OPT_JOIN=0
 OPT_DRY_RUN=0
 OPT_JSON=0
 OPT_FAST=0
+OPT_MODEL=""
+OPT_MODEL_PROVIDER=""
 OPT_RAW_PROMPT=0
 OPT_INJECT_CLAUDE_MD=1
 OPT_CODEX_BIN="${CODEX_CLI_PATH:-}"
 OPT_WORKTREE_DIR=""
 OPT_APP_VISIBLE_CWD=""
 OPT_PIN_POLICY="auto"
-OPT_START_APP_SERVER=0
+OPT_START_APP_SERVER=1
 ENV_KVS=()
 
 usage() {
@@ -48,9 +51,12 @@ cc-dispatch-codex-app — 启动 Codex App 可见 worker thread
   --env KEY=VAL          注入 worker prompt 元数据（可重复；FLEET_* 会写入 prompt/协调元数据）
   --sid-file PATH        写入 Codex App thread id；推荐 "$COORD/<module>.sid"
   --join                 同一任务后续批次，放行复用兜底闸
-  --fast                 快速模式：serviceTier=priority；默认 serviceTier=default
+  --model MODEL          高级临时覆盖：仅为新建的 Codex session 覆盖模型
+  --model-provider ID    高级临时覆盖：仅为新建 session 覆盖 provider；必须同时传 --model
+  --fast                 快速模式：serviceTier=priority；DeepSeek provider 禁用
   --codex-bin PATH       指定 Codex 可执行文件；默认 CODEX_CLI_PATH / Codex.app / PATH 中的 codex
-  --start-app-server     若 app-server control socket 未启动，尝试 `codex remote-control start --json`
+  --start-app-server     若 app-server control socket 未启动则自动启动（默认）
+  --no-start-app-server  不自动启动 app-server，只连接现有 daemon
   --worktree-dir DIR     指定 worker worktree 根目录；默认 <repo>/.claude/worktrees/<RQ>-<module>-codex-app
   --app-visible-cwd DIR  Codex App 侧栏归属 cwd；默认从 ~/.codex/config.toml 找 --cwd 所属最长保存项目
   --pin-policy MODE      App 侧栏可见性兜底：auto|always|never；默认 auto
@@ -64,8 +70,10 @@ cc-dispatch-codex-app — 启动 Codex App 可见 worker thread
 说明:
   主技能/主 session 通常只需要传 --cwd/--name/--env/--sid-file/--prompt-file。
   App 可见性、worktree、三层 CLAUDE.md 注入、thread 加载与临时 pin 都由脚本默认处理。
-  模型与 reasoning 不由本脚本覆盖，沿用 Codex App / Codex 配置。
-  默认 serviceTier=default；显式 --fast 才用 priority。
+  默认由 $CODEX_HOME/multi-session-dev.json（通常 ~/.codex/multi-session-dev.json）自动选择 provider/model。
+  主技能与 Agent 不应拼接 provider/model/key 参数；由操作者运行 cc-codex-session-config select 切换。
+  --model-provider + --model 只保留给人工诊断时做一次性覆盖。
+  DeepSeek session 会显式清除 serviceTier、关闭 reasoning summary；其它 provider 仅在 --fast 时使用 priority。
 EOF
 }
 
@@ -85,8 +93,11 @@ while [[ $# -gt 0 ]]; do
     --sid-file) OPT_SID_FILE="${2:-}"; shift 2 ;;
     --join) OPT_JOIN=1; shift ;;
     --fast) OPT_FAST=1; shift ;;
+    --model) OPT_MODEL="${2:-}"; shift 2 ;;
+    --model-provider) OPT_MODEL_PROVIDER="${2:-}"; shift 2 ;;
     --codex-bin) OPT_CODEX_BIN="${2:-}"; shift 2 ;;
     --start-app-server) OPT_START_APP_SERVER=1; shift ;;
+    --no-start-app-server) OPT_START_APP_SERVER=0; shift ;;
     --worktree-dir) OPT_WORKTREE_DIR="${2:-}"; shift 2 ;;
     --app-visible-cwd) OPT_APP_VISIBLE_CWD="${2:-}"; shift 2 ;;
     --pin-policy) OPT_PIN_POLICY="${2:-}"; shift 2 ;;
@@ -111,6 +122,9 @@ case "$OPT_PIN_POLICY" in
   auto|always|never) ;;
   *) die_usage "--pin-policy 只能是 auto|always|never: $OPT_PIN_POLICY" ;;
 esac
+[[ -z "$OPT_MODEL_PROVIDER" || -n "$OPT_MODEL" ]] || die_usage "--model-provider 必须同时传 --model，避免 provider/model 混配"
+[[ -z "$OPT_MODEL_PROVIDER" || "$OPT_MODEL_PROVIDER" =~ ^[A-Za-z0-9._-]+$ ]] || die_usage "--model-provider id 非法: $OPT_MODEL_PROVIDER"
+[[ "$OPT_MODEL" != *$'\n'* && "$OPT_MODEL" != *$'\r'* ]] || die_usage "--model 不能包含换行"
 
 for kv in "${ENV_KVS[@]}"; do
   case "$kv" in
@@ -146,6 +160,20 @@ discover_codex_bin() {
     printf '%s\n' "$OPT_CODEX_BIN"
     return 0
   fi
+  local found
+  found="$(command -v codex 2>/dev/null || true)"
+  if [[ -n "$found" && -x "$found" ]]; then
+    printf '%s\n' "$found"
+    return 0
+  fi
+  if [[ -x "$HOME/.local/bin/codex" ]]; then
+    printf '%s\n' "$HOME/.local/bin/codex"
+    return 0
+  fi
+  if [[ -x "/Applications/ChatGPT.app/Contents/Resources/codex" ]]; then
+    printf '%s\n' "/Applications/ChatGPT.app/Contents/Resources/codex"
+    return 0
+  fi
   if [[ -x "/Applications/Codex.app/Contents/Resources/codex" ]]; then
     printf '%s\n' "/Applications/Codex.app/Contents/Resources/codex"
     return 0
@@ -154,11 +182,12 @@ discover_codex_bin() {
     printf '%s\n' "$HOME/.codex/plugins/.plugin-appserver/codex"
     return 0
   fi
-  command -v codex 2>/dev/null || return 1
+  return 1
 }
 
 saved_codex_project_for() {
-  local cwd="$1" config="$HOME/.codex/config.toml"
+  local cwd="$1" codex_home="${CODEX_HOME:-$HOME/.codex}"
+  local config="$codex_home/config.toml"
   [[ -f "$config" ]] || return 1
   node - "$cwd" "$config" <<'NODE'
 const fs = require("fs");
@@ -186,6 +215,119 @@ for (const line of text.split(/\r?\n/)) {
 
 if (best) process.stdout.write(best);
 NODE
+}
+
+configured_model_provider() {
+  local codex_home="${CODEX_HOME:-$HOME/.codex}"
+  local config="$codex_home/config.toml"
+  [[ -f "$config" ]] || return 1
+  awk '
+    /^\[/ { in_table=1 }
+    !in_table && /^[[:space:]]*model_provider[[:space:]]*=/ {
+      line=$0
+      sub(/^[^=]*=[[:space:]]*/, "", line)
+      sub(/[[:space:]]*#.*/, "", line)
+      gsub(/^[[:space:]"'\'' ]+|[[:space:]"'\'' ]+$/, "", line)
+      print line
+      exit
+    }
+  ' "$config"
+}
+
+configured_model() {
+  local codex_home="${CODEX_HOME:-$HOME/.codex}"
+  local config="$codex_home/config.toml"
+  [[ -f "$config" ]] || return 1
+  awk '
+    /^\[/ { in_table=1 }
+    !in_table && /^[[:space:]]*model[[:space:]]*=/ {
+      line=$0
+      sub(/^[^=]*=[[:space:]]*/, "", line)
+      sub(/[[:space:]]*#.*/, "", line)
+      gsub(/^[[:space:]"'\'' ]+|[[:space:]"'\'' ]+$/, "", line)
+      print line
+      exit
+    }
+  ' "$config"
+}
+
+provider_base_url() {
+  local provider="$1" codex_home="${CODEX_HOME:-$HOME/.codex}"
+  local config="$codex_home/config.toml"
+  [[ -f "$config" && -n "$provider" ]] || return 1
+  awk -v target="$provider" '
+    /^\[model_providers\./ {
+      section=$0
+      sub(/^\[model_providers\./, "", section)
+      sub(/\]$/, "", section)
+      gsub(/^"|"$/, "", section)
+      active=(section==target)
+      next
+    }
+    /^\[/ { active=0 }
+    active && /^[[:space:]]*base_url[[:space:]]*=/ {
+      line=$0
+      sub(/^[^=]*=[[:space:]]*/, "", line)
+      sub(/[[:space:]]*#.*/, "", line)
+      gsub(/^[[:space:]"'\'' ]+|[[:space:]"'\'' ]+$/, "", line)
+      print line
+      exit
+    }
+  ' "$config"
+}
+
+provider_env_key() {
+  local provider="$1" codex_home="${CODEX_HOME:-$HOME/.codex}"
+  local config="$codex_home/config.toml"
+  [[ -f "$config" && -n "$provider" ]] || return 1
+  awk -v target="$provider" '
+    /^\[model_providers\./ {
+      section=$0
+      sub(/^\[model_providers\./, "", section)
+      sub(/\]$/, "", section)
+      gsub(/^"|"$/, "", section)
+      active=(section==target)
+      next
+    }
+    /^\[/ { active=0 }
+    active && /^[[:space:]]*env_key[[:space:]]*=/ {
+      line=$0
+      sub(/^[^=]*=[[:space:]]*/, "", line)
+      sub(/[[:space:]]*#.*/, "", line)
+      gsub(/^[[:space:]"'\'' ]+|[[:space:]"'\'' ]+$/, "", line)
+      print line
+      exit
+    }
+  ' "$config"
+}
+
+provider_bearer_token_state() {
+  local provider="$1" codex_home="${CODEX_HOME:-$HOME/.codex}"
+  local config="$codex_home/config.toml"
+  [[ -f "$config" && -n "$provider" ]] || { printf '%s\n' missing; return 0; }
+  awk -v target="$provider" '
+    /^\[model_providers\./ {
+      section=$0
+      sub(/^\[model_providers\./, "", section)
+      sub(/\]$/, "", section)
+      gsub(/^"|"$/, "", section)
+      active=(section==target)
+      next
+    }
+    /^\[/ { active=0 }
+    active && /^[[:space:]]*experimental_bearer_token[[:space:]]*=/ {
+      line=$0
+      sub(/^[^=]*=[[:space:]]*/, "", line)
+      sub(/[[:space:]]*#.*/, "", line)
+      gsub(/^[[:space:]"'\'' ]+|[[:space:]"'\'' ]+$/, "", line)
+      lower=tolower(line)
+      if (line=="" || line ~ /[<>]/ || lower ~ /your/ || line ~ /你的/) print "placeholder"
+      else print "set"
+      found=1
+      exit
+    }
+    END { if (!found) print "missing" }
+  ' "$config"
 }
 
 first_existing_claude_md() {
@@ -327,7 +469,9 @@ write_json_params() {
   KIND="$kind" OUT="$out" THREAD_ID="${THREAD_ID:-}" TURN_ID="${TURN_ID:-}" \
   OPT_NAME="$OPT_NAME" WT_CWD="$WT_CWD" APP_VISIBLE_CWD="$APP_VISIBLE_CWD" \
   PROMPT_FILE="${VISIBLE_PROMPT:-}" CONTEXT_PROMPT_FILE="${CONTEXT_PROMPT:-}" \
-  SERVICE_TIER="$SERVICE_TIER_VALUE" APP_THREAD_SOURCE="${APP_THREAD_SOURCE:-user}" \
+  SERVICE_TIER="$SERVICE_TIER_VALUE" DEEPSEEK_SESSION="$ACTIVE_IS_DEEPSEEK" \
+  CODEX_REASONING_EFFORT="$ROUTING_REASONING_EFFORT" \
+  CODEX_MODEL="$OPT_MODEL" CODEX_MODEL_PROVIDER="$OPT_MODEL_PROVIDER" APP_THREAD_SOURCE="${APP_THREAD_SOURCE:-user}" \
   node <<'NODE'
 const fs = require("fs");
 const kind = process.env.KIND;
@@ -348,9 +492,12 @@ if (kind === "thread-start") {
     threadSource: process.env.APP_THREAD_SOURCE || "user",
     ephemeral: false,
     serviceName: "multi-session-dev",
-    serviceTier: process.env.SERVICE_TIER || "default",
     developerInstructions,
   };
+  if (process.env.CODEX_MODEL) params.model = process.env.CODEX_MODEL;
+  if (process.env.CODEX_MODEL_PROVIDER) params.modelProvider = process.env.CODEX_MODEL_PROVIDER;
+  if (process.env.SERVICE_TIER) params.serviceTier = process.env.SERVICE_TIER;
+  else if (process.env.DEEPSEEK_SESSION === "1") params.serviceTier = null;
 } else if (kind === "set-name") {
   params = { threadId: process.env.THREAD_ID, name: process.env.OPT_NAME };
 } else if (kind === "thread-resume") {
@@ -360,13 +507,18 @@ if (kind === "thread-start") {
 } else if (kind === "turn-start") {
   params = {
     threadId: process.env.THREAD_ID,
-    cwd: process.env.APP_VISIBLE_CWD,
+    cwd: process.env.WT_CWD,
     approvalPolicy: "never",
     approvalsReviewer: "auto_review",
     sandboxPolicy: { type: "dangerFullAccess" },
-    serviceTier: process.env.SERVICE_TIER || "default",
     input: [{ type: "text", text: fs.readFileSync(process.env.PROMPT_FILE, "utf8") }],
   };
+  if (process.env.SERVICE_TIER) params.serviceTier = process.env.SERVICE_TIER;
+  else if (process.env.DEEPSEEK_SESSION === "1") {
+    params.serviceTier = null;
+    params.summary = "none";
+  }
+  if (process.env.CODEX_REASONING_EFFORT) params.effort = process.env.CODEX_REASONING_EFFORT;
 } else {
   throw new Error(`unknown params kind ${kind}`);
 }
@@ -380,6 +532,14 @@ app_call() {
   [[ -n "$OPT_CODEX_BIN" ]] && args+=(--codex-bin "$OPT_CODEX_BIN")
   [[ "$OPT_START_APP_SERVER" -eq 1 ]] && args+=(--start-app-server)
   "$APP_CALL_BIN" "${args[@]}" "$method" "$params"
+}
+
+pin_call() {
+  local action="$1" thread_id="$2"
+  local args=()
+  [[ -n "$OPT_CODEX_BIN" ]] && args+=(--codex-bin "$OPT_CODEX_BIN")
+  [[ "$OPT_START_APP_SERVER" -eq 1 ]] && args+=(--start-app-server)
+  "$PIN_BIN" "${args[@]}" "$action" "$thread_id"
 }
 
 CWD_ABS="$(cd "$OPT_CWD" 2>/dev/null && pwd -P)" || die_usage "cwd not a directory: $OPT_CWD"
@@ -462,8 +622,69 @@ if git -C "$GIT_TOP" show-ref --verify --quiet "refs/heads/$WORKER_BRANCH"; then
 fi
 
 CODEX_SPEED="1x"
-SERVICE_TIER_VALUE="default"
+SERVICE_TIER_VALUE=""
+ROUTING_ACTIVE="cli-override"
+ROUTING_MODE="fixed"
+ROUTING_PROVIDER_TYPE=""
+ROUTING_AUTH_ENV=""
+ROUTING_REASONING_EFFORT=""
+ROUTING_SOURCE="explicit flags"
+if [[ -z "$OPT_MODEL_PROVIDER" && -z "$OPT_MODEL" ]]; then
+  [[ -x "$SESSION_CONFIG_BIN" ]] || { echo "❌ Codex session 配置解析器不可执行: $SESSION_CONFIG_BIN" >&2; exit 8; }
+  ROUTING_TSV="$("$SESSION_CONFIG_BIN" resolve --tsv 2>&1)" || {
+    echo "❌ Codex session 配置无效: $ROUTING_TSV" >&2
+    exit 8
+  }
+  IFS=$'\t' read -r ROUTING_ACTIVE ROUTING_MODE ROUTE_PROVIDER ROUTE_MODEL ROUTING_REASONING_EFFORT ROUTING_PROVIDER_TYPE ROUTING_AUTH_ENV ROUTING_SOURCE <<< "$ROUTING_TSV"
+  [[ "$ROUTE_PROVIDER" == "-" ]] && ROUTE_PROVIDER=""
+  [[ "$ROUTE_MODEL" == "-" ]] && ROUTE_MODEL=""
+  [[ "$ROUTING_REASONING_EFFORT" == "-" ]] && ROUTING_REASONING_EFFORT=""
+  [[ "$ROUTING_PROVIDER_TYPE" == "-" ]] && ROUTING_PROVIDER_TYPE=""
+  [[ "$ROUTING_AUTH_ENV" == "-" ]] && ROUTING_AUTH_ENV=""
+  if [[ "$ROUTING_MODE" == "fixed" ]]; then
+    OPT_MODEL_PROVIDER="$ROUTE_PROVIDER"
+    OPT_MODEL="$ROUTE_MODEL"
+  fi
+fi
+ACTIVE_MODEL_PROVIDER="${OPT_MODEL_PROVIDER:-$(configured_model_provider || true)}"
+ACTIVE_MODEL="${OPT_MODEL:-$(configured_model || true)}"
+ACTIVE_PROVIDER_BASE_URL="$(provider_base_url "$ACTIVE_MODEL_PROVIDER" || true)"
+ACTIVE_PROVIDER_ENV_KEY="$(provider_env_key "$ACTIVE_MODEL_PROVIDER" || true)"
+ACTIVE_PROVIDER_BEARER_STATE="$(provider_bearer_token_state "$ACTIVE_MODEL_PROVIDER")"
+ACTIVE_IS_DEEPSEEK=0
+if [[ "$ROUTING_PROVIDER_TYPE" == "deepseek" || "$ACTIVE_MODEL_PROVIDER" == "deepseek" || "$ACTIVE_PROVIDER_BASE_URL" =~ ^https://api\.deepseek\.com/?$ ]]; then
+  ACTIVE_IS_DEEPSEEK=1
+fi
+if [[ "$ROUTING_MODE" == "fixed" && -z "$ACTIVE_PROVIDER_BASE_URL" ]]; then
+  echo "❌ session target '$ROUTING_ACTIVE' 的 provider '$ACTIVE_MODEL_PROVIDER' 未在 ${CODEX_HOME:-$HOME/.codex}/config.toml 中定义。" >&2
+  exit 8
+fi
+EFFECTIVE_AUTH_ENV="${ROUTING_AUTH_ENV:-$ACTIVE_PROVIDER_ENV_KEY}"
+if [[ -n "$ROUTING_AUTH_ENV" && -n "$ACTIVE_PROVIDER_ENV_KEY" && "$ROUTING_AUTH_ENV" != "$ACTIVE_PROVIDER_ENV_KEY" ]]; then
+  echo "❌ session target '$ROUTING_ACTIVE' 的 authEnv=$ROUTING_AUTH_ENV 与 provider env_key=$ACTIVE_PROVIDER_ENV_KEY 不一致。" >&2
+  exit 8
+fi
+if [[ -n "$EFFECTIVE_AUTH_ENV" ]]; then
+  AUTH_ENV_VALUE="$(printenv "$EFFECTIVE_AUTH_ENV" 2>/dev/null || true)"
+  if [[ -z "$AUTH_ENV_VALUE" ]]; then
+    echo "❌ session target '$ROUTING_ACTIVE' 需要环境变量 $EFFECTIVE_AUTH_ENV；未读取 key，也不会创建 worktree/thread。" >&2
+    exit 8
+  fi
+  unset AUTH_ENV_VALUE
+elif [[ "$ACTIVE_IS_DEEPSEEK" -eq 1 && "$ROUTING_MODE" == "fixed" ]]; then
+  if [[ "$ACTIVE_PROVIDER_BEARER_STATE" == "placeholder" ]]; then
+    echo "❌ session target '$ROUTING_ACTIVE' 的 provider '$ACTIVE_MODEL_PROVIDER' 仍是 DeepSeek API Key 占位符；请先填写 config.toml。" >&2
+    exit 8
+  elif [[ "$ACTIVE_PROVIDER_BEARER_STATE" != "set" ]]; then
+    echo "❌ session target '$ROUTING_ACTIVE' 的 provider '$ACTIVE_MODEL_PROVIDER' 缺少 env_key 或 experimental_bearer_token。" >&2
+    exit 8
+  fi
+fi
 if [[ "$OPT_FAST" -eq 1 ]]; then
+  if [[ "$ACTIVE_IS_DEEPSEEK" -eq 1 ]]; then
+    echo "❌ --fast 会发送 serviceTier=priority，DeepSeek Codex provider 不支持；请去掉 --fast。" >&2
+    exit 5
+  fi
   CODEX_SPEED="fast"
   SERVICE_TIER_VALUE="priority"
 fi
@@ -556,7 +777,17 @@ if [[ "$OPT_DRY_RUN" -eq 1 ]]; then
   echo "[dry-run] visibility pin requested: $VISIBILITY_PIN_REQUESTED ($VISIBILITY_PIN_REASON)"
   echo "[dry-run] worker branch: $WORKER_BRANCH"
   echo "[dry-run] integration branch: $INT_BRANCH"
-  echo "[dry-run] serviceTier: $SERVICE_TIER_VALUE"
+  echo "[dry-run] model provider: ${ACTIVE_MODEL_PROVIDER:-<inherit/openai>}"
+  echo "[dry-run] model: ${ACTIVE_MODEL:-<inherit>}"
+  echo "[dry-run] reasoning effort: ${ROUTING_REASONING_EFFORT:-<inherit>}"
+  echo "[dry-run] session routing: $ROUTING_ACTIVE ($ROUTING_MODE; $ROUTING_SOURCE)"
+  echo "[dry-run] auth env: ${EFFECTIVE_AUTH_ENV:-<provider-managed>}"
+  if [[ "$ACTIVE_IS_DEEPSEEK" -eq 1 ]]; then
+    echo "[dry-run] serviceTier: <cleared for DeepSeek>"
+    echo "[dry-run] reasoning summary: none"
+  else
+    echo "[dry-run] serviceTier: ${SERVICE_TIER_VALUE:-<inherit>}"
+  fi
   echo "[dry-run] app threadSource: $APP_THREAD_SOURCE"
   echo "[dry-run] thread title: $OPT_NAME"
   exit 0
@@ -637,7 +868,7 @@ if [[ "$VISIBILITY_PIN_REQUESTED" -eq 1 ]]; then
   if [[ ! -x "$PIN_BIN" ]]; then
     PIN_ERROR="pin helper not executable: $PIN_BIN"
     echo "⚠ Codex App 临时 pin 失败：$PIN_ERROR" >&2
-  elif PIN_OUTPUT="$("$PIN_BIN" pin "$THREAD_ID" 2>&1)"; then
+  elif PIN_OUTPUT="$(pin_call pin "$THREAD_ID" 2>&1)"; then
     PIN_APPLIED=1
   else
     PIN_ERROR="$PIN_OUTPUT"
@@ -657,7 +888,17 @@ name=$OPT_NAME
 started_at=$(date +%s)
 codex_bin=$CODEX_BIN
 speed=$CODEX_SPEED
-service_tier=$SERVICE_TIER_VALUE
+model_provider=${ACTIVE_MODEL_PROVIDER:-inherit}
+model=${ACTIVE_MODEL:-inherit}
+reasoning_effort=${ROUTING_REASONING_EFFORT:-inherit}
+session_routing_active=$ROUTING_ACTIVE
+session_routing_mode=$ROUTING_MODE
+session_routing_source=$ROUTING_SOURCE
+session_auth_env=${EFFECTIVE_AUTH_ENV:-provider-managed}
+model_provider_override=${OPT_MODEL_PROVIDER:-0}
+model_override=${OPT_MODEL:-0}
+deepseek_session=$ACTIVE_IS_DEEPSEEK
+service_tier=${SERVICE_TIER_VALUE:-inherit}
 app_thread_source=$APP_THREAD_SOURCE
 cwd=$CWD_ABS
 worktree_root=$WT_ROOT

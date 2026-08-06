@@ -1,0 +1,180 @@
+#!/usr/bin/env node
+// cc-fleet-read-codex-app — read the latest persisted progress/result from a Codex App worker.
+
+const fs = require("fs");
+const path = require("path");
+const { execFileSync, spawnSync } = require("child_process");
+
+let rq = "";
+let moduleName = "";
+let coord = "";
+let codexBin = "";
+let startAppServer = true;
+let jsonOut = false;
+let rawOut = false;
+
+function usage() {
+  console.error(`cc-fleet-read-codex-app <RQ> <module> [options]
+  --json                 output a stable, normalized JSON snapshot
+  --raw                  output the complete thread/read response
+  --coord DIR            override coordination directory
+  --codex-bin PATH       use this Codex CLI binary
+  --start-app-server     start app-server when needed (default)
+  --no-start-app-server  only connect to an existing app-server`);
+}
+
+for (let i = 2; i < process.argv.length; i++) {
+  const a = process.argv[i];
+  if (a === "--coord") coord = process.argv[++i] || "";
+  else if (a === "--codex-bin") codexBin = process.argv[++i] || "";
+  else if (a === "--start-app-server") startAppServer = true;
+  else if (a === "--no-start-app-server") startAppServer = false;
+  else if (a === "--json") jsonOut = true;
+  else if (a === "--raw") rawOut = true;
+  else if (a === "-h" || a === "--help") { usage(); process.exit(0); }
+  else if (a.startsWith("-")) { console.error(`unknown flag: ${a}`); process.exit(5); }
+  else if (!rq) rq = a;
+  else if (!moduleName) moduleName = a;
+  else { console.error(`unexpected argument: ${a}`); process.exit(5); }
+}
+
+if (!rq || !moduleName || (jsonOut && rawOut)) {
+  usage();
+  process.exit(5);
+}
+
+function gitOut(args) {
+  try {
+    return execFileSync("git", args, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+  } catch {
+    return "";
+  }
+}
+
+function defaultCoord() {
+  const common = gitOut(["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+  return common ? path.join(common, "fleet", rq) : "";
+}
+
+function parseEnv(file) {
+  const out = {};
+  for (const line of fs.readFileSync(file, "utf8").split(/\r?\n/)) {
+    if (!line.trim() || line.trim().startsWith("#")) continue;
+    const idx = line.indexOf("=");
+    if (idx > 0) out[line.slice(0, idx)] = line.slice(idx + 1);
+  }
+  return out;
+}
+
+function callApp(method, params) {
+  const callBin = process.env.CODEX_APP_CALL_BIN || path.join(__dirname, "cc-codex-app-call");
+  const tmpDir = path.join(coord, "app-json");
+  fs.mkdirSync(tmpDir, { recursive: true });
+  const tmp = path.join(tmpDir, `.read-${process.pid}-${Math.random().toString(16).slice(2)}.json`);
+  fs.writeFileSync(tmp, JSON.stringify(params));
+  const args = [];
+  if (codexBin) args.push("--codex-bin", codexBin);
+  if (startAppServer) args.push("--start-app-server");
+  args.push(method, tmp);
+  const res = spawnSync(callBin, args, {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+    maxBuffer: 64 * 1024 * 1024,
+  });
+  try { fs.unlinkSync(tmp); } catch {}
+  if (res.status !== 0) throw new Error((res.stderr || res.stdout || `app call failed ${res.status}`).trim());
+  return JSON.parse(res.stdout);
+}
+
+function itemSummary(item) {
+  const base = { id: item?.id || "", type: item?.type || "unknown" };
+  if (item?.type === "agentMessage" || item?.type === "plan") base.text = item.text || "";
+  else if (item?.type === "reasoning") {
+    base.summary = Array.isArray(item.summary) ? item.summary : [];
+  } else if (item?.type === "commandExecution") {
+    base.command = item.command || "";
+    base.status = item.status || "";
+    base.exitCode = item.exitCode ?? null;
+    base.output = item.aggregatedOutput || "";
+  } else if (item?.type === "fileChange") {
+    base.status = item.status || "";
+    base.changeCount = Array.isArray(item.changes) ? item.changes.length : 0;
+  } else if (item?.status) base.status = item.status;
+  return base;
+}
+
+coord = coord || defaultCoord();
+if (!coord || !fs.existsSync(coord)) {
+  console.error(`❌ 找不到协调目录: ${coord || "<unknown>"}`);
+  process.exit(2);
+}
+const metaPath = path.join(coord, `${moduleName}.codex-app.env`);
+if (!fs.existsSync(metaPath)) {
+  console.error(`❌ 找不到 Codex App worker 元数据: ${metaPath}`);
+  process.exit(2);
+}
+const meta = parseEnv(metaPath);
+const threadId = meta.thread_id || meta.id;
+if (!threadId) {
+  console.error(`❌ 元数据缺少 thread_id: ${metaPath}`);
+  process.exit(2);
+}
+
+let response;
+try {
+  response = callApp("thread/read", { threadId, includeTurns: true });
+} catch (e) {
+  console.error(`❌ 读取 Codex App thread 失败: ${String(e.message || e)}`);
+  process.exit(2);
+}
+if (rawOut) {
+  console.log(JSON.stringify(response, null, 2));
+  process.exit(0);
+}
+
+const thread = response.thread || {};
+const turns = Array.isArray(thread.turns) ? thread.turns : [];
+const latestTurn = turns.length ? turns[turns.length - 1] : null;
+let latestAgentMessage = null;
+for (let i = turns.length - 1; i >= 0 && !latestAgentMessage; i--) {
+  const items = Array.isArray(turns[i].items) ? turns[i].items : [];
+  for (let j = items.length - 1; j >= 0; j--) {
+    if (items[j]?.type === "agentMessage") {
+      latestAgentMessage = { turnId: turns[i].id || "", itemId: items[j].id || "", text: items[j].text || "" };
+      break;
+    }
+  }
+}
+const latestItems = Array.isArray(latestTurn?.items) ? latestTurn.items.map(itemSummary) : [];
+const snapshot = {
+  ok: true,
+  rq,
+  module: moduleName,
+  threadId,
+  modelProvider: meta.model_provider || "inherit",
+  model: meta.model || "inherit",
+  threadStatus: thread?.status?.type || "unknown",
+  activeFlags: Array.isArray(thread?.status?.activeFlags) ? thread.status.activeFlags : [],
+  latestTurn: latestTurn ? { id: latestTurn.id || "", status: latestTurn.status || "", items: latestItems } : null,
+  latestAgentMessage,
+};
+
+if (jsonOut) {
+  console.log(JSON.stringify(snapshot));
+  process.exit(0);
+}
+
+console.log(`Codex session: ${moduleName} @ ${rq}`);
+console.log(`thread=${threadId}  provider=${snapshot.modelProvider}  model=${snapshot.model}`);
+console.log(`thread_status=${snapshot.threadStatus}  turn=${snapshot.latestTurn?.id || "-"}  turn_status=${snapshot.latestTurn?.status || "-"}`);
+if (snapshot.activeFlags.length) console.log(`active_flags=${snapshot.activeFlags.join(",")}`);
+const commands = latestItems.filter((item) => item.type === "commandExecution");
+if (commands.length) {
+  console.log("\n最近命令:");
+  for (const command of commands.slice(-5)) {
+    console.log(`- [${command.status || "unknown"}] ${command.command}`);
+    if (command.output) console.log(String(command.output).trim().slice(-2000));
+  }
+}
+console.log("\n最新回复:");
+console.log(latestAgentMessage?.text || "（尚无已持久化的 agentMessage；session 可能仍在执行首个步骤）");

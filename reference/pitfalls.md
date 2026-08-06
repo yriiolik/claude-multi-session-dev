@@ -91,3 +91,17 @@ prompt** 兜底；现已改为**默认关**注入，不再与自动加载重复�
 ⚠ 这是 daemon 内部行为、历史上回归过（2.1.167 还在 miss）——若某次升级后 worker 又不守规范（英文 / 不开 worktree /
 改主树），用 `cc-dispatch --inject-claude-md` 重开兜底（把三层 `CLAUDE.md` 原文塞进首行哨兵后的
 `⟦INJECTED-CLAUDE-MD⟧` 块，spare 无关、稳定可靠），并重跑 `tests/test-cc-dispatch-inject.sh` + 真实探针确认。
+
+## 五、Codex 后端把「thread 空闲」当完成（2026-08-06 实测）
+
+与第三点（`state` vs `tempo`）同源，但触发路径不同：Codex 的一个 turn 跑完，thread 就进 `idle`，
+`cc-fleet-status-codex-app` 据此报 `done`。**但 worker 很可能只是在等主 session 追加指令**——实测一个按任务卡
+「阶段一做完停下等口令」的 worker，在等待期间就被 watch 宣告「✅ 全部完成（2/2）」并退出监视，那时它连回执都还没写。
+
+修复已落在脚本里：`cc-fleet-watch-codex-app` 改为按回执分级——有 `result:` 回执才 `✅ 已完成 — 回执在案`；
+空闲无回执先推 `⏳ 本轮 turn 结束但未落回执`，持续超过 `--stall-idle` 才判 `💤 需核验`，总结里标 🟡。
+**编排侧要记住的一句话：Codex 后端看到「结束」类推送，只有带「回执在案」四个字的才是真完成。**
+
+同一轮实测还确认了两条（详见 `codex-mode.md`）：Codex worker **没有 `FLEET_*` 环境变量**（身份靠 preamble +
+`<COORD>/<module>.codex-app.env`）；worker **自述模型永远是「Codex，基于 GPT-5」**，那是内置 base_instructions
+写死的，判模型只能看元数据文件或 rollout 记录。

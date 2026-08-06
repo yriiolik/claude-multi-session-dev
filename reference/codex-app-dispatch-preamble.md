@@ -39,6 +39,10 @@
 重要：App 侧栏锚点目录只用于创建阶段的项目归类；派发脚本会在首个 turn 把 cwd 切到真实 worker 工作目录
 `{{WORKTREE_CWD}}`，后续 turn 也保持该 cwd。不要改动 `{{APP_VISIBLE_CWD}}`。
 
+⚠ **Codex 模式下没有 `FLEET_*` 环境变量**（app-server 协议不提供注入 shell 环境的通道）。
+上面这几行就是你的完整 fleet 身份，落盘副本在 `{{COORD_DIR}}/{{MODULE}}.codex-app.env`。
+**不要**去跑 `env | grep FLEET_` 找身份，那必然是空的，也不是缺陷。
+
 角色判断：
 - 开发型（默认，含 `-fix`）：在范围内写代码 + 自测 + commit + `cc-fleet-land`。
 - 契约设计型（module 名带 `-contract`）：只产出契约文件到 `{{COORD_DIR}}/contracts/`，不实现业务逻辑。

@@ -59,15 +59,25 @@ function readParams() {
   return raw.trim() ? JSON.parse(raw) : {};
 }
 
+// 启动前先收掉陈旧现场：pid 文件指向已死进程时，`daemon start` 会以为"已经在跑"而空等
+// socket 直到超时（2026-08-06 实测）。这里把自愈做在启动路径里，调用方无需关心。
 function startServer(bin) {
-  const attempts = [["remote-control", "start", "--json"], ["app-server", "daemon", "start"]];
+  let daemon = null;
+  try { daemon = require("./lib/codex-daemon.js"); } catch { /* lib 缺失则退回原始行为 */ }
+  const home = process.env.CODEX_HOME || path.join(process.env.HOME || "", ".codex");
+  const paths = daemon ? daemon.daemonPaths(home) : null;
+  if (daemon && paths) {
+    try { daemon.reapStaleDaemon(paths); } catch { /* 自愈失败不阻断下面的正常启动尝试 */ }
+  }
+  const attempts = [["app-server", "daemon", "start"], ["remote-control", "start", "--json"]];
   const errors = [];
   for (const args of attempts) {
     const rc = spawnSync(bin, args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: timeoutMs });
     if (rc.status === 0) { lastStartError = ""; return true; }
     errors.push(`${rc.stderr || rc.stdout || rc.error || ""}`.trim());
   }
-  lastStartError = errors.filter(Boolean).join("\n");
+  // 只保留首行摘要，避免把 daemon 贴出来的整段历史日志（可能是前几天的）当成本次错误。
+  lastStartError = errors.filter(Boolean).map((e) => e.split("\n")[0]).join(" | ");
   return false;
 }
 
@@ -126,7 +136,13 @@ function callProxy(bin, params) {
         sendJson({ method: "initialized", params: {} });
         sendJson({ id: 2, method, params });
       } else if (msg.id === 2) {
-        if (msg.error) return fail(new Error(JSON.stringify(msg.error)));
+        if (msg.error) {
+          // 这是服务端**正常应答**里的业务错误（如 thread not found）——连接是好的。
+          // 打上标记，避免上层把它误当成"连不上"而去重启/自愈 app-server。
+          const rpcError = new Error(JSON.stringify(msg.error));
+          rpcError.rpcError = true;
+          return fail(rpcError);
+        }
         finish(msg.result ?? null);
       }
     }
@@ -223,6 +239,11 @@ function wait(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
     const result = await callProxy(bin, params);
     process.stdout.write(`${JSON.stringify(result)}\n`);
   } catch (firstError) {
+    // 服务端已经正常应答、只是业务上失败 → 直接把错误交出去，不要走启动/自愈路径。
+    if (firstError.rpcError) {
+      console.error(firstError.message);
+      process.exit(9);
+    }
     if (shouldStart || process.env.CODEX_APP_START === "1") {
       startServer(bin);
       let lastError = firstError;

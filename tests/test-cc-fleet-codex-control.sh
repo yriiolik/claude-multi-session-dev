@@ -45,8 +45,10 @@ for (let i = 0; i < args.length; i++) {
 const params = paramsPath ? JSON.parse(fs.readFileSync(paramsPath, "utf8")) : {};
 fs.appendFileSync(process.env.FAKE_LOG, `${JSON.stringify({method, params})}\n`);
 if (method === "thread/read") {
-  const status = process.env.FAKE_STATE === "idle" ? "idle" : "active";
-  const turnStatus = process.env.FAKE_STATE === "idle" ? "interrupted" : "inProgress";
+  // idle=被打断后空闲；done=turn 正常跑完后空闲（worker 可能在等追加指令）；其余=在跑
+  const state = process.env.FAKE_STATE || "";
+  const status = (state === "idle" || state === "done") ? "idle" : "active";
+  const turnStatus = state === "idle" ? "interrupted" : state === "done" ? "completed" : "inProgress";
   console.log(JSON.stringify({thread:{id:"thread-test",status:{type:status,activeFlags:[]},turns:[
     {id:"turn-old",status:"completed",items:[{id:"msg-old",type:"agentMessage",text:"旧结果"}]},
     {id:"turn-live",status:turnStatus,items:[
@@ -123,6 +125,45 @@ OUT="$("$ROOT/scripts/cc-fleet-respawn" RQ-test mod --coord "$COORD" --dispatch 
 [ "$RC" -eq 0 ] && ok || fail "respawn dry-run 应退出 0，实得 $RC"
 assert_has "cc-fleet-kill-codex-app"
 if printf '%s' "$OUT" | grep -q -- '--signal'; then fail "Codex respawn 不应传 POSIX signal"; else ok; fi
+
+# thread 空闲 ≠ 干完了：它可能只是在等主 session 追加指令。没有 result: 回执就不许结案，
+# 否则 watch 会在 worker 等回话时宣告"全部完成"（2026-08-06 实测踩到）。
+CASE="watch_idle_without_receipt_is_not_completed"
+COORD2="$T/fleet/RQ-watch"; mkdir -p "$COORD2"
+cat > "$COORD2/w.codex-app.env" <<EOF
+id=thread-test
+thread_id=thread-test
+rq=RQ-watch
+module=w
+mode=codex-app
+summary_file=$COORD2/w.summary.md
+terminated=0
+EOF
+OUT="$(CODEX_APP_CALL_BIN="$FAKE" FAKE_LOG="$LOG" FAKE_STATE=done "$WATCH" RQ-watch --coord "$COORD2" --once 2>&1)"; RC=$?
+[ "$RC" -eq 1 ] && ok || fail "空闲但无回执不该结案，应 rc=1，实得 $RC"
+if printf '%s' "$OUT" | grep -q "已完成"; then fail "不该宣告已完成: $OUT"; else ok; fi
+assert_has "未落回执"
+
+CASE="watch_receipt_closes_the_case"
+printf 'result: w 完成\n\n细节\n' > "$COORD2/w.summary.md"
+OUT="$(CODEX_APP_CALL_BIN="$FAKE" FAKE_LOG="$LOG" FAKE_STATE=done "$WATCH" RQ-watch --coord "$COORD2" --once 2>&1)"; RC=$?
+[ "$RC" -eq 0 ] && ok || fail "有回执应结案 rc=0，实得 $RC"
+assert_has "回执在案"
+
+CASE="watch_stall_idle_settles_as_unverified"
+rm -f "$COORD2/w.summary.md"
+# --stall-idle 0：空闲立刻判"静默结束"，但要标成需核验而不是完成
+OUT="$(CODEX_APP_CALL_BIN="$FAKE" FAKE_LOG="$LOG" FAKE_STATE=done "$WATCH" RQ-watch --coord "$COORD2" --once --stall-idle 0 2>&1)"; RC=$?
+[ "$RC" -eq 0 ] && ok || fail "静默判定应结束 rc=0，实得 $RC"
+assert_has "需核验"
+
+# status 对"从未归档过的 thread"不该把 unarchive 的良性报错塞进 DETAIL
+CASE="status_hides_benign_unarchive_error"
+FAKE_UNARCH="$T/fake-unarchive.js"
+sed 's#} else console.log("{}");#} else if (method === "thread/unarchive") { console.error("no archived rollout found"); process.exit(1); } else console.log("{}");#' "$FAKE" > "$FAKE_UNARCH"
+chmod +x "$FAKE_UNARCH"
+OUT="$(CODEX_APP_CALL_BIN="$FAKE_UNARCH" FAKE_LOG="$LOG" FAKE_STATE=done "$STATUS" RQ-watch --coord "$COORD2" 2>&1)"
+if printf '%s' "$OUT" | grep -q "unarchive 兜底失败"; then fail "良性 unarchive 报错不该进 DETAIL: $OUT"; else ok; fi
 
 echo
 echo "==== Codex session control 测试：PASS=$PASS FAIL=$FAIL ===="

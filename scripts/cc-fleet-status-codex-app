@@ -181,7 +181,11 @@ function ensureSidebarVisible(job) {
     job.visibility_unarchived = 1;
   } catch (e) {
     job.visibility_unarchived = 0;
-    appendDetail(job, `unarchive 兜底失败: ${String(e.message || e).slice(0, 120)}`);
+    const msg = String(e.message || e);
+    // 从没归档过的 thread 本来就 unarchive 不了——这是常态，不是故障，别塞进 DETAIL 刷屏。
+    if (!/no archived rollout/i.test(msg)) {
+      appendDetail(job, `unarchive 兜底失败: ${msg.slice(0, 120)}`);
+    }
   }
 }
 

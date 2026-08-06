@@ -25,6 +25,7 @@ OPT_PROMPT_FILE=""
 OPT_SID_FILE=""
 OPT_JOIN=0
 OPT_DRY_RUN=0
+OPT_KEEP_ON_FAILURE=0
 OPT_JSON=0
 OPT_FAST=0
 OPT_MODEL=""
@@ -65,6 +66,7 @@ cc-dispatch-codex-app — 启动 Codex App 可见 worker thread
   --raw-prompt           不自动包裹 Codex App preamble，仅注入 CLAUDE.md 和原 prompt
   --no-inject-claude-md  不注入三层 CLAUDE.md（通常不用）
   --dry-run              只打印计划，不创建 worktree、不启动 thread
+  --keep-on-failure      thread 创建失败时保留 worktree/分支现场（默认自动回滚）
   --json                 启动成功后输出 JSON
 
 说明:
@@ -107,6 +109,7 @@ while [[ $# -gt 0 ]]; do
     --inject-claude-md) OPT_INJECT_CLAUDE_MD=1; shift ;;
     --no-inject-claude-md) OPT_INJECT_CLAUDE_MD=0; shift ;;
     --dry-run) OPT_DRY_RUN=1; shift ;;
+    --keep-on-failure) OPT_KEEP_ON_FAILURE=1; shift ;;
     --json) OPT_JSON=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) die_usage "未知参数: $1" ;;
@@ -534,6 +537,45 @@ app_call() {
   "$APP_CALL_BIN" "${args[@]}" "$method" "$params"
 }
 
+# 派发互斥：mkdir 是跨平台的原子操作（macOS 没有 flock 命令）。
+DISPATCH_LOCK="${CODEX_HOME:-$HOME/.codex}/app-server-daemon/.msd-dispatch.lock"
+DISPATCH_LOCK_HELD=0
+acquire_dispatch_lock() {
+  mkdir -p "$(dirname "$DISPATCH_LOCK")" 2>/dev/null || true
+  local waited=0 owner=""
+  while ! mkdir "$DISPATCH_LOCK" 2>/dev/null; do
+    owner="$(cat "$DISPATCH_LOCK/pid" 2>/dev/null || true)"
+    # 持锁进程已经死了 → 锁是陈旧的，直接回收，别让它把后续派发全堵死。
+    if [[ -n "$owner" ]] && ! kill -0 "$owner" 2>/dev/null; then
+      rm -rf "$DISPATCH_LOCK" 2>/dev/null || true
+      continue
+    fi
+    sleep 1
+    waited=$((waited + 1))
+    if (( waited >= 180 )); then
+      echo "⚠ 等待其它 codex 派发释放锁超过 180s，继续本次派发。" >&2
+      return 0
+    fi
+  done
+  printf '%s' "$$" > "$DISPATCH_LOCK/pid" 2>/dev/null || true
+  DISPATCH_LOCK_HELD=1
+}
+release_dispatch_lock() {
+  [[ "$DISPATCH_LOCK_HELD" -eq 1 ]] && rm -rf "$DISPATCH_LOCK" 2>/dev/null
+  DISPATCH_LOCK_HELD=0
+}
+
+# thread 没建起来时，已经建好的 worktree/分支就是纯垃圾——默认回滚，留现场用 --keep-on-failure。
+rollback_worktree() {
+  if [[ "$OPT_KEEP_ON_FAILURE" -eq 1 ]]; then
+    echo "   worktree 已保留: $WT_ROOT" >&2
+    return 0
+  fi
+  git -C "$GIT_TOP" worktree remove --force "$WT_ROOT" >/dev/null 2>&1 || true
+  git -C "$GIT_TOP" branch -D "$WORKER_BRANCH" >/dev/null 2>&1 || true
+  echo "   已回滚 worktree 与分支（要保留现场加 --keep-on-failure）" >&2
+}
+
 pin_call() {
   local action="$1" thread_id="$2"
   local args=()
@@ -793,6 +835,24 @@ if [[ "$OPT_DRY_RUN" -eq 1 ]]; then
   exit 0
 fi
 
+# ---- Codex 后端就绪（无感自愈）----
+# app-server 没起 / pid 文件指向死进程 / config.toml 改过还没生效，这三类都在 cc-codex-ensure
+# 内部消化掉，正常情况零输出。调用方自带 app-call（测试或特殊集成）时跳过。
+if [[ "$OPT_START_APP_SERVER" -eq 1 && -z "${CODEX_APP_CALL_BIN:-}" && "${MSD_SKIP_CODEX_ENSURE:-0}" != "1" ]]; then
+  ENSURE_ARGS=(--allow-restart --fleet-root "$(dirname "$COORD")")
+  [[ -n "${CODEX_BIN:-}" ]] && ENSURE_ARGS+=(--codex-bin "$CODEX_BIN")
+  if ! "$SCRIPT_DIR/cc-codex-ensure" "${ENSURE_ARGS[@]}"; then
+    echo "❌ Codex 后端未就绪，已中止派发（未创建 worktree/thread）。" >&2
+    exit 9
+  fi
+fi
+
+# ---- 派发串行锁 ----
+# 并发建 thread 实测会撞 `thread not found`（2026-08-06），且失败方还会留下孤儿 worktree。
+# 派发本身是短操作，直接串行化最省心。
+acquire_dispatch_lock
+trap release_dispatch_lock EXIT
+
 mkdir -p "$(dirname "$WT_ROOT")" || {
   echo "❌ 无法创建 worktree 父目录: $(dirname "$WT_ROOT")" >&2
   exit 7
@@ -816,12 +876,14 @@ write_visible_prompt "$PROMPT_SRC" "$VISIBLE_PROMPT"
 
 write_json_params thread-start "$THREAD_START_PARAMS"
 THREAD_RESULT="$(app_call "thread/start" "$THREAD_START_PARAMS")" || {
-  echo "❌ 创建 Codex App thread 失败。worktree 已保留: $WT_ROOT" >&2
+  echo "❌ 创建 Codex App thread 失败。" >&2
+  rollback_worktree
   exit 9
 }
 THREAD_ID="$(printf '%s' "$THREAD_RESULT" | node -e 'let s="";process.stdin.on("data",b=>s+=b);process.stdin.on("end",()=>{const r=JSON.parse(s); console.log(r.thread && r.thread.id ? r.thread.id : "");})')"
 if [[ -z "$THREAD_ID" ]]; then
-  echo "❌ Codex App thread/start 未返回 thread.id。worktree 已保留: $WT_ROOT" >&2
+  echo "❌ Codex App thread/start 未返回 thread.id。" >&2
+  rollback_worktree
   exit 9
 fi
 
@@ -836,7 +898,8 @@ CONTEXT_INJECT_ERROR=""
 
 write_json_params turn-start "$TURN_START_PARAMS"
 TURN_RESULT="$(app_call "turn/start" "$TURN_START_PARAMS")" || {
-  echo "❌ 向 Codex App thread 发送任务失败。thread=$THREAD_ID worktree=$WT_ROOT" >&2
+  echo "❌ 向 Codex App thread 发送任务失败。thread=$THREAD_ID" >&2
+  rollback_worktree
   exit 9
 }
 TURN_ID="$(printf '%s' "$TURN_RESULT" | node -e 'let s="";process.stdin.on("data",b=>s+=b);process.stdin.on("end",()=>{const r=JSON.parse(s); console.log(r.turn && r.turn.id ? r.turn.id : "");})')"

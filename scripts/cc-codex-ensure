@@ -1,0 +1,170 @@
+#!/usr/bin/env node
+// cc-codex-ensure — 让 Codex 后端"随手可用"的一站式自愈预检。
+//
+// 由各 cc-*-codex-app 命令在入口自动调用，正常情况完全静默；只有在它**做了动作**
+// （拉起 server / 清陈旧 pid / 因配置变更重启）或**确实过不去**时才出声。
+// 目标：使用者不需要先跑 doctor、不需要判断 server 起没起、不需要想"改了配置要不要重启"。
+//
+// 退出码：0 就绪 / 2 配置有问题 / 8 找不到 Codex CLI / 9 app-server 不可用
+
+const fs = require("fs");
+const path = require("path");
+const { spawnSync } = require("child_process");
+const cfg = require("./lib/codex-config.js");
+const dmn = require("./lib/codex-daemon.js");
+
+let codexBin = "";
+let jsonOut = false;
+let verbose = false;
+let allowRestart = false;
+let fleetRoot = "";
+let timeoutMs = 45000;
+
+function usage() {
+  console.error(`cc-codex-ensure [--codex-bin PATH] [--allow-restart] [--fleet-root DIR] [--timeout-ms N] [--json] [--verbose]
+
+保证 Codex app-server 就绪且活动路由目标可用。默认静默，只在做了动作或失败时输出。
+--allow-restart  允许在 config.toml/模型目录变更后重启 app-server（无活跃 worker 时才会真重启）`);
+}
+
+for (let i = 2; i < process.argv.length; i++) {
+  const a = process.argv[i];
+  if (a === "--codex-bin") codexBin = process.argv[++i] || "";
+  else if (a === "--json") jsonOut = true;
+  else if (a === "--verbose") verbose = true;
+  else if (a === "--quiet") verbose = false;
+  else if (a === "--allow-restart") allowRestart = true;
+  else if (a === "--fleet-root") fleetRoot = process.argv[++i] || "";
+  else if (a === "--timeout-ms") timeoutMs = Number(process.argv[++i] || "45000");
+  else if (a === "-h" || a === "--help") { usage(); process.exit(0); }
+  else { console.error(`unknown argument: ${a}`); usage(); process.exit(5); }
+}
+
+const scriptsDir = __dirname;
+const actions = [];
+const warnings = [];   // 运行时状况（如配置漂移未生效）——始终提示
+const advisories = []; // 配置改进建议——只在 --verbose/--json 出现，避免每条命令都刷屏
+
+function done(code, extra = {}) {
+  const payload = { ok: code === 0, actions, warnings, advisories, ...extra };
+  if (jsonOut) {
+    console.log(JSON.stringify(payload));
+  } else {
+    for (const w of warnings) console.error(`⚠ codex: ${w}`);
+    if (verbose) for (const a of advisories) console.error(`· codex: ${a}`);
+    // 无事发生就彻底闭嘴——这是"无感"的关键。
+    if (actions.length) console.error(`🔧 codex: ${actions.join("；")}`);
+    else if (verbose && code === 0) console.error("✓ codex: app-server 就绪，配置未变更");
+    if (code !== 0 && extra.error) console.error(`❌ codex: ${extra.error}`);
+  }
+  process.exit(code);
+}
+
+// ---- 1. CLI ----
+const bin = cfg.discoverCodexBin(codexBin);
+if (!bin) done(8, { error: "找不到可执行的 Codex CLI；设置 CODEX_CLI_PATH 或传 --codex-bin" });
+const version = cfg.codexVersion(bin);
+
+// ---- 2. 配置与路由目标 ----
+const codexHome = cfg.codexHome();
+const config = cfg.readCodexConfig(codexHome);
+const routed = cfg.resolveRouting(scriptsDir);
+if (!routed.ok) done(2, { error: `路由配置无效: ${routed.error}`, codexBin: bin });
+const routing = routed.routing;
+const check = cfg.validateRouting(config, routing, { version });
+advisories.push(...check.warnings);
+if (check.problems.length) {
+  done(2, { error: check.problems.join("；"), codexBin: bin, routing });
+}
+
+// ---- 3. app-server 活性 ----
+const paths = dmn.daemonPaths(codexHome);
+const catalog = cfg.catalogPathOf(config);
+const fingerprint = dmn.configFingerprint(config, catalog);
+
+function bringUp(reason) {
+  const startedAt = Date.now();
+  const reaped = dmn.reapStaleDaemon(paths);
+  actions.push(...reaped);
+  const start = dmn.startDaemon(bin, timeoutMs);
+  if (!start.ok) {
+    const fresh = dmn.freshStderr(paths, startedAt);
+    done(9, {
+      error: `无法启动 Codex app-server（${reason}）: ${start.error}${fresh ? `\n最近日志:\n${fresh}` : ""}`,
+      codexBin: bin, routing,
+    });
+  }
+  const probe = dmn.probeAppServer(scriptsDir, bin, timeoutMs);
+  if (!probe.ok) {
+    const fresh = dmn.freshStderr(paths, startedAt);
+    done(9, {
+      error: `Codex app-server 启动后仍不可用（${reason}）: ${probe.detail.split("\n")[0]}${fresh ? `\n最近日志:\n${fresh}` : ""}`,
+      codexBin: bin, routing,
+    });
+  }
+  dmn.writeServerState(paths, { fingerprint, startedAt, codexBin: bin, version });
+  actions.push(reason);
+}
+
+// 漂移时要不要重启，取决于此刻有没有 worker 正在跑——绝不为了配置新鲜而打断在跑的 turn。
+function activeWorkers() {
+  const root = fleetRoot || defaultFleetRoot();
+  if (!root || !fs.existsSync(root)) return [];
+  const envFiles = [];
+  for (const rq of fs.readdirSync(root)) {
+    const dir = path.join(root, rq);
+    let entries = [];
+    try { entries = fs.readdirSync(dir); } catch { continue; }
+    for (const name of entries) {
+      if (name.endsWith(".codex-app.env")) envFiles.push(path.join(dir, name));
+    }
+  }
+  const candidates = [];
+  for (const file of envFiles) {
+    const text = (() => { try { return fs.readFileSync(file, "utf8"); } catch { return ""; } })();
+    if (/^terminated=1$/m.test(text)) continue;
+    const id = (text.match(/^thread_id=(.+)$/m) || [])[1];
+    if (id) candidates.push({ id: id.trim(), file });
+  }
+  const live = [];
+  for (const item of candidates.slice(0, 12)) {
+    const rc = spawnSync(process.env.CODEX_APP_CALL_BIN || path.join(scriptsDir, "cc-codex-app-call"), [
+      "--codex-bin", bin, "--timeout-ms", "8000", "thread/read", "-",
+    ], { input: JSON.stringify({ threadId: item.id }), encoding: "utf8", timeout: 12000 });
+    if (rc.status !== 0) continue;
+    if (/"status"\s*:\s*"?(active|inProgress|running)/i.test(rc.stdout || "")) live.push(item.id);
+  }
+  return live;
+}
+
+function defaultFleetRoot() {
+  const rc = spawnSync("git", ["rev-parse", "--git-common-dir"], { encoding: "utf8" });
+  if (rc.status !== 0) return "";
+  const dir = String(rc.stdout || "").trim();
+  if (!dir) return "";
+  return path.join(path.resolve(dir), "fleet");
+}
+
+const probe = dmn.probeAppServer(scriptsDir, bin, timeoutMs);
+if (!probe.ok) {
+  bringUp("已拉起 Codex app-server");
+} else {
+  const state = dmn.readServerState(paths);
+  const drifted = !state || state.fingerprint !== fingerprint;
+  if (drifted && allowRestart) {
+    const live = activeWorkers();
+    if (live.length) {
+      warnings.push(`config.toml/模型目录已变更，但有 ${live.length} 个 Codex worker 正在跑，本次沿用运行中的配置（等它们结束后再派发会自动重启生效）`);
+    } else {
+      dmn.stopDaemon(bin, timeoutMs);
+      bringUp("配置已变更，已重启 app-server 使其生效");
+    }
+  } else if (drifted && !state) {
+    // 首次接管一个别处启动的 server：记下指纹，之后才能判断漂移。
+    dmn.writeServerState(paths, { fingerprint, startedAt: Date.now(), codexBin: bin, version, adopted: true });
+  } else if (drifted) {
+    warnings.push("config.toml/模型目录已变更，运行中的 app-server 仍是旧配置（下次派发会自动重启生效）");
+  }
+}
+
+done(0, { codexBin: bin, version, routing, fingerprint });

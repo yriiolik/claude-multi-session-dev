@@ -13,9 +13,10 @@ let maxLoops = 0;
 let once = false;
 let codexBin = "";
 let startAppServer = true;
+let stallIdle = 240;
 
 function usage() {
-  console.error("cc-fleet-watch-codex-app <RQ-id> [--coord DIR] [--wait] [--interval SEC] [--heartbeat SEC] [--max-loops N] [--no-start-app-server]");
+  console.error("cc-fleet-watch-codex-app <RQ-id> [--coord DIR] [--wait] [--interval SEC] [--heartbeat SEC] [--stall-idle SEC] [--max-loops N] [--no-start-app-server]");
 }
 
 for (let i = 2; i < process.argv.length; i++) {
@@ -25,6 +26,7 @@ for (let i = 2; i < process.argv.length; i++) {
   else if (a === "--once") once = true;
   else if (a === "--interval") interval = Number(process.argv[++i] || "20");
   else if (a === "--heartbeat") heartbeat = Number(process.argv[++i] || "240");
+  else if (a === "--stall-idle") stallIdle = Number(process.argv[++i] || "240");
   else if (a === "--max-loops") maxLoops = Number(process.argv[++i] || "0");
   else if (a === "--codex-bin") codexBin = process.argv[++i] || "";
   else if (a === "--start-app-server") startAppServer = true;
@@ -44,6 +46,9 @@ const settled = new Set();
 const failed = new Set();
 const stopped = new Set();
 const known = new Set();
+const unverified = new Set();   // 空闲够久但始终没落回执 → 结案但标"需核验"
+const idleNoticed = new Set();
+const idleSince = new Map();
 let lastEmit = Date.now();
 let loops = 0;
 
@@ -80,9 +85,25 @@ while (true) {
     const s = j.state || "?";
     known.add(m);
     if (settled.has(m)) continue;
-    if (s === "done") {
+    if (s === "done" && j.receipt === 1) {
+      // 持久回执 = 权威完成信号，单调结案（与 Claude 模式铁律 1.6 一致）。
+      idleSince.delete(m);
       settled.add(m);
-      if (!wait) emit(`✅ ${m} Codex App worker 已完成`);
+      if (!wait) emit(`✅ ${m} Codex App worker 已完成 — 回执在案`);
+    } else if (s === "done") {
+      // Codex 的 thread idle 只代表"这一轮 turn 结束"，可能是在等主 session 追加指令，
+      // 也可能是干完了没写回执。没有回执就不能宣告完成，否则会把等输入的 worker 判死。
+      const since = idleSince.get(m) || Date.now();
+      idleSince.set(m, since);
+      const heldMs = Date.now() - since;
+      if (heldMs >= stallIdle * 1000) {
+        settled.add(m);
+        unverified.add(m);
+        if (!wait) emit(`💤 ${m} Codex App worker 空闲 ${Math.round(heldMs / 1000)}s 且无回执 — 需核验（可能在等你回话，或做完没写 result:）`);
+      } else if (!wait && !idleNoticed.has(m)) {
+        idleNoticed.add(m);
+        emit(`⏳ ${m} Codex App worker 本轮 turn 结束但未落回执 — 若它在等指令，用 cc-fleet-reply-codex-app 回它`);
+      }
     } else if (s === "stopped") {
       settled.add(m);
       stopped.add(m);
@@ -92,7 +113,12 @@ while (true) {
       failed.add(m);
       if (!wait) emit(`❌ ${m} Codex App worker 异常 — ${j.detail || s}`);
     } else if (s === "blocked") {
+      idleSince.delete(m);
       if (!wait) emit(`⏸ ${m} Codex App worker 等待输入/approval`);
+    } else {
+      // 回到运行态 → 之前的空闲计时作废，避免把"歇一下又继续"误判成静默结束。
+      idleSince.delete(m);
+      idleNoticed.delete(m);
     }
   }
 
@@ -107,7 +133,11 @@ while (true) {
       emit(`⏹ Codex App fleet ${rq} 全部结束，其中 ${stopped.size} 个由主控停止`);
       process.exit(3);
     }
-    emit(`✅ Codex App fleet ${rq} 全部完成（${done}/${total}）`);
+    if (unverified.size) {
+      emit(`🟡 Codex App fleet ${rq} 全部结束（${done}/${total}），其中 ${unverified.size} 个空闲无回执需核验: ${[...unverified].join(", ")}`);
+      process.exit(0);
+    }
+    emit(`✅ Codex App fleet ${rq} 全部完成（${done}/${total}，回执均在案）`);
     process.exit(0);
   }
 

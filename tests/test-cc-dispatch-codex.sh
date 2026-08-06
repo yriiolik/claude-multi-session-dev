@@ -227,6 +227,45 @@ RC=$?
 grep -q '^session_routing_active=deepseek-work$' "$CDIR2/vis.codex-app.env" && ok || fail "元数据未记录自动 routing target"
 grep -q '^reasoning_effort=high$' "$CDIR2/vis.codex-app.env" && ok || fail "元数据未记录 reasoning effort"
 
+# thread 建不起来时（实测撞过并发 `thread not found`），已建的 worktree/分支必须回滚，
+# 否则每次失败都在仓库里留一个孤儿 worktree + 分支。
+CASE="rollback_worktree_when_thread_start_fails"
+FAKE_FAIL="$R/fake-app-fail.js"
+cat > "$FAKE_FAIL" <<'NODE'
+#!/usr/bin/env node
+const fs = require("fs");
+const args = process.argv.slice(2);
+let method = "";
+for (let i = 0; i < args.length; i++) {
+  const a = args[i];
+  if (a === "--codex-bin") { i++; continue; }
+  if (a === "--start-app-server") continue;
+  if (!method) { method = a; break; }
+}
+if (method === "thread/start") { console.error('{"code":-32600,"message":"thread not found"}'); process.exit(9); }
+console.log("{}");
+NODE
+chmod +x "$FAKE_FAIL"
+WT_BEFORE="$(git -C "$R" worktree list | wc -l | tr -d ' ')"
+OUT="$(CODEX_HOME="$R/codex-home" DEEPSEEK_API_KEY_WORK=secret CODEX_APP_CALL_BIN="$FAKE_FAIL" FAKE_APP_LOG="$FAKE_LOG" "$DISPATCH" --cwd "$R/pkg" --name "↳boom@$RQ2" \
+  --env FLEET_ROLE=worker --env FLEET_RQ="$RQ2" --env FLEET_MODULE=boom --env FLEET_BASE_BRANCH="$INT2" \
+  --sid-file "$CDIR2/boom.sid" --prompt-file "$R/card.md" --codex-bin /usr/bin/true --pin-policy never --join 2>&1)"
+RC=$?
+[ "$RC" -eq 9 ] && ok || fail "thread/start 失败应 rc=9，实得 $RC"
+printf '%s' "$OUT" | grep -q "已回滚" && ok || fail "应提示已回滚: $OUT"
+WT_AFTER="$(git -C "$R" worktree list | wc -l | tr -d ' ')"
+[ "$WT_BEFORE" = "$WT_AFTER" ] && ok || fail "worktree 应被回滚（前 $WT_BEFORE 后 $WT_AFTER）"
+if git -C "$R" branch --list | grep -q 'boom'; then fail "worker 分支应被删除"; else ok; fi
+
+CASE="keep_on_failure_preserves_scene"
+OUT="$(CODEX_HOME="$R/codex-home" DEEPSEEK_API_KEY_WORK=secret CODEX_APP_CALL_BIN="$FAKE_FAIL" FAKE_APP_LOG="$FAKE_LOG" "$DISPATCH" --cwd "$R/pkg" --name "↳boom2@$RQ2" \
+  --env FLEET_ROLE=worker --env FLEET_RQ="$RQ2" --env FLEET_MODULE=boom2 --env FLEET_BASE_BRANCH="$INT2" \
+  --sid-file "$CDIR2/boom2.sid" --prompt-file "$R/card.md" --codex-bin /usr/bin/true --pin-policy never --join --keep-on-failure 2>&1)"
+printf '%s' "$OUT" | grep -q "worktree 已保留" && ok || fail "--keep-on-failure 应保留现场: $OUT"
+# 反向验证：保留时 worktree 数确实 +1 —— 这条同时证明上面的"回滚"断言不是恒真的假绿。
+WT_KEPT="$(git -C "$R" worktree list | wc -l | tr -d ' ')"
+[ "$WT_KEPT" -eq "$((WT_AFTER + 1))" ] && ok || fail "--keep-on-failure 后 worktree 应 +1（$WT_AFTER → $WT_KEPT）"
+
 echo
 echo "==== cc-dispatch-codex shim 测试：PASS=$PASS FAIL=$FAIL ===="
 [ "$FAIL" -eq 0 ] && echo "✅ 全绿" || { echo "❌ 有失败"; exit 1; }

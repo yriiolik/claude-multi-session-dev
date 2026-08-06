@@ -58,6 +58,11 @@ function onMessage(payload) {
     process.stdout.write(serverFrame(response.subarray(0,middle), 1, false));
     process.stdout.write(serverFrame(response.subarray(middle), 0, true));
   } else if (msg.id === 2) {
+    if (process.env.FAKE_RPC_ERROR === "1") {
+      // 服务端正常应答、业务上失败（如 thread not found）——连接本身是好的
+      process.stdout.write(serverFrame({ id: 2, error: { code: -32600, message: "thread not found: x" } }));
+      return;
+    }
     process.stdout.write(serverFrame({
       id: 2,
       result: { method: msg.method, paramBytes: Buffer.byteLength(JSON.stringify(msg.params)) },
@@ -126,6 +131,17 @@ OUT="$(HOME="$TMP/home" FAKE_LOG="$LOG" FAKE_MARKER="$MARKER" "$CALL" thread/rea
 RC=$?
 [ "$RC" -eq 0 ] && ok || fail "应优先使用 ~/.local/bin/codex，rc=$RC: $OUT"
 printf '%s' "$OUT" | grep -q '"method":"thread/read"' && ok || fail "自动发现返回值错误: $OUT"
+
+# 回归（2026-08-06）：曾把 JSON-RPC 业务错误当成"连不上"，触发自愈路径去重启/清 socket，
+# 把一个健康的 app-server 打死。业务错误必须原样返回，绝不碰 daemon。
+CASE="rpc_business_error_must_not_trigger_autostart"
+: > "$LOG"
+rm -f "$MARKER"
+OUT="$(FAKE_RPC_ERROR=1 FAKE_LOG="$LOG" FAKE_MARKER="$MARKER" "$CALL" --codex-bin "$FAKE" --start-app-server turn/start - <<<'{}' 2>&1)"
+RC=$?
+[ "$RC" -eq 9 ] && ok || fail "业务错误应 rc=9，实得 $RC: $OUT"
+printf '%s' "$OUT" | grep -q "thread not found" && ok || fail "应原样透出业务错误: $OUT"
+[ ! -f "$MARKER" ] && ok || fail "业务错误不该触发 app-server 启动/自愈"
 
 echo
 echo "==== cc-codex-app-call 测试：PASS=$PASS FAIL=$FAIL ===="

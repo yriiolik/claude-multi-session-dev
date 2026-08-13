@@ -105,6 +105,13 @@ rollout 找不到时才退回 `thread/read`，并在页面上明说这是降级�
 Ghostty"授权框。Ghostty 没开 / 没授权 / 非 macOS —— 一律只提示不报错，**绝不让已派发成功的 thread
 因为面板没开出来而被判失败**。
 
+**分屏比例**默认收窄到源面板的 1/3（`--ratio` / `CC_FLEET_PANEL_RATIO`，0 表示保持原生对半）。
+Ghostty 的 split 固定对半、也没有"按比例分"的配置项，能程序化调整的只有相对移动分割线的
+`resize_split:<方向>,<像素>`；像素↔列的换算取决于字号，事先算不出来。所以收窄动作由**面板自己**
+完成——只有跑在分屏里的进程读得到分屏列数：发一次 resize，用实际列数变化反推每列多少像素，
+第二次一步到位（实测 94 列 → 62 列，一步收敛）。面板的 terminal id 由 `cc-fleet-panel-open`
+写在状态文件里传过去。收敛过程在 alt-screen 里不可见，排查用 `CC_FLEET_PANEL_DEBUG=<file>` 落盘。
+
 ## 排障
 
 先看对应 `-codex-app` 命令的报错与 `--help`，再依次：

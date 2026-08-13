@@ -70,6 +70,16 @@ assert_eq "$(argv_field 3)" "right" "方向参数正确"
 assert_eq "$(argv_field 4)" "1" "默认把焦点还给原终端，不打断正在打字的 session"
 assert_eq "$(node -pe 'JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).terminalId' "$STATE")" "FAKE-TERM-0001" "记录新 surface 的 id"
 
+CASE="分屏比例"
+# Ghostty 的 split 固定对半；比例由面板自己收敛，open 只负责把目标值传下去
+assert_contains "$(argv_field 1)" "'--target-ratio' '0.33'" "默认把面板收窄到 1/3 而不是对半"
+OUT="$(run_open --ratio 0.25)"
+assert_contains "$(argv_field 1)" "'--target-ratio' '0.25'" "--ratio 生效"
+OUT="$(CC_FLEET_PANEL_RATIO=0.4 run_open)"
+assert_contains "$(argv_field 1)" "'--target-ratio' '0.4'" "CC_FLEET_PANEL_RATIO 生效"
+OUT="$(run_open --ratio 0)"
+assert_not_contains "$(argv_field 1)" "--target-ratio" "--ratio 0 时保持 Ghostty 默认的对半"
+
 CASE="方向与焦点"
 OUT="$(run_open --direction down --focus)"
 assert_eq "$(argv_field 3)" "down" "--direction 生效"

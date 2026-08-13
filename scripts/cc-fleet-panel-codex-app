@@ -21,6 +21,7 @@
 
 const fs = require("fs");
 const path = require("path");
+const { spawnSync } = require("child_process");
 const jobsLib = require("./lib/codex-app-jobs.js");
 const rollout = require("./lib/codex-rollout.js");
 
@@ -43,6 +44,7 @@ const opt = {
   codexBin: "",
   startAppServer: true,
   spin: true,
+  targetRatio: Number(process.env.CC_FLEET_PANEL_RATIO) || 0,
 };
 
 function usage() {
@@ -63,6 +65,7 @@ function usage() {
   --close-on-attention   有「需核验/异常」也照样自动退出（默认不退，留着让你看）
   --idle-timeout SEC     一直没见到活跃 worker 就退出（默认 300，0=不退）
   --no-spin              执行中的标记不做动画
+  --target-ratio R       启动后把分屏收窄到源面板的 R 倍宽（0.2~0.6；Ghostty 只会对半切）
   --once                 渲染一帧到 stdout 后退出（不进 raw 模式）
   --plain                关闭 ANSI 颜色
   --json                 输出状态模型 JSON 后退出
@@ -84,6 +87,7 @@ for (let i = 2; i < process.argv.length; i++) {
   else if (a === "--close-on-attention") opt.closeOnAttention = true;
   else if (a === "--idle-timeout") opt.idleTimeout = Number(process.argv[++i]) || 0;
   else if (a === "--no-spin") opt.spin = false;
+  else if (a === "--target-ratio") opt.targetRatio = Number(process.argv[++i]) || 0;
   else if (a === "--once") opt.once = true;
   else if (a === "--plain") opt.plain = true;
   else if (a === "--json") opt.json = true;
@@ -599,6 +603,88 @@ function renderDetail(model, ui) {
   return [...head, ...view, `${foot}${pos}`];
 }
 
+// ---------------------------------------------------------------- 分屏比例自校正
+
+// Ghostty 的 split 固定对半，且没有"按比例分"的配置项——能程序化调整的只有相对移动分割线的
+// `resize_split:<方向>,<像素>`。像素↔列的换算取决于字号，事先算不出来，所以由面板自己收敛：
+// 发一次 resize，用实际列数变化反推每列多少像素，第二次就能一步到位（通常两步以内收敛）。
+//
+// 为什么是面板做而不是 cc-fleet-panel-open 做：只有面板自己读得到分屏的列数。
+// 面板的 terminal id 由 open 写在状态文件里，这里等它落盘。
+function osaPerform(terminalId, action) {
+  const script = `on run argv
+  set theId to item 1 of argv
+  set theAction to item 2 of argv
+  tell application "Ghostty"
+    set target to missing value
+    repeat with t in terminals
+      if (id of t as text) is theId then
+        set target to t
+        exit repeat
+      end if
+    end repeat
+    if target is missing value then return "not-found"
+    return (perform action theAction on target) as text
+  end tell
+end run`;
+  const res = spawnSync(process.env.CC_GHOSTTY_OSASCRIPT || "/usr/bin/osascript",
+    ["-", terminalId, action],
+    { input: script, encoding: "utf8", stdio: ["pipe", "pipe", "pipe"] });
+  return res.status === 0;
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function waitForTerminalId(deadlineMs = 3000) {
+  const started = Date.now();
+  while (Date.now() - started < deadlineMs) {
+    const st = jobsLib.readPanelState();
+    // openedAt 用来排除上一次遗留的状态文件：只认本进程启动前后写下的那条
+    if (st.terminalId && (!st.openedAt || st.openedAt * 1000 >= started - 30000)) return st.terminalId;
+    await sleep(120);
+  }
+  return "";
+}
+
+// 收敛过程发生在 alt-screen 里，出问题时屏幕上什么都看不到（只会表现为"宽度不对"）。
+// CC_FLEET_PANEL_DEBUG=<file> 时把每一步落盘，排查时才有东西可看。
+function fitLog(msg) {
+  const file = process.env.CC_FLEET_PANEL_DEBUG;
+  if (!file) return;
+  try { fs.appendFileSync(file, `${msg}\n`); } catch {}
+}
+
+async function fitSplitRatio(ratio) {
+  if (!(ratio > 0.05 && ratio < 0.95)) return;
+  if (!process.stdout.isTTY) { fitLog("skip: 不是 TTY"); return; }
+  const terminalId = await waitForTerminalId();
+  if (!terminalId) { fitLog("skip: 拿不到 terminal id"); return; }
+  fitLog(`start ratio=${ratio} cols=${process.stdout.columns} terminal=${terminalId}`);
+
+  let pxPerCol = jobsLib.DEFAULT_PX_PER_COL;
+  let totalCols = 0;
+  for (let step = 0; step < 4; step++) {
+    const before = process.stdout.columns || 0;
+    if (!before) return;
+    const plan = jobsLib.planSplitResize({ currentCols: before, ratio, pxPerCol, totalCols });
+    totalCols = plan.totalCols; // 总宽只在第一步按"对半"推定，之后固定，免得越算越偏
+    if (plan.done) { fitLog(`done step=${step} cols=${before} target=${plan.targetCols}`); return; }
+    fitLog(`step=${step} cols=${before} target=${plan.targetCols} ${plan.direction},${plan.pixels}px pxPerCol=${pxPerCol.toFixed(2)}`);
+    if (!osaPerform(terminalId, `resize_split:${plan.direction},${plan.pixels}`)) { fitLog("osascript 失败"); return; }
+    // 等 SIGWINCH 生效
+    for (let w = 0; w < 12; w++) {
+      await sleep(50);
+      if ((process.stdout.columns || 0) !== before) break;
+    }
+    const after = process.stdout.columns || before;
+    const movedCols = Math.abs(after - before);
+    if (movedCols === 0) { fitLog(`stall at cols=${after}`); return; } // 已经到边界，再推也没用
+    pxPerCol = plan.pixels / movedCols;
+    ui.width = after;
+    draw();
+  }
+}
+
 function paint(lines, ui) {
   if (opt.once) {
     process.stdout.write(`${lines.join("\n")}\n`);
@@ -801,6 +887,9 @@ if (process.stdin.isTTY) {
 }
 
 draw();
+
+// 分屏收窄到目标比例（Ghostty 只会对半切，见 fitSplitRatio 的说明）。异步进行，不挡主循环。
+if (opt.targetRatio) fitSplitRatio(opt.targetRatio).catch(() => {});
 
 // 动画只重绘、不采集：帧率跟数据刷新彻底解耦，否则要么标记不动，要么每 120ms 打一次 app-server。
 const spinTimer = opt.spin ? setInterval(() => {

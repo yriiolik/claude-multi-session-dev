@@ -382,6 +382,36 @@ function inferOwnerByCwd(coord) {
 }
 
 // ---------------------------------------------------------------------------
+// 分屏比例自校正
+//
+// Ghostty 的 split 固定对半，没有"按比例分"的配置项，能程序化调整的只有
+// `resize_split:<方向>,<像素>`（相对移动分割线）。像素与列的换算取决于字号，事先算不出来。
+//
+// 所以由**面板自己**收敛：它知道自己的列数（对半切出来时 = 源面板的一半），据此推出源面板总列数
+// 与目标列数，发一次 resize，再用实际列数变化反推出每列多少像素，下一次就能一步到位。
+// ---------------------------------------------------------------------------
+
+const DEFAULT_PX_PER_COL = 8; // 14pt 等宽字体的经验值，只作为第一次试探的起点
+
+// currentCols：面板当前列数；ratio：面板应占**被切开的那个面板**的比例。
+// 刚 split 出来是对半，所以源面板总列数 ≈ currentCols / 0.5。
+function planSplitResize({ currentCols, ratio, pxPerCol = DEFAULT_PX_PER_COL, totalCols = 0 }) {
+  const total = totalCols || Math.round(currentCols * 2);
+  const target = Math.max(20, Math.round(total * ratio));
+  const deltaCols = currentCols - target;
+  const px = Math.round(Math.abs(deltaCols) * (pxPerCol > 0 ? pxPerCol : DEFAULT_PX_PER_COL));
+  return {
+    totalCols: total,
+    targetCols: target,
+    deltaCols,
+    // 面板在右侧：把自己的左边界往右推（direction=right）就是缩小
+    direction: deltaCols > 0 ? "right" : "left",
+    pixels: px,
+    done: Math.abs(deltaCols) <= 1 || px <= 0,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // 面板进程/分屏状态
 //
 // 幂等靠 pidfile 而不是 pgrep：拉起面板时 osascript 的命令行里也带着面板脚本路径，
@@ -474,6 +504,8 @@ module.exports = {
   readOwnerMeta,
   resolveOwnerName,
   inferOwnerByCwd,
+  DEFAULT_PX_PER_COL,
+  planSplitResize,
   panelDir,
   panelPidFile,
   panelStateFile,

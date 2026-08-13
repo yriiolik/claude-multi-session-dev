@@ -79,6 +79,9 @@ running 条目）→ **你刚才误用了 `Agent`**，立刻改用 `cc-dispatch`
   **动手前加载 `reference/codex-mode.md`**（那里有它与 Claude 后端的几条真实行为差异）。
 - 后端就绪（server 起没起、模型路由对不对、配置改了要不要重启）**全部由脚本内部自愈**——
   派发前不需要额外体检、不需要确认、不需要手动拉服务。
+- Codex worker 进不了 `claude agents`（它是 app-server 里的 thread，不是进程）。派发脚本会自动在
+  Ghostty 分屏拉起只读面板 `cc-fleet-panel-codex-app` 给用户看，**你不需要为此做任何事**，
+  编排判断照旧只看 `cc-fleet-status-codex-app` 与回执。
 
 ## 主 session 的六步职责
 

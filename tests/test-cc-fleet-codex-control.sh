@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+
+# 派发脚本现在会自动拉起 Ghostty 分屏面板并写全局注册表。测试里一律关掉：
+# 否则跑一次测试就会在真实 Ghostty 上弹出一堆分屏，还会污染 ~/.claude/fleet。
+export CC_FLEET_PANEL=0
 set -u
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"

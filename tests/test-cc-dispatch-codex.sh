@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 # cc-dispatch-codex 兼容层测试：codex 模式现在转发到 codex-app 模式。
+
+# 派发脚本现在会自动拉起 Ghostty 分屏面板并写全局注册表。测试里一律关掉：
+# 否则跑一次测试就会在真实 Ghostty 上弹出一堆分屏，还会污染 ~/.claude/fleet。
+export CC_FLEET_PANEL=0
 set -u
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"

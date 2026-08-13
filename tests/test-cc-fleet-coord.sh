@@ -4,6 +4,10 @@
 #       递增永不复用；ISO 日期前缀归一化；--fresh 撞到往轮工件即 exit 4、干净 RQ 放行；默认解析 +
 #       --no-mkdir 向后兼容。
 # 测试铁律：断言只增强不削弱；失败一律是脚本 bug，改脚本不改断言。
+
+# 派发脚本现在会自动拉起 Ghostty 分屏面板并写全局注册表。测试里一律关掉：
+# 否则跑一次测试就会在真实 Ghostty 上弹出一堆分屏，还会污染 ~/.claude/fleet。
+export CC_FLEET_PANEL=0
 set -u
 
 COORD_BIN="$(cd "$(dirname "$0")/.." && pwd)/scripts/cc-fleet-coord"

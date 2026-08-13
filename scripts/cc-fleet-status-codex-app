@@ -3,7 +3,10 @@
 
 const fs = require("fs");
 const path = require("path");
-const { execFileSync, spawnSync } = require("child_process");
+const { spawnSync } = require("child_process");
+// 状态判定与元数据解析统一走共享库，保证面板（cc-fleet-panel-codex-app）与本脚本
+// 对同一个 worker 给出一致答案。副作用（unarchive/resume/unpin/写回）仍留在本脚本。
+const jobsLib = require("./lib/codex-app-jobs.js");
 
 let rq = "";
 let coord = "";
@@ -32,29 +35,7 @@ if (!rq) {
   process.exit(5);
 }
 
-function gitOut(args) {
-  try {
-    return execFileSync("git", args, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
-  } catch {
-    return "";
-  }
-}
-
-function defaultCoord() {
-  const common = gitOut(["rev-parse", "--path-format=absolute", "--git-common-dir"]);
-  return common ? path.join(common, "fleet", rq) : "";
-}
-
-function parseEnv(file) {
-  const out = {};
-  for (const line of fs.readFileSync(file, "utf8").split(/\r?\n/)) {
-    if (!line.trim() || line.trim().startsWith("#")) continue;
-    const idx = line.indexOf("=");
-    if (idx < 0) continue;
-    out[line.slice(0, idx)] = line.slice(idx + 1);
-  }
-  return out;
-}
+const defaultCoord = () => jobsLib.defaultCoord(rq);
 
 function updateEnvFile(file, updates) {
   const input = fs.readFileSync(file, "utf8").split(/\r?\n/);
@@ -76,16 +57,8 @@ function updateEnvFile(file, updates) {
   fs.writeFileSync(file, `${lines.join("\n").replace(/\n*$/, "")}\n`);
 }
 
-function appendDetail(job, text) {
-  job.detail = job.detail ? `${job.detail}；${text}` : text;
-}
-
-function receiptDone(file) {
-  if (!file || !fs.existsSync(file)) return false;
-  const lines = fs.readFileSync(file, "utf8").replace(/^\uFEFF/, "").split(/\r?\n/);
-  const first = lines.find((line) => line.trim());
-  return !!first && /^result:/i.test(first.trim());
-}
+const appendDetail = jobsLib.appendDetail;
+const receiptDone = jobsLib.receiptDone;
 
 function discoverCallBin() {
   const selfDir = __dirname;
@@ -118,46 +91,7 @@ function callApp(method, params) {
   return JSON.parse(res.stdout);
 }
 
-function classifyFromThread(job, thread) {
-  job.appStatus = thread?.status?.type || "unknown";
-  const turns = Array.isArray(thread?.turns) ? thread.turns : [];
-  const latestTurn = turns.length ? turns[turns.length - 1] : null;
-  job.turnStatus = latestTurn?.status || "";
-
-  if (latestTurn?.status === "inProgress" || thread?.status?.type === "active") {
-    const flags = thread?.status?.activeFlags || [];
-    if (flags.includes("waitingOnApproval")) {
-      job.state = "blocked";
-      job.detail = "Codex App thread 等待 approval / 输入";
-    } else {
-      job.state = "running";
-      job.detail = `Codex App thread active turn=${latestTurn?.id || job.turn_id || "-"}`;
-    }
-    return;
-  }
-  if (job.terminated === "1") {
-    job.state = "stopped";
-    job.detail = `Codex App session 已由主控停止${job.terminated_turn_id ? ` turn=${job.terminated_turn_id}` : ""}`;
-    return;
-  }
-  if (latestTurn?.status === "failed" || thread?.status?.type === "systemError") {
-    job.state = "failed";
-    job.detail = "Codex App thread failed/systemError";
-    return;
-  }
-  if (latestTurn?.status === "interrupted") {
-    job.state = "failed";
-    job.detail = "Codex App turn interrupted";
-    return;
-  }
-  if (latestTurn?.status === "completed" || ["idle", "notLoaded"].includes(thread?.status?.type)) {
-    job.state = "done";
-    job.detail = "Codex App thread 已空闲/完成；如无回执请读最后消息核验";
-    return;
-  }
-  job.state = "unknown";
-  job.detail = `Codex App thread 状态未知: ${job.appStatus}`;
-}
+const classifyFromThread = jobsLib.classifyFromThread;
 
 function ensureLiveLoaded(job) {
   if (job.state !== "running" && job.state !== "blocked") return;
@@ -226,14 +160,7 @@ if (!coord || !fs.existsSync(coord) || !fs.statSync(coord).isDirectory()) {
   process.exit(2);
 }
 
-const files = fs.readdirSync(coord).filter((f) => f.endsWith(".codex-app.env")).sort();
-const jobs = files.map((f) => {
-  const full = path.join(coord, f);
-  const meta = parseEnv(full);
-  meta.module = meta.module || f.replace(/\.codex-app\.env$/, "");
-  meta.meta = full;
-  return meta;
-});
+const jobs = jobsLib.listJobs(coord);
 
 let appUnavailable = false;
 for (const job of jobs) {

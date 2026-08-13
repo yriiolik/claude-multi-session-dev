@@ -7,6 +7,10 @@
 # 见 PROTOCOL.md §11）。故注入**默认关**，避免与自动加载重复烧 token；仅 daemon 版本回归时用
 # --inject-claude-md 重开兜底。本测试相应断言：默认不注入；--inject-claude-md 时注入结构正确、哨兵保持
 # 首行、intent 不含注入、--no-inject-claude-md 显式关同默认。
+
+# 派发脚本现在会自动拉起 Ghostty 分屏面板并写全局注册表。测试里一律关掉：
+# 否则跑一次测试就会在真实 Ghostty 上弹出一堆分屏，还会污染 ~/.claude/fleet。
+export CC_FLEET_PANEL=0
 set -u
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

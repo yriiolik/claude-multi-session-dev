@@ -10,7 +10,7 @@ COORD_BIN="$ROOT/scripts/cc-fleet-coord"
 
 PASS=0; FAIL=0; CASE="init"
 DIRS=()
-trap 'for d in "${DIRS[@]:-}"; do [ -n "$d" ] && rm -rf "$d"; done' EXIT
+trap 'for d in "${DIRS[@]:-}"; do [ -n "$d" ] && rm -rf "$d" 2>/dev/null; done' EXIT
 ok(){ PASS=$((PASS+1)); }
 fail(){ echo "✗ [$CASE] $1"; FAIL=$((FAIL+1)); }
 assert_eq(){ [[ "$1" == "$2" ]] && ok || fail "$3: 期望 [$2] 实得 [$1]"; }
@@ -110,8 +110,13 @@ assert_eq "$(node -pe 'JSON.parse(require("fs").readFileSync(process.argv[1],"ut
 CASE="面板看得见 worker"
 OUT="$("$PANEL" --json)"
 assert_contains "$OUT" "库存" "面板列出刚派发的 worker"
-assert_eq "$(echo "$OUT" | node -pe 'JSON.parse(require("fs").readFileSync(0,"utf8")).jobs[0].group')" "working" "在跑的 worker 归入 Working"
+assert_eq "$(echo "$OUT" | node -pe 'JSON.parse(require("fs").readFileSync(0,"utf8")).jobs[0].bucket')" "pending" "在跑的 worker 归入未完成"
+assert_eq "$(echo "$OUT" | node -pe 'JSON.parse(require("fs").readFileSync(0,"utf8")).jobs[0].label')" "执行中" "状态词为执行中"
 assert_eq "$(echo "$OUT" | node -pe 'JSON.parse(require("fs").readFileSync(0,"utf8")).jobs[0].receipt')" "0" "还没落回执"
+# 派发时要把"这批 worker 是谁派的"记下来，事后只能靠 cwd 猜
+assert_contains "$(cat "$CDIR/owner.meta" 2>/dev/null || echo MISSING)" "owner_pid=" "派发时落下主 session 归属"
+assert_eq "$(echo "$OUT" | node -pe 'JSON.parse(require("fs").readFileSync(0,"utf8")).groups.length')" "1" "面板按 RQ 聚成一个任务组"
+assert_eq "$(echo "$OUT" | node -pe 'JSON.parse(require("fs").readFileSync(0,"utf8")).groups[0].rq')" "$RQ" "任务组就是本次 RQ"
 
 # 跨 session：另一个仓库派发的 worker 也要出现在同一个面板里
 CASE="跨 session 汇总"

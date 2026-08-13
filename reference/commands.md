@@ -91,9 +91,24 @@ preamble**，每张卡需自包含。
 ### Codex 终端面板（自动分屏，无需你操心）
 
 Codex worker 是 app-server 里的 thread，**永远不会出现在 `claude agents` 里**。所以
-`cc-dispatch-codex-app` 派发成功后会自动做两件事：把本次 `$COORD` 登记进全局注册表、在当前
-Ghostty 窗口右侧分屏拉起 `cc-fleet-panel-codex-app`。面板是**全局**的——跨 session、跨仓库派发的
-worker 都汇总在同一块屏上；全部收工后面板自行退出、分屏随之关闭。
+`cc-dispatch-codex-app` 派发成功后会自动做两件事：把本次 `$COORD` 登记进全局注册表（连带记下是哪个
+主 session 派的）、在当前 Ghostty 窗口右侧分屏拉起 `cc-fleet-panel-codex-app`。面板是**全局**的——
+跨 session、跨仓库派发的 worker 都汇总在同一块屏上；全部收工后面板自行退出、分屏随之关闭。
+
+面板按**任务组（RQ）**分组，组标题就是发起这批 worker 的主 session 名字，组内只分未完成 / 已完成：
+
+```
+多会话Codex虚拟OMS上线前检查清单                RQ-2026-0813-002 · qzc  1/6 完成
+  未完成
+   ✳ ↳outbound     执行中 $ bash scripts/run-vitest.sh src/modules/inbound/…   10m
+   ⏳ ↳inbound      待输入 等待 approval / 输入                                 10m
+   ! ↳scan-perm    需核验 空闲但未落回执                                        22m
+  已完成
+   ✓ ↳scan-limits  已回执 🧾 scan-limits 完成 — 只读横向排查完毕，产出 7 项发现  10m
+```
+
+执行中的 `✳` 是动画（和 `claude agents` 一样），detail 列显示 rollout 里最近一条活动（在跑的）或
+回执首行（已完成的）。
 
 ```bash
 cc-fleet-panel-codex-app                 # 手动开（全局）
@@ -103,7 +118,12 @@ cc-fleet-panel-open --close              # 手动关掉面板与分屏
 cc-fleet-panel-register --list           # 看注册表里有哪些协调目录
 ```
 
-面板交互：`↑↓` 选择 · `→` 进详情（实时看 reasoning / 执行的命令 / 文件改动 / 回执）· `←` 返回 · `r` 刷新 · `q` 退出。
+面板交互：`↑↓` 选择 · `→` 进详情 · `←` 返回 · `PgUp/PgDn` 翻页 · `End` 跟随最新 · `r` 刷新 · `q` 退出。
+
+详情页读的是 Codex 的 rollout 日志而不是 `thread/read`——后者只给消息级 item，看不到命令与思考
+（实测 27 次命令的 thread 它只返回 3 条）。所以详情里能看到完整的思考 / 每次命令及其输出与退出码 /
+文件改动 / 回执正文。原因与解析细节见 `codex-mode.md`。
+
 面板**只读**，不会替你 resume / unarchive / 改元数据；编排决策仍以 `cc-fleet-status-codex-app` 与
 `cc-fleet-summary` 为准。不想要它：派发加 `--no-panel`，或全局 `export CC_FLEET_PANEL=0`。
 

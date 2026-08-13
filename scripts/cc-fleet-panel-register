@@ -29,4 +29,19 @@ if (args[0] === "--list") {
 const coord = args[0];
 const rq = args[1] || path.basename(path.resolve(coord));
 jobsLib.registerCoord(coord, rq);
-console.log(`✅ 已登记到 Codex 面板注册表: ${path.resolve(coord)} (rq=${rq})`);
+
+// 顺带记下"这批 worker 是谁派的"。本进程跑在主 session 的进程树里，此刻才拿得到它的身份；
+// 事后再想补就只能靠 cwd 猜了。面板用它做任务组的标题。
+let ownerNote = "";
+if (!args.includes("--no-owner")) {
+  try {
+    const owner = jobsLib.detectOwner();
+    owner.cwd = process.env.PWD || process.cwd();
+    jobsLib.writeOwnerMeta(path.resolve(coord), owner);
+    ownerNote = owner.name ? ` owner=${owner.name}` : " owner=(未识别主 session)";
+  } catch (e) {
+    ownerNote = ` owner=记录失败(${String(e.message || e).slice(0, 60)})`;
+  }
+}
+
+console.log(`✅ 已登记到 Codex 面板注册表: ${path.resolve(coord)} (rq=${rq})${ownerNote}`);

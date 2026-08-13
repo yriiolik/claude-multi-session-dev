@@ -14,7 +14,7 @@ let paramsPath = "";
 let lastStartError = "";
 
 function usage() {
-  console.error(`cc-codex-app-call [--codex-bin PATH] [--start-app-server] [--timeout-ms N] <method> [params.json|-]
+  console.error(`cc-codex-app-call [--codex-bin PATH] [--start-app-server|--no-start-app-server] [--timeout-ms N] <method> [params.json|-]
 
 Reads one JSON params object and prints the JSON-RPC result object.
 Uses the official \`codex app-server proxy\` for socket discovery/connection,
@@ -25,6 +25,10 @@ for (let i = 2; i < process.argv.length; i++) {
   const a = process.argv[i];
   if (a === "--codex-bin") codexBin = process.argv[++i] || "";
   else if (a === "--start-app-server") shouldStart = true;
+  // 上层脚本（面板 / status / read / watch / kill）在"只连已有 app-server"时传的就是这个。
+  // 以前这里不认它，于是它被当成 method、真正的 method 又被当成 params 文件，最后报
+  // `unknown argument: <params 路径>` 退出 5 —— 表现为一整屏 worker 全变「状态未知」。
+  else if (a === "--no-start-app-server") shouldStart = false;
   else if (a === "--timeout-ms") timeoutMs = Number(process.argv[++i] || "30000");
   else if (a === "-h" || a === "--help") { usage(); process.exit(0); }
   else if (!method) method = a;

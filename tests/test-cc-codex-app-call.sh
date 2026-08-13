@@ -123,6 +123,17 @@ RC=$?
 [ -f "$MARKER" ] && ok || fail "未调用 remote-control start"
 printf '%s' "$OUT" | grep -q '"method":"config/read"' && ok || fail "返回值错误: $OUT"
 
+# 面板 / status / read / watch / kill 在"只连已有 app-server"时传的就是 --no-start-app-server。
+# 以前这里不认这个 flag：它被当成 method、真 method 又被当成 params 文件，报
+# `unknown argument: <路径>` 退出 5——表现为一整屏 worker 全变「状态未知」。
+CASE="no_start_app_server_flag_is_accepted"
+: > "$LOG"
+OUT="$(FAKE_LOG="$LOG" FAKE_MARKER="$MARKER" "$CALL" --codex-bin "$FAKE" --no-start-app-server thread/read - <<<'{}' 2>&1)"
+RC=$?
+[ "$RC" -eq 0 ] && ok || fail "--no-start-app-server 应被接受，rc=$RC: $OUT"
+printf '%s' "$OUT" | grep -q '"method":"thread/read"' && ok || fail "method 被 flag 挤掉了: $OUT"
+printf '%s' "$OUT" | grep -qv 'unknown argument' && ok || fail "不该再报 unknown argument: $OUT"
+
 CASE="auto_discovery_prefers_working_local_codex"
 mkdir -p "$TMP/home/.local/bin"
 cp "$FAKE" "$TMP/home/.local/bin/codex"

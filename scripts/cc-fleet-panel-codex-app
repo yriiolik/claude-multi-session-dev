@@ -10,7 +10,10 @@
 //      刷屏级写入，还会和编排者的 status 调用互相打架。状态判定复用 lib/codex-app-jobs.js 的纯函数。
 //   2. **全局视角**。worker 是跨 session、跨仓库派发的，面板读全局注册表而不是某个 cwd 的 .git/fleet。
 //   3. **"空闲 ≠ 完成"**。Codex 的 turn 跑完就 idle，只有 summary 首行是 `result:` 才算真交付。
-//      所以 idle-without-receipt 单独归入「需核验」组，不混进 Completed，也不触发自动关闭。
+//      idle-without-receipt 记作「需核验」，归在**未完成**里，也不触发自动关闭。
+//
+// 组织方式：按**任务组（RQ）**分组，组标题是发起这批 worker 的主 session 名字；组内只分
+// 未完成 / 已完成两栏，各 worker 的具体状态由行首标记表达（执行中的标记是动画）。
 //
 // 交互：↑↓/jk 选择 · →/l/Enter 进详情 · ←/h/Esc 返回 · r 刷新 · q 退出。
 
@@ -19,6 +22,7 @@
 const fs = require("fs");
 const path = require("path");
 const jobsLib = require("./lib/codex-app-jobs.js");
+const rollout = require("./lib/codex-rollout.js");
 
 // ---------------------------------------------------------------- 参数
 
@@ -38,6 +42,7 @@ const opt = {
   keys: [],
   codexBin: "",
   startAppServer: true,
+  spin: true,
 };
 
 function usage() {
@@ -45,7 +50,7 @@ function usage() {
 
 用法:
   cc-fleet-panel-codex-app                  # 全局：读注册表里所有协调目录
-  cc-fleet-panel-codex-app --rq RQ-2026-...  # 只看一个 RQ
+  cc-fleet-panel-codex-app --rq RQ-2026-...  # 只看一个任务组
   cc-fleet-panel-codex-app --coord DIR       # 额外纳入一个协调目录（可重复）
 
 选项:
@@ -57,6 +62,7 @@ function usage() {
   --close-grace SEC      收工后等待多久再退出（默认 20）
   --close-on-attention   有「需核验/异常」也照样自动退出（默认不退，留着让你看）
   --idle-timeout SEC     一直没见到活跃 worker 就退出（默认 300，0=不退）
+  --no-spin              执行中的标记不做动画
   --once                 渲染一帧到 stdout 后退出（不进 raw 模式）
   --plain                关闭 ANSI 颜色
   --json                 输出状态模型 JSON 后退出
@@ -77,6 +83,7 @@ for (let i = 2; i < process.argv.length; i++) {
   else if (a === "--close-grace") opt.closeGrace = Number(process.argv[++i]) || 0;
   else if (a === "--close-on-attention") opt.closeOnAttention = true;
   else if (a === "--idle-timeout") opt.idleTimeout = Number(process.argv[++i]) || 0;
+  else if (a === "--no-spin") opt.spin = false;
   else if (a === "--once") opt.once = true;
   else if (a === "--plain") opt.plain = true;
   else if (a === "--json") opt.json = true;
@@ -141,6 +148,25 @@ function padTo(str, width) {
   return gap > 0 ? str + " ".repeat(gap) : str;
 }
 
+// 详情页按列宽折行再交给渲染，终端自己回绕会把缩进吃掉，读起来是散的。
+function wrap(text, width, indent = "") {
+  const out = [];
+  const limit = Math.max(8, width - dispWidth(indent));
+  for (const raw of String(text).replace(/\t/g, "  ").split(/\r?\n/)) {
+    if (!raw) { out.push(indent); continue; }
+    let line = "";
+    let w = 0;
+    for (const ch of raw) {
+      const cw = charWidth(ch.codePointAt(0));
+      if (w + cw > limit) { out.push(indent + line); line = ""; w = 0; }
+      line += ch;
+      w += cw;
+    }
+    out.push(indent + line);
+  }
+  return out;
+}
+
 // ---------------------------------------------------------------- 配色
 
 const C = opt.plain
@@ -153,24 +179,38 @@ const C = opt.plain
       yellow: (s) => `\x1b[33m${s}\x1b[39m`,
       red: (s) => `\x1b[31m${s}\x1b[39m`,
       magenta: (s) => `\x1b[35m${s}\x1b[39m`,
+      blue: (s) => `\x1b[34m${s}\x1b[39m`,
       sel: (s) => `\x1b[7m${s}\x1b[27m`,
     };
 
-// ---------------------------------------------------------------- 分组模型
+// ---------------------------------------------------------------- 状态语义
 
-// 组的划分直接对应技能里的验收语义，不要随便合并：
-//   needs-check = thread 空闲但没落回执 —— 这正是最容易被误判成"完成"的一类。
-const GROUPS = [
-  { key: "blocked", title: "待输入", color: "yellow", match: (j) => j.state === "blocked" },
-  { key: "working", title: "Working", color: "cyan", match: (j) => j.state === "running" },
-  { key: "needs-check", title: "需核验", color: "yellow", match: (j) => (j.state === "done" && !j.receipt) || j.state === "unknown" },
-  { key: "attention", title: "异常", color: "red", match: (j) => ["failed", "stopped", "lost"].includes(j.state) },
-  { key: "completed", title: "Completed", color: "green", match: (j) => j.state === "done" && !!j.receipt },
-];
+// 组内只分未完成 / 已完成两栏（bucket），具体状态差异靠行首标记 + 文案表达。
+// 唯一不能含糊的是 needs-check：thread 空闲但没落 `result:` 回执——它算**未完成**。
+const SPINNER = ["·", "✢", "✳", "∗", "✻", "✽"];
 
-function groupOf(job) {
-  return GROUPS.find((g) => g.match(job)) || GROUPS[GROUPS.length - 1];
+function classify(job) {
+  switch (job.state) {
+    case "running":
+      return { bucket: "pending", tone: "cyan", mark: null, label: "执行中" };
+    case "blocked":
+      return { bucket: "pending", tone: "yellow", mark: "⏳", label: "待输入" };
+    case "done":
+      return job.receipt
+        ? { bucket: "done", tone: "green", mark: "✓", label: "已回执" }
+        : { bucket: "pending", tone: "yellow", mark: "!", label: "需核验" };
+    case "failed":
+      return { bucket: "pending", tone: "red", mark: "✗", label: "失败" };
+    case "stopped":
+      return { bucket: "pending", tone: "red", mark: "⊘", label: "已停止" };
+    case "lost":
+      return { bucket: "pending", tone: "red", mark: "?", label: "元数据缺失" };
+    default:
+      return { bucket: "pending", tone: "yellow", mark: "?", label: "状态未知" };
+  }
 }
+
+const STATE_ORDER = ["running", "blocked", "unknown", "done", "failed", "stopped", "lost"];
 
 function fmtAge(sec) {
   if (!Number.isFinite(sec) || sec < 0) return "-";
@@ -211,13 +251,53 @@ function activeCoords() {
   return opt.rq ? out.filter((c) => c.rq === opt.rq) : out;
 }
 
+// 组标题用主 session 的**实时**名字（派发时落的 owner.meta 只存 pid/id，名字会被取名 hook 改写）。
+// owner.meta 之前派发的历史 RQ 没有归属记录，退而按 task.meta 的 cwd 推断，最后才退到仓库名。
+function groupTitle(coord) {
+  const owner = jobsLib.readOwnerMeta(coord);
+  const live = jobsLib.resolveOwnerName(owner);
+  if (live) return { title: live, owner, ownerSource: "meta" };
+  const guess = jobsLib.inferOwnerByCwd(coord);
+  if (guess && guess.name) return { title: guess.name, owner: guess, ownerSource: "inferred" };
+  const repo = repoOf(coord);
+  return { title: repo ? `（${repo} 的任务）` : "（未记录主 session）", owner, ownerSource: "none" };
+}
+
+// 列表的 detail 列要回答"此刻在干什么"。原始 detail 是 `Codex App thread active turn=<uuid>`
+// 和回执文件路径——两条都没有信息量。所以：跑着的看 rollout 最近一条事件，落了回执的看回执首行。
+function liveDetail(job) {
+  if (job.receipt) {
+    try {
+      const first = fs.readFileSync(job.summary_file, "utf8").split(/\r?\n/).find((l) => l.trim());
+      if (first) return `🧾 ${first.replace(/^result:\s*/i, "")}`;
+    } catch {}
+    return job.detail;
+  }
+  if (job.state !== "running" && job.state !== "blocked") return job.detail;
+  const file = rolloutFor(job);
+  if (!file) return job.detail;
+  const act = rollout.lastActivity(file);
+  if (!act) return job.detail;
+  if (act.kind === "shell") return `$ ${act.text}`;
+  if (act.kind === "patch") return `✎ ${act.text}`;
+  if (act.kind === "message") return `💬 ${act.text}`;
+  return `🧠 ${act.text}`;
+}
+
+// coord 形如 <repo>/.git/fleet/<RQ>，回退两层就是仓库根。
+function repoOf(coord) {
+  const m = String(coord).match(/^(.*)\/\.git\/fleet\/[^/]+$/);
+  return m ? path.basename(m[1]) : "";
+}
+
 function collect() {
   const now = Math.floor(Date.now() / 1000);
   const cutoff = opt.maxAgeHours > 0 ? now - opt.maxAgeHours * 3600 : 0;
+  const groups = [];
   const jobs = [];
   let appUnavailable = false;
-  const coords = activeCoords();
-  for (const c of coords) {
+
+  for (const c of activeCoords()) {
     const snap = jobsLib.readOnlySnapshot(c.coord, {
       codexBin: opt.codexBin,
       startAppServer: opt.startAppServer,
@@ -235,28 +315,78 @@ function collect() {
       },
     });
     if (snap.appUnavailable) appUnavailable = true;
+    if (!snap.jobs.length) continue;
+
+    const { title, owner, ownerSource } = groupTitle(c.coord);
+    const group = {
+      key: c.coord,
+      rq: c.rq,
+      title,
+      owner,
+      ownerSource,
+      repo: repoOf(c.coord),
+      jobs: [],
+      pending: 0,
+      done: 0,
+      ts: 0,
+    };
     for (const job of snap.jobs) {
       job.rq = job.rq || c.rq;
       job.ts = job.ts || jobMtime(job);
-      job.displayName = job.name || `↳${job.module}@${job.rq}`;
-      job.group = groupOf(job).key;
-      jobs.push(job);
+      job.group = group;
+      job.cls = classify(job);
+      job.detail = liveDetail(job) || job.detail;
+      // 组标题已经写了 RQ，行内只留模块名，把宽度让给 detail
+      job.displayName = `↳${job.module}`;
+      group.jobs.push(job);
+      group[job.cls.bucket] += 1;
+      group.ts = Math.max(group.ts, job.ts || 0);
     }
+    group.jobs.sort((a, b) => {
+      if (a.cls.bucket !== b.cls.bucket) return a.cls.bucket === "pending" ? -1 : 1;
+      const sa = STATE_ORDER.indexOf(a.state);
+      const sb = STATE_ORDER.indexOf(b.state);
+      if (sa !== sb) return sa - sb;
+      return (b.ts || 0) - (a.ts || 0);
+    });
+    groups.push(group);
   }
-  jobs.sort((a, b) => {
-    const ga = GROUPS.findIndex((g) => g.key === a.group);
-    const gb = GROUPS.findIndex((g) => g.key === b.group);
-    if (ga !== gb) return ga - gb;
+
+  // 有未完成的任务组排前面，其余按最近活动倒序
+  groups.sort((a, b) => {
+    if (!!a.pending !== !!b.pending) return a.pending ? -1 : 1;
     return (b.ts || 0) - (a.ts || 0);
   });
-  const counts = {};
-  for (const g of GROUPS) counts[g.key] = jobs.filter((j) => j.group === g.key).length;
-  return { now, coords, jobs, counts, appUnavailable };
+  for (const g of groups) jobs.push(...g.jobs);
+
+  return {
+    now,
+    groups,
+    jobs,
+    pending: jobs.filter((j) => j.cls.bucket === "pending").length,
+    done: jobs.filter((j) => j.cls.bucket === "done").length,
+    appUnavailable,
+  };
 }
 
 // ---------------------------------------------------------------- 详情
 
-function readThread(job) {
+// rollout 文件路径按 thread id 扫目录树得到，结果缓存：面板每 2 秒刷一次，不能每次都遍历。
+const rolloutCache = new Map();
+
+function rolloutFor(job) {
+  const tid = job.thread_id || job.id;
+  if (!tid) return "";
+  if (rolloutCache.has(tid)) {
+    const cached = rolloutCache.get(tid);
+    if (cached && fs.existsSync(cached)) return cached;
+  }
+  const found = rollout.findRollout(tid);
+  rolloutCache.set(tid, found);
+  return found;
+}
+
+function readThreadFallback(job) {
   const threadId = job.thread_id || job.id;
   if (!threadId) return { error: "缺少 thread_id" };
   try {
@@ -271,128 +401,176 @@ function readThread(job) {
   }
 }
 
-function itemLines(item) {
+function timelineLines(items, width, truncated) {
   const out = [];
-  const t = item?.type;
-  if (t === "agentMessage" || t === "plan") {
-    const label = t === "plan" ? "📋 计划" : "💬 回复";
-    out.push(C.green(label));
-    for (const line of String(item.text || "").split(/\r?\n/)) out.push(`   ${line}`);
-  } else if (t === "reasoning") {
-    const summary = Array.isArray(item.summary) ? item.summary : [];
-    if (summary.length) {
+  const rule = C.dim("─".repeat(Math.max(10, Math.min(width, 160))));
+  if (truncated) out.push(C.dim("（rollout 过长，只解析了末尾部分）"));
+  for (const it of items) {
+    if (it.type === "turn") {
+      out.push("");
+      out.push(`${C.blue("▶ turn")} ${C.dim(it.text.replace(/^turn /, ""))}`);
+      continue;
+    }
+    if (it.type === "task") {
+      // 任务卡有几百行，全摊开会把真正的执行过程挤没。默认只给前几行。
+      const lines = String(it.text).split(/\r?\n/);
+      out.push(C.magenta("📋 任务卡"));
+      for (const l of lines.slice(0, 8)) out.push(...wrap(l, width, "   "));
+      if (lines.length > 8) out.push(C.dim(`   …（任务卡共 ${lines.length} 行，此处折叠）`));
+      out.push(rule);
+      continue;
+    }
+    if (it.type === "thinking") {
       out.push(C.dim("🧠 思考"));
-      for (const s of summary) {
-        for (const line of String(s).split(/\r?\n/)) out.push(C.dim(`   ${line}`));
+      for (const l of wrap(it.text, width, "   ")) out.push(C.dim(l));
+      continue;
+    }
+    if (it.type === "message") {
+      out.push(C.green("💬 回复"));
+      out.push(...wrap(it.text, width, "   "));
+      continue;
+    }
+    if (it.type === "call") {
+      if (it.kind === "patch") {
+        out.push(`${C.magenta("✎ 改文件")} ${truncate(it.text, width - 12)}`);
+      } else {
+        const bad = it.exitCode !== null && it.exitCode !== undefined && it.exitCode !== 0;
+        const head = bad ? C.red("✗ $") : C.cyan("$");
+        const tag = it.exitCode === null || it.exitCode === undefined
+          ? C.dim(" …运行中")
+          : C.dim(` exit=${it.exitCode}`);
+        out.push(`${head} ${truncate(it.text, width - 14)}${tag}`);
       }
+      const body = String(it.output || "").split(/\r?\n/).filter((l) => l.trim() !== "");
+      const tail = body.slice(-8);
+      for (const l of tail) out.push(C.dim(truncate(`   ${l}`, width)));
+      if (body.length > tail.length) out.push(C.dim(`   …（输出共 ${body.length} 行）`));
+      continue;
     }
-  } else if (t === "commandExecution") {
-    const status = item.status || "";
-    const exit = item.exitCode === null || item.exitCode === undefined ? "" : ` exit=${item.exitCode}`;
-    const mark = status === "failed" || (item.exitCode && item.exitCode !== 0) ? C.red("✗") : C.cyan("$");
-    out.push(`${mark} ${item.command || ""} ${C.dim(`[${status}${exit}]`)}`);
-    const output = String(item.aggregatedOutput || "").split(/\r?\n/).filter((l) => l !== "");
-    for (const line of output.slice(-6)) out.push(C.dim(`   ${line}`));
-  } else if (t === "fileChange") {
-    const n = Array.isArray(item.changes) ? item.changes.length : 0;
-    out.push(`${C.magenta("✎ 文件改动")} ${n} 处 ${C.dim(`[${item.status || ""}]`)}`);
-    for (const ch of (item.changes || []).slice(0, 10)) {
-      out.push(C.dim(`   ${ch.kind || ch.type || ""} ${ch.path || ""}`));
-    }
-  } else if (t) {
-    out.push(C.dim(`· ${t}${item.status ? ` [${item.status}]` : ""}`));
   }
   return out;
 }
 
-function detailLines(job, thread, width) {
+function detailLines(job, width) {
   const lines = [];
-  const push = (s) => lines.push(s);
-  if (thread?.error) {
-    push(C.red(`❌ 读取 thread 失败: ${thread.error}`));
-    push("");
+  const rule = C.dim("─".repeat(Math.max(10, Math.min(width, 160))));
+  const file = rolloutFor(job);
+  let meta = {};
+  let body = [];
+
+  if (file) {
+    const tl = rollout.readTimeline(file);
+    meta = tl.meta || {};
+    body = timelineLines(tl.items, width, tl.truncated);
+    if (!tl.items.length) body = [C.dim("（rollout 里还没有可读事件）")];
+  } else {
+    // rollout 找不到（thread 刚建 / CODEX_HOME 不同）时退回 app-server。它只给消息级 item，
+    // 看不到命令与思考，所以明确告诉用户这是降级视图，别以为 worker 什么都没干。
+    const res = readThreadFallback(job);
+    body.push(C.yellow("⚠ 找不到 rollout 日志，降级为 app-server 消息视图（看不到命令与思考）"));
+    if (res.error) body.push(C.red(`❌ ${res.error}`));
+    for (const turn of res.thread?.turns || []) {
+      body.push(C.blue(`▶ turn ${turn.status || ""}`));
+      for (const it of turn.items || []) {
+        if (it.type === "agentMessage" && it.text) {
+          body.push(C.green("💬 回复"));
+          body.push(...wrap(it.text, width, "   "));
+        } else if (it.type === "commandExecution") {
+          body.push(`${C.cyan("$")} ${truncate(it.command || "", width - 10)}`);
+        }
+      }
+    }
   }
-  const t = thread?.thread || {};
-  push(C.dim(`thread ${job.thread_id || job.id || "-"}`));
-  push(C.dim(`模型   ${job.model_provider || "?"}/${job.model || "?"}${job.reasoning_effort ? ` · effort=${job.reasoning_effort}` : ""}`));
-  if (job.branch) push(C.dim(`分支   ${job.branch}`));
-  if (job.worktree_cwd) push(C.dim(`工作树 ${job.worktree_cwd}`));
-  push(C.dim(`回执   ${job.receipt ? `🧾 在案 ${job.summary_file}` : "未落回执"}`));
-  push(C.dim("─".repeat(Math.max(10, Math.min(width, 120)))));
+
+  lines.push(C.dim(`thread ${job.thread_id || job.id || "-"}`));
+  lines.push(C.dim(`模型   ${meta.provider || job.model_provider || "?"}/${meta.model || job.model || "?"}${(meta.effort || job.reasoning_effort) ? ` · effort=${meta.effort || job.reasoning_effort}` : ""}`));
+  if (job.branch) lines.push(C.dim(`分支   ${job.branch}`));
+  const wd = meta.workdir || job.worktree_cwd;
+  if (wd) lines.push(...wrap(`工作树 ${wd}`, width, "").map(C.dim));
+  if (meta.tokens) lines.push(C.dim(`token  ${meta.tokens.toLocaleString("en-US")}`));
+  lines.push(C.dim(`回执   ${job.receipt ? `🧾 在案 ${job.summary_file}` : "未落回执"}`));
+  lines.push(C.dim(`日志   ${file || "(未找到 rollout)"}`));
+  lines.push(rule);
 
   // 有回执时先把回执正文摆出来——这是验收时唯一有契约保证的内容。
   if (job.receipt) {
-    push(C.green("🧾 回执"));
+    lines.push(C.green("🧾 回执"));
     try {
-      for (const line of fs.readFileSync(job.summary_file, "utf8").split(/\r?\n/)) push(`   ${line}`);
+      for (const l of fs.readFileSync(job.summary_file, "utf8").split(/\r?\n/)) {
+        lines.push(...wrap(l, width, "   "));
+      }
     } catch (e) {
-      push(C.red(`   读取回执失败: ${String(e.message || e)}`));
+      lines.push(C.red(`   读取回执失败: ${String(e.message || e)}`));
     }
-    push(C.dim("─".repeat(Math.max(10, Math.min(width, 120)))));
+    lines.push(rule);
   }
 
-  const turns = Array.isArray(t.turns) ? t.turns : [];
-  if (!turns.length && !thread?.error) push(C.dim("（该 thread 还没有可读的 turn）"));
-  turns.forEach((turn, idx) => {
-    push(C.bold(`[turn ${idx + 1}] ${turn.status || ""}`));
-    const items = Array.isArray(turn.items) ? turn.items : [];
-    for (const item of items) for (const l of itemLines(item)) push(l);
-    push("");
-  });
-  return lines;
+  return lines.concat(body);
 }
 
 // ---------------------------------------------------------------- 渲染
+
+// 无色的标记字符。选中行整行反色，必须拿这个来排版——把带 ANSI 的版本塞进 padTo 会把列宽算多。
+function markChar(job, frame) {
+  if (job.cls.mark) return job.cls.mark;
+  return opt.spin ? SPINNER[frame % SPINNER.length] : "✳";
+}
+
+function rowMark(job, frame) {
+  return C[job.cls.tone](markChar(job, frame));
+}
 
 function renderList(model, ui) {
   const width = ui.width;
   const lines = [];
   const scope = opt.rq ? `RQ ${opt.rq}` : "全局";
-  lines.push(`${C.bold("Codex Fleet")} ${C.dim(`· ${scope} · ${model.coords.length} 协调目录 · ${model.jobs.length} worker`)}`);
+  lines.push(`${C.bold("Codex Fleet")} ${C.dim(`· ${scope} · ${model.groups.length} 任务组 · ${model.jobs.length} worker`)}`);
   const parts = [];
-  for (const g of GROUPS) {
-    if (!model.counts[g.key]) continue;
-    parts.push(C[g.color](`${model.counts[g.key]} ${g.title}`));
-  }
+  if (model.pending) parts.push(C.cyan(`${model.pending} 未完成`));
+  if (model.done) parts.push(C.green(`${model.done} 已完成`));
   lines.push(parts.length ? parts.join(C.dim(" · ")) : C.dim("暂无 worker"));
   if (model.appUnavailable) lines.push(C.red("⚠ app-server 不可达；未落回执的线程状态读不到"));
-  lines.push("");
 
-  const rows = [];
-  let lastGroup = "";
-  for (const job of model.jobs) {
-    if (job.group !== lastGroup) {
-      lastGroup = job.group;
-      const g = GROUPS.find((x) => x.key === job.group);
-      rows.push({ type: "header", text: C.dim(g.title) });
-    }
-    rows.push({ type: "job", job });
-  }
-  if (!rows.length) {
-    rows.push({ type: "header", text: C.dim("（还没有 Codex worker；派发后会自动出现在这里）") });
+  if (!model.groups.length) {
+    lines.push("");
+    lines.push(C.dim("（还没有 Codex worker；派发后会自动出现在这里）"));
+    lines.push("");
+    lines.push(C.dim("↑↓ 选择 · → 进详情 · ← 返回 · r 刷新 · q 退出"));
+    return lines;
   }
 
-  // 名字列宽随内容自适应，但给 detail 留住至少一半宽度。
   const nameW = Math.min(
-    Math.max(20, ...model.jobs.map((j) => dispWidth(j.displayName))),
-    Math.floor(width * 0.42)
+    Math.max(14, ...model.jobs.map((j) => dispWidth(j.displayName))),
+    Math.floor(width * 0.3)
   );
+  const stateW = 6;
   const ageW = 5;
-  const detailW = Math.max(10, width - 3 - nameW - 2 - ageW - 1);
+  const detailW = Math.max(10, width - 5 - nameW - stateW - ageW - 4);
 
-  for (const row of rows) {
-    if (row.type === "header") { lines.push(row.text); continue; }
-    const job = row.job;
-    const g = GROUPS.find((x) => x.key === job.group);
-    const selected = model.jobs[ui.cursor] === job;
-    // 列宽必须按**无色文本**算——ANSI 转义序列不占列，混进来 padTo 就会算多。
-    const name = padTo(truncate(job.displayName, nameW), nameW);
-    const detail = padTo(truncate(job.detail || "", detailW), detailW);
-    const age = padTo(fmtAge(model.now - (Number(job.started_at) || model.now)), ageW);
-    if (selected) {
-      lines.push(C.sel(padTo(` ✳ ${name}  ${detail} ${age}`, width)));
-    } else {
-      lines.push(` ${C[g.color]("✳")} ${name}  ${C.dim(detail)} ${C.dim(age)}`);
+  for (const g of model.groups) {
+    lines.push("");
+    // 组标题：主 session 名字（谁派的） + RQ + 仓库 + 完成度
+    const right = `${g.rq}${g.repo ? ` · ${g.repo}` : ""}  ${g.done}/${g.jobs.length} 完成`;
+    const left = truncate(g.title, Math.max(10, width - dispWidth(right) - 4));
+    lines.push(`${C.bold(left)}${C.dim(" ".repeat(Math.max(1, width - dispWidth(left) - dispWidth(right))) + right)}`);
+
+    let lastBucket = "";
+    for (const job of g.jobs) {
+      if (job.cls.bucket !== lastBucket) {
+        lastBucket = job.cls.bucket;
+        lines.push(C.dim(`  ${lastBucket === "pending" ? "未完成" : "已完成"}`));
+      }
+      const selected = model.jobs[ui.cursor] === job;
+      const name = padTo(truncate(job.displayName, nameW), nameW);
+      const label = padTo(job.cls.label, stateW);
+      const detail = padTo(truncate(job.detail || "", detailW), detailW);
+      const age = padTo(fmtAge(model.now - (Number(job.started_at) || model.now)), ageW);
+      if (selected) {
+        // 选中行整行反色，配色必须按无色文本排版，ANSI 转义混进 padTo 会算多
+        lines.push(C.sel(padTo(`   ${markChar(job, ui.frame)} ${name} ${label} ${detail} ${age}`, width)));
+      } else {
+        lines.push(`   ${rowMark(job, ui.frame)} ${name} ${C[job.cls.tone](label)} ${C.dim(detail)} ${C.dim(age)}`);
+      }
     }
   }
 
@@ -404,30 +582,29 @@ function renderList(model, ui) {
 function renderDetail(model, ui) {
   const job = model.jobs[ui.cursor];
   if (!job) return [C.dim("（没有选中的 worker）")];
-  const g = GROUPS.find((x) => x.key === job.group);
+  const g = job.group;
   const head = [
-    `${C.bold(job.displayName)}  ${C[g.color](g.title)} ${C.dim(fmtAge(model.now - (Number(job.started_at) || model.now)))}`,
-    C.dim(job.detail || ""),
+    `${C.bold(job.displayName)} ${C.dim(`· ${g.title} · ${g.rq}`)}`,
+    `${C[job.cls.tone](job.cls.label)} ${C.dim(fmtAge(model.now - (Number(job.started_at) || model.now)))} ${C.dim(truncate(job.detail || "", ui.width - 20))}`,
     "",
   ];
   const body = ui.detailLines || [C.dim("加载中…")];
-  const foot = [C.dim("← 返回 · ↑↓ 滚动 · r 刷新 · q 退出")];
-  const avail = Math.max(3, ui.height - head.length - foot.length - 1);
+  const foot = C.dim("← 返回 · ↑↓ 滚动 · PgUp/PgDn 翻页 · End 跟随最新 · r 刷新 · q 退出");
+  const avail = Math.max(3, ui.height - head.length - 2);
   const maxOff = Math.max(0, body.length - avail);
   if (ui.follow) ui.detailOffset = maxOff;
   ui.detailOffset = Math.max(0, Math.min(ui.detailOffset, maxOff));
   const view = body.slice(ui.detailOffset, ui.detailOffset + avail);
-  const pos = maxOff > 0 ? C.dim(` [${ui.detailOffset}/${maxOff}${ui.follow ? " 跟随" : ""}]`) : "";
-  return [...head, ...view, "", `${foot[0]}${pos}`];
+  const pos = maxOff > 0 ? C.dim(`  [${ui.detailOffset}/${maxOff}${ui.follow ? " 跟随" : ""}]`) : "";
+  return [...head, ...view, `${foot}${pos}`];
 }
 
 function paint(lines, ui) {
-  const body = lines.slice(0, ui.height).join("\r\n");
   if (opt.once) {
     process.stdout.write(`${lines.join("\n")}\n`);
     return;
   }
-  process.stdout.write(`\x1b[H\x1b[2J${body}`);
+  process.stdout.write(`\x1b[H\x1b[2J${lines.slice(0, ui.height).join("\r\n")}`);
 }
 
 // ---------------------------------------------------------------- 主循环状态
@@ -439,6 +616,7 @@ const ui = {
   follow: true,
   detailLines: null,
   detailKey: "",
+  frame: 0,
   width: process.stdout.columns || 100,
   height: process.stdout.rows || 30,
 };
@@ -448,21 +626,15 @@ let sawActive = false;
 let allDoneSince = 0;
 const startedAt = Date.now();
 
-function anyActive(m) {
-  return m.jobs.some((j) => jobsLib.ACTIVE_STATES.has(j.state));
-}
-
-function anyAttention(m) {
-  return m.jobs.some((j) => j.group === "needs-check" || j.group === "attention");
-}
+const anyActive = (m) => m.jobs.some((j) => jobsLib.ACTIVE_STATES.has(j.state));
+const anyAttention = (m) => m.jobs.some((j) => j.cls.bucket === "pending" && !jobsLib.ACTIVE_STATES.has(j.state));
 
 // 自动关闭：只有「见过活跃 worker」之后才可能触发，避免面板刚被派发脚本拉起、
 // 第一个 thread 还没建好就自己关掉。跨 session 的新派发会重新写进注册表，
 // 下一 tick 就会被 collect() 看到并重置计时。
 function maybeAutoClose() {
   if (!opt.autoClose) return false;
-  const active = anyActive(model);
-  if (active) { sawActive = true; allDoneSince = 0; return false; }
+  if (anyActive(model)) { sawActive = true; allDoneSince = 0; return false; }
   if (!sawActive) {
     if (opt.idleTimeout > 0 && Date.now() - startedAt > opt.idleTimeout * 1000) return true;
     return false;
@@ -484,11 +656,10 @@ function refreshDetail(force) {
   if (!job) { ui.detailLines = null; return; }
   const key = `${job.coord}::${job.module}`;
   const stale = Date.now() - lastDetailAt >= opt.detailInterval;
-  // 换了 worker 必须立刻重读；同一个 worker 则按 detail-interval 节流，
-  // 不跟着列表刷新频率走（列表刷新会更频繁，thread/read 是进程级开销）。
+  // 换了 worker 必须立刻重读；同一个 worker 则按 detail-interval 节流。
   if (!force && ui.detailKey === key && ui.detailLines && !stale) return;
   ui.detailKey = key;
-  ui.detailLines = detailLines(job, readThread(job), ui.width);
+  ui.detailLines = detailLines(job, ui.width);
   lastDetailAt = Date.now();
 }
 
@@ -559,28 +730,37 @@ for (const k of opt.keys) {
 }
 
 if (opt.json) {
-  const out = {
+  const sel = model.jobs[ui.cursor];
+  console.log(JSON.stringify({
     scope: opt.rq || "global",
-    coords: model.coords,
-    counts: model.counts,
+    pending: model.pending,
+    done: model.done,
     appUnavailable: model.appUnavailable,
     view: ui.view,
     cursor: ui.cursor,
-    selected: model.jobs[ui.cursor]
-      ? { module: model.jobs[ui.cursor].module, rq: model.jobs[ui.cursor].rq, group: model.jobs[ui.cursor].group }
-      : null,
+    selected: sel ? { module: sel.module, rq: sel.rq, bucket: sel.cls.bucket } : null,
+    groups: model.groups.map((g) => ({
+      rq: g.rq,
+      title: g.title,
+      repo: g.repo,
+      ownerPid: g.owner?.pid || 0,
+      ownerSource: g.ownerSource,
+      pending: g.pending,
+      done: g.done,
+      modules: g.jobs.map((j) => j.module),
+    })),
     jobs: model.jobs.map((j) => ({
       module: j.module,
       rq: j.rq,
       name: j.displayName,
       state: j.state,
-      group: j.group,
+      bucket: j.cls.bucket,
+      label: j.cls.label,
       receipt: j.receipt ? 1 : 0,
       thread_id: j.thread_id || j.id || "",
       detail: j.detail || "",
     })),
-  };
-  console.log(JSON.stringify(out, null, 2));
+  }, null, 2));
   process.exit(0);
 }
 
@@ -622,6 +802,15 @@ if (process.stdin.isTTY) {
 
 draw();
 
+// 动画只重绘、不采集：帧率跟数据刷新彻底解耦，否则要么标记不动，要么每 120ms 打一次 app-server。
+const spinTimer = opt.spin ? setInterval(() => {
+  if (ui.view !== "list") return;
+  if (!model.jobs.some((j) => j.state === "running")) return;
+  ui.frame += 1;
+  draw();
+}, 130) : null;
+if (spinTimer && spinTimer.unref) spinTimer.unref();
+
 const listTimer = setInterval(() => {
   const before = model.jobs[ui.cursor];
   model = collect();
@@ -633,6 +822,7 @@ const listTimer = setInterval(() => {
   draw();
   if (maybeAutoClose()) {
     clearInterval(listTimer);
+    if (spinTimer) clearInterval(spinTimer);
     if (!opt.plain) process.stdout.write("\x1b[?25h\x1b[?1049l");
     console.log("✅ Codex worker 全部收工，面板自动关闭。");
     shutdown(0);

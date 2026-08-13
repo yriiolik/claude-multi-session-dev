@@ -259,6 +259,129 @@ function listCoords({ prune = true } = {}) {
 }
 
 // ---------------------------------------------------------------------------
+// 任务组归属：这个 RQ 是哪个主 session 派出去的
+//
+// 面板按 RQ 分组，组标题要显示"发起这批 worker 的主 session 叫什么"。协调目录的 task.meta
+// 只有 cwd/分支，没有 session 身份，所以由派发脚本在派发时落一份 owner.meta。
+//
+// 只存 pid / session id / 当时的名字快照；**展示时按 pid 去 `~/.claude/sessions/<pid>.json`
+// 取实时名字**——主 session 的标题会被取名 hook 改写（"bg" → 中文标题），快照会过期。
+// ---------------------------------------------------------------------------
+
+function claudeSessionRegistry(pid) {
+  if (!pid) return null;
+  try {
+    return JSON.parse(fs.readFileSync(path.join(process.env.HOME || os.homedir(), ".claude", "sessions", `${pid}.json`), "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+// 派发脚本跑在主 session 的进程树里：优先信 CLAUDE_PID，拿不到就沿父进程链找注册文件。
+function detectOwner(env = process.env) {
+  const out = { pid: 0, sessionId: env.CLAUDE_CODE_SESSION_ID || "", name: "" };
+  const direct = Number(env.CLAUDE_PID) || 0;
+  const candidates = [];
+  if (direct) candidates.push(direct);
+  let pid = process.pid;
+  for (let i = 0; i < 8 && pid > 1; i++) {
+    candidates.push(pid);
+    const ppid = Number(gitFreeParentPid(pid));
+    if (!ppid || ppid === pid) break;
+    pid = ppid;
+  }
+  for (const c of candidates) {
+    const reg = claudeSessionRegistry(c);
+    if (reg && reg.sessionId) {
+      out.pid = c;
+      out.sessionId = reg.sessionId;
+      out.name = reg.name || "";
+      return out;
+    }
+  }
+  return out;
+}
+
+function gitFreeParentPid(pid) {
+  try {
+    return execFileSync("ps", ["-o", "ppid=", "-p", String(pid)], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+  } catch {
+    return "";
+  }
+}
+
+function ownerMetaPath(coord) {
+  return path.join(coord, "owner.meta");
+}
+
+function writeOwnerMeta(coord, owner) {
+  const file = ownerMetaPath(coord);
+  const lines = [
+    `owner_pid=${owner.pid || ""}`,
+    `owner_session_id=${owner.sessionId || ""}`,
+    `owner_name=${(owner.name || "").replace(/\n/g, " ")}`,
+    `owner_cwd=${owner.cwd || ""}`,
+    `recorded_at=${Math.floor(Date.now() / 1000)}`,
+  ];
+  fs.writeFileSync(file, `${lines.join("\n")}\n`);
+  return file;
+}
+
+function readOwnerMeta(coord) {
+  const meta = parseEnv(ownerMetaPath(coord));
+  return {
+    pid: Number(meta.owner_pid) || 0,
+    sessionId: meta.owner_session_id || "",
+    name: meta.owner_name || "",
+    cwd: meta.owner_cwd || "",
+  };
+}
+
+// 实时名字优先，主 session 已退出则回落到快照，都没有就交给调用方兜底。
+function resolveOwnerName(owner) {
+  if (owner && owner.pid) {
+    const reg = claudeSessionRegistry(owner.pid);
+    if (reg && reg.sessionId === (owner.sessionId || reg.sessionId) && reg.name) return reg.name;
+  }
+  return owner && owner.name ? owner.name : "";
+}
+
+// 回退推断：owner.meta 出现之前派发的历史 RQ 没有归属记录。协调目录的 task.meta 里有派发时的
+// cwd，拿它去活着的 claude session 注册表里找同 cwd 的会话。同 cwd 多开时可能猜错，所以调用方
+// 要把来源标成 inferred，不要当成确凿信息。
+function inferOwnerByCwd(coord) {
+  const task = parseEnv(path.join(coord, "task.meta"));
+  const cwd = task.cwd;
+  if (!cwd) return null;
+  const dir = path.join(process.env.HOME || os.homedir(), ".claude", "sessions");
+  let files;
+  try {
+    files = fs.readdirSync(dir).filter((f) => /^\d+\.json$/.test(f));
+  } catch {
+    return null;
+  }
+  const hits = [];
+  for (const f of files) {
+    try {
+      const reg = JSON.parse(fs.readFileSync(path.join(dir, f), "utf8"));
+      if (reg && reg.cwd === cwd && reg.name) hits.push(reg);
+    } catch {}
+  }
+  if (!hits.length) return null;
+  // 忙着的优先（多半就是正在盯这批 worker 的那个），否则取最近启动的
+  hits.sort((a, b) => {
+    const ba = a.status === "busy" ? 0 : 1;
+    const bb = b.status === "busy" ? 0 : 1;
+    if (ba !== bb) return ba - bb;
+    return (b.startedAt || 0) - (a.startedAt || 0);
+  });
+  return { pid: hits[0].pid || 0, sessionId: hits[0].sessionId || "", name: hits[0].name, cwd };
+}
+
+// ---------------------------------------------------------------------------
 // 面板进程/分屏状态
 //
 // 幂等靠 pidfile 而不是 pgrep：拉起面板时 osascript 的命令行里也带着面板脚本路径，
@@ -344,6 +467,13 @@ module.exports = {
   writeRegistry,
   registerCoord,
   listCoords,
+  claudeSessionRegistry,
+  detectOwner,
+  ownerMetaPath,
+  writeOwnerMeta,
+  readOwnerMeta,
+  resolveOwnerName,
+  inferOwnerByCwd,
   panelDir,
   panelPidFile,
   panelStateFile,

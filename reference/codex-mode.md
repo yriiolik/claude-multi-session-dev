@@ -66,18 +66,39 @@ claude 进程自注册）+ `~/.claude/daemon/roster.json`（daemon 托管的 PTY
 既没有独立进程也没有 PTY，伪造 `jobs/<short>/state.json` 或 `sessions/<pid>.json` 实测都不会被列出
 （有进程/密钥校验）。所以 codex 侧的可视化只能自己出一个等价面板。
 
-`cc-dispatch-codex-app` 派发成功后**自动**：登记 `$COORD` 进全局注册表 → 在当前 Ghostty 窗口右侧
-分屏拉起面板。用法与按键见 `commands.md`。设计上的几条硬约束：
+`cc-dispatch-codex-app` 派发成功后**自动**：登记 `$COORD` 进全局注册表 + 落 `owner.meta`（这批
+worker 是谁派的）→ 在当前 Ghostty 窗口右侧分屏拉起面板。用法与按键见 `commands.md`。
+
+**组织方式**：按**任务组（RQ）**分组，组标题是发起这批 worker 的主 session 名字；组内只分
+未完成 / 已完成两栏，各 worker 的状态差异由行首标记与状态词表达（执行中的标记是动画）。
+
+设计上的硬约束：
 
 1. **只读**。面板每几秒刷一次，绝不 `thread/resume` / `thread/unarchive` / 取消 pin / 写回 `.codex-app.env`
    ——否则会和编排者的 status 调用互相打架，还会把副作用放大成刷屏级写入。状态判定与 status 脚本
    共用 `scripts/lib/codex-app-jobs.js` 的纯函数，两边对同一 worker 的答案必然一致。
 2. **全局**。worker 是跨 session、跨仓库派发的，面板读全局注册表
    （`~/.claude/fleet/codex-coords.json`）而不是某个 cwd 的 `.git/fleet`。
-3. **「空闲 ≠ 完成」照旧**。thread idle 但没落 `result:` 回执的，单独归入**需核验**组，不混进
-   Completed，**也不触发自动关闭**——那正是最需要你看一眼的状态。
+3. **「空闲 ≠ 完成」照旧**。thread idle 但没落 `result:` 回执的状态词是**需核验**，归在**未完成**栏，
+   **也不触发自动关闭**——那正是最需要你看一眼的状态。
 4. **自动关闭**只在「见过活跃 worker → 现在全部收工」时触发，跨 session 的新派发会重置计时。
    全绿收工才关；有需核验/异常就一直留着（要强制关加 `--close-on-attention`）。
+
+**组标题的来源**（`--json` 里的 `ownerSource`）：`owner.meta` 只存主 session 的 pid / session id，
+名字**每次展示时按 pid 现取** `~/.claude/sessions/<pid>.json`——主 session 的标题会被取名 hook 从 `bg`
+改成中文标题，存快照必然过期。`owner.meta` 出现之前派发的历史 RQ 没有归属记录，退而按 `task.meta`
+的 cwd 去活着的 session 里推断（标 `inferred`，同 cwd 多开时可能猜错），最后才退到仓库名。
+
+**详情页读 rollout，不读 `thread/read`**。这是实测结论：一个跑了 27 次命令、11 段推理的 thread，
+`thread/read` 只返回 3 条 item（1 userMessage + 2 agentMessage）——它只给**消息级**视图。完整的
+思考 / 每次命令及其输出与退出码 / 文件改动，只有
+`$CODEX_HOME/sessions/<Y>/<M>/<D>/rollout-*-<thread-id>.jsonl` 里有。解析在
+`scripts/lib/codex-rollout.js`：只读文件末尾若干字节、按 `call_id` 把命令与输出配对、剥掉 Codex 给
+每条命令加的 `cd "<worktree>" &&` 前缀、跳过注入的 developer 消息（那是几千行 CLAUDE.md）。
+rollout 找不到时才退回 `thread/read`，并在页面上明说这是降级视图。
+
+列表的 detail 列同理：原始 detail 是 `Codex App thread active turn=<uuid>` 和回执文件路径，两条都
+没有信息量；面板改成显示 rollout 里**最近一条活动**（在跑的）或**回执首行**（已完成的）。
 
 分屏走 Ghostty 1.3+ 的 AppleScript 字典（`split ... with configuration`），不是模拟 ⌘D：模拟按键要
 辅助功能权限、会被前台应用抢走、也拿不到新 surface 的句柄用于幂等与关闭。首次会弹一次"允许控制

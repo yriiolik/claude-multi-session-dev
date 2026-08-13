@@ -116,10 +116,16 @@ cc-fleet-panel-codex-app --rq "$RQ"      # 只看一个 RQ
 cc-fleet-panel-open                      # 手动分屏拉起（幂等，已开则复用）
 cc-fleet-panel-open --ratio 0.25         # 面板占原面板 1/4 宽（默认 0.33；0=Ghostty 原生对半）
 cc-fleet-panel-open --close              # 手动关掉面板与分屏
+cc-fleet-panel-open --no-close-split     # 面板退出后保留分屏（默认退出即关，见下）
 cc-fleet-panel-register --list           # 看注册表里有哪些协调目录
 ```
 
 面板交互：`↑↓` 选择 · `→` 进详情 · `←` 返回 · `PgUp/PgDn` 翻页 · `End` 跟随最新 · `r` 刷新 · `q` 退出。
+
+面板退出（自动收工 / 按 `q` / `--close`）时**分屏会一并关掉**，不留 "Process exited. Press any key
+to close the terminal."——Ghostty 自己不收 surface，收尾由命令串尾部的 `cc-fleet-panel-close-surface`
+完成。只有面板**异常退出**（退出码非 0）才保留分屏，好让你看见报错。全局关掉这个行为：
+`CC_FLEET_PANEL_CLOSE_SPLIT=0`。细节见 `codex-mode.md`。
 
 详情页读的是 Codex 的 rollout 日志而不是 `thread/read`——后者只给消息级 item，看不到命令与思考
 （实测 27 次命令的 thread 它只返回 3 条）。所以详情里能看到完整的思考 / 每次命令及其输出与退出码 /

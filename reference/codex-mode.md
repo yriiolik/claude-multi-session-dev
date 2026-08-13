@@ -105,6 +105,25 @@ rollout 找不到时才退回 `thread/read`，并在页面上明说这是降级�
 Ghostty"授权框。Ghostty 没开 / 没授权 / 非 macOS —— 一律只提示不报错，**绝不让已派发成功的 thread
 因为面板没开出来而被判失败**。
 
+**面板退出后分屏会被真正关掉**，不再留一块 "Process exited. Press any key to close the terminal."
+让你手动敲键。Ghostty 1.3.1 自己不会收掉 surface（`wait after command = false` 对 AppleScript 建出来
+的 split 无效，实测命令 exit 0 七秒后 surface 依旧在），所以由 `cc-fleet-panel-open` 在分屏的命令串
+末尾挂一个 `cc-fleet-panel-close-surface` 来收尾——自动收工、按 `q`、被 `--close` SIGTERM、甚至面板
+根本没启动起来，全都覆盖得到。两条安全线：
+
+- **面板退出码非 0 就保留分屏**。那时分屏里往往是唯一能看到报错的地方（比如分屏的 PATH 里没有
+  node），关掉等于把故障现场吞了。这种分屏保持 Ghostty 原样，看完敲一下键即可。
+- **nonce 对不上绝不关**。terminal id 从共享状态文件里读，只有 `cc-fleet-panel-open` 本次写进去的
+  nonce 与命令行传入的一致，才能证明那块 surface 是本次开的——否则可能关掉用户自己的终端。
+
+不想要这个行为：`cc-fleet-panel-open --no-close-split`，或全局 `CC_FLEET_PANEL_CLOSE_SPLIT=0`。
+
+⚠ 命令串的引号形式是实测逼出来的，改动前先看 `tests/test-cc-fleet-panel-open.sh` 的「分屏收尾」
+断言。Ghostty 不是把 command 当一行 shell 脚本执行，而是**自己**展开变量、按引号拆词，再拼成
+`bash -c "exec -l 'argv0' 'argv1' …"`。所以：串联必须显式包一层 `/bin/sh -c`（`;` 否则只是字面
+参数）；这层脚本必须用**单引号**包（Ghostty 会展开双引号里的 `$?`，把面板退出码提前吃成 0）；
+脚本内部的各个参数则改用双引号引用。
+
 **分屏比例**默认收窄到源面板的 1/3（`--ratio` / `CC_FLEET_PANEL_RATIO`，0 表示保持原生对半）。
 Ghostty 的 split 固定对半、也没有"按比例分"的配置项，能程序化调整的只有相对移动分割线的
 `resize_split:<方向>,<像素>`；像素↔列的换算取决于字号，事先算不出来。所以收窄动作由**面板自己**

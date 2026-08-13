@@ -64,7 +64,7 @@ assert_contains "$(cat "$STDIN_LOG")" "split src direction right" "AppleScript �
 assert_contains "$(argv_field 1)" "cc-fleet-panel-codex-app" "命令指向面板脚本"
 # 分屏的 PATH 是 Ghostty 的登录环境，pyenv/nvm 的 node 不在里面。靠 shebang 会 env: node not found，
 # 分屏一闪而过——图形界面上只会表现为"面板没开出来"，极难排查。
-assert_contains "$(argv_field 1)" "'$(node -pe 'process.execPath')' '" "用绝对 node 路径启动，不依赖分屏的 PATH"
+assert_contains "$(argv_field 1)" "\"$(node -pe 'process.execPath')\" \"" "用绝对 node 路径启动，不依赖分屏的 PATH"
 assert_contains "$(cat "$ARGV_LOG")" "PATH=" "PATH 带进分屏（面板要 spawn cc-codex-app-call 和 git）"
 assert_eq "$(argv_field 3)" "right" "方向参数正确"
 assert_eq "$(argv_field 4)" "1" "默认把焦点还给原终端，不打断正在打字的 session"
@@ -72,11 +72,11 @@ assert_eq "$(node -pe 'JSON.parse(require("fs").readFileSync(process.argv[1],"ut
 
 CASE="分屏比例"
 # Ghostty 的 split 固定对半；比例由面板自己收敛，open 只负责把目标值传下去
-assert_contains "$(argv_field 1)" "'--target-ratio' '0.33'" "默认把面板收窄到 1/3 而不是对半"
+assert_contains "$(argv_field 1)" '"--target-ratio" "0.33"' "默认把面板收窄到 1/3 而不是对半"
 OUT="$(run_open --ratio 0.25)"
-assert_contains "$(argv_field 1)" "'--target-ratio' '0.25'" "--ratio 生效"
+assert_contains "$(argv_field 1)" '"--target-ratio" "0.25"' "--ratio 生效"
 OUT="$(CC_FLEET_PANEL_RATIO=0.4 run_open)"
-assert_contains "$(argv_field 1)" "'--target-ratio' '0.4'" "CC_FLEET_PANEL_RATIO 生效"
+assert_contains "$(argv_field 1)" '"--target-ratio" "0.4"' "CC_FLEET_PANEL_RATIO 生效"
 OUT="$(run_open --ratio 0)"
 assert_not_contains "$(argv_field 1)" "--target-ratio" "--ratio 0 时保持 Ghostty 默认的对半"
 
@@ -95,8 +95,34 @@ assert_contains "$(cat "$STDIN_LOG")" "set environment variables of cfg" "AppleS
 
 CASE="参数透传"
 OUT="$(run_open -- --rq RQ-2026-0813-001 --no-auto-close)"
-assert_contains "$(argv_field 1)" "'--rq' 'RQ-2026-0813-001'" "-- 之后的参数原样传给面板且各自加引号"
-assert_contains "$(argv_field 1)" "'--no-auto-close'" "多个透传参数都在"
+assert_contains "$(argv_field 1)" '"--rq" "RQ-2026-0813-001"' "-- 之后的参数原样传给面板且各自加引号"
+assert_contains "$(argv_field 1)" '"--no-auto-close"' "多个透传参数都在"
+
+# ---------------------------------------------------------------- 分屏收尾
+# Ghostty 1.3.1 不会在命令退出后收掉 split，只会停在 "Process exited. Press any key to close
+# the terminal."。所以命令串尾部挂一个 close-surface helper 主动关。以下断言全部来自实测，
+# 换掉任何一处引号形式都会让收尾静默失效（而分屏照样开得出来，故障完全不可见）。
+CASE="分屏收尾"
+rm -f "$STATE" "$PIDF"
+OUT="$(run_open)"
+CMD_FIELD="$(argv_field 1)"
+assert_contains "$CMD_FIELD" "/bin/sh -c '" "串联要生效必须显式包一层 sh —— Ghostty 的 command 不经过 shell"
+assert_contains "$CMD_FIELD" "cc-fleet-panel-close-surface" "命令串尾部挂上关分屏的 helper"
+# `$?` 必须落在**单引号**里：Ghostty 会展开双引号中的变量，写在外面会被它提前吃成 0，
+# helper 便永远看不到面板的真实退出码，异常退出的分屏也会被误关。
+assert_contains "$CMD_FIELD" '"--rc" "$?"' 'helper 拿到的是面板的真实退出码（$? 留在单引号内）'
+assert_contains "$CMD_FIELD" '"; ' "用 ; 而不是 && —— 面板异常退出时也要走到收尾这一步"
+NONCE_STATE="$(node -pe 'JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).nonce || ""' "$STATE")"
+[[ -n "$NONCE_STATE" ]] && ok || fail "状态文件要记下 nonce（helper 的归属凭证）"
+assert_contains "$CMD_FIELD" "\"--nonce\" \"$NONCE_STATE\"" "命令串里的 nonce 与状态文件一致，helper 才认得出这块分屏是本次开的"
+
+CASE="分屏收尾开关"
+OUT="$(run_open --no-close-split)"
+assert_not_contains "$(argv_field 1)" "cc-fleet-panel-close-surface" "--no-close-split 时不挂 helper"
+assert_eq "$(node -pe 'JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).nonce' "$STATE")" "" "不自动关时不写 nonce（免得后来的 helper 误认）"
+OUT="$(CC_FLEET_PANEL_CLOSE_SPLIT=0 run_open)"
+assert_not_contains "$(argv_field 1)" "cc-fleet-panel-close-surface" "CC_FLEET_PANEL_CLOSE_SPLIT=0 时不挂 helper"
+assert_contains "$(cat "$ARGV_LOG")" "CC_FLEET_PANEL_CLOSE_SPLIT=0" "开关本身也带进分屏（手动跑的面板同样不自动关）"
 
 # ---------------------------------------------------------------- 幂等
 CASE="幂等"

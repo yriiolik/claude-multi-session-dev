@@ -479,6 +479,53 @@ function writePanelState(state) {
   fs.renameSync(tmp, file);
 }
 
+// ---------------------------------------------------------------------------
+// 关闭分屏
+//
+// 为什么必须由我们主动关：Ghostty 1.3.1 **不会**在分屏里的命令退出后收掉 surface，即便
+// `new surface configuration` 里把 `wait after command` 设成了 false（2026-08-13 实测：
+// 命令 exit 0 七秒后 surface 仍 alive）。表现就是面板收工后留下一块
+// "Process exited. Press any key to close the terminal."，还要用户手动敲一下键。
+// 实测同时确认：`close` 一个 surface —— 无论里面的进程已退出还是仍在跑，甚至就是从**该
+// surface 自己内部**发起 —— 都会立即生效，不弹确认框。所以关闭一律走 AppleScript close。
+//
+// 先找齐再关：在 `repeat with t in terminals` 里直接 close 会让正在遍历的集合当场失效，
+// 报「不能获得 item N of every terminal。无效的索引 (-1719)」。
+const GHOSTTY_CLOSE_SCRIPT = `on run argv
+  set theId to item 1 of argv
+  tell application "Ghostty"
+    set target to missing value
+    repeat with t in terminals
+      if (id of t as text) is theId then
+        set target to t
+        exit repeat
+      end if
+    end repeat
+    if target is missing value then return "not-found"
+    close target
+    return "closed"
+  end tell
+end run`;
+
+// timeout 是保命用的：关闭动作常常发生在「面板已经不在了」的收尾路径上，osascript 万一
+// 挂住（Ghostty 无响应 / 弹了别的对话框），不能把调用方一起拖住。
+function closeGhosttySurface(terminalId, opts = {}) {
+  const bin = opts.osascript || process.env.CC_GHOSTTY_OSASCRIPT || "/usr/bin/osascript";
+  const res = spawnSync(bin, ["-", String(terminalId)], {
+    input: GHOSTTY_CLOSE_SCRIPT,
+    encoding: "utf8",
+    stdio: ["pipe", "pipe", "pipe"],
+    timeout: opts.timeoutMs || 6000,
+  });
+  const out = String(res.stdout || "").trim();
+  return {
+    ok: res.status === 0,
+    out,
+    closed: res.status === 0 && out !== "not-found",
+    err: String(res.stderr || "").trim() || (res.error ? String(res.error.message || res.error) : `osascript exit ${res.status}`),
+  };
+}
+
 module.exports = {
   TERMINAL_STATES,
   ACTIVE_STATES,
@@ -515,4 +562,6 @@ module.exports = {
   clearPanelPid,
   readPanelState,
   writePanelState,
+  GHOSTTY_CLOSE_SCRIPT,
+  closeGhosttySurface,
 };

@@ -14,10 +14,12 @@
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const crypto = require("crypto");
 const { spawnSync } = require("child_process");
 const jobsLib = require("./lib/codex-app-jobs.js");
 
 const PANEL_BIN = path.join(__dirname, "cc-fleet-panel-codex-app");
+const CLOSE_SURFACE_BIN = path.join(__dirname, "cc-fleet-panel-close-surface");
 const OSASCRIPT = process.env.CC_GHOSTTY_OSASCRIPT || "/usr/bin/osascript";
 
 let action = "open";
@@ -28,6 +30,8 @@ let ratio = Number(process.env.CC_FLEET_PANEL_RATIO) || 0.33;
 let focusPanel = false;
 let strict = false;
 let quiet = false;
+// 面板退出后由命令串尾部的 helper 把分屏关掉（Ghostty 自己不会关，见 CLOSE_SURFACE_BIN 的说明）。
+let closeSplit = process.env.CC_FLEET_PANEL_CLOSE_SPLIT !== "0";
 const panelArgs = [];
 
 function usage() {
@@ -42,6 +46,7 @@ function usage() {
   --direction DIR   分屏方向（默认 right，可用 CC_FLEET_PANEL_DIRECTION 覆盖）
   --ratio R         面板占原面板的比例（默认 0.33，可用 CC_FLEET_PANEL_RATIO 覆盖；0=保持对半）
   --focus           分屏后把焦点留在面板（默认焦点还给原来的终端，别打断你打字）
+  --no-close-split  面板退出后不自动关分屏（默认自动关；也可用 CC_FLEET_PANEL_CLOSE_SPLIT=0）
   --strict          Ghostty 不可用时以非 0 退出（默认只提示）
   --quiet           不打印提示
   --close           关掉已开的面板（先 SIGTERM 面板进程，再兜底关 surface）
@@ -55,6 +60,8 @@ for (let i = 2; i < process.argv.length; i++) {
   else if (a === "--direction") direction = process.argv[++i] || "right";
   else if (a === "--ratio") ratio = Number(process.argv[++i]) || 0;
   else if (a === "--focus") focusPanel = true;
+  else if (a === "--close-split") closeSplit = true;
+  else if (a === "--no-close-split") closeSplit = false;
   else if (a === "--strict") strict = true;
   else if (a === "--quiet") quiet = true;
   else if (a === "--close") action = "close";
@@ -100,6 +107,7 @@ const ENV_PASSTHROUGH = [
   "CC_FLEET_PANEL_PIDFILE",
   "CC_FLEET_PANEL_RATIO",
   "CC_FLEET_PANEL_DEBUG",
+  "CC_FLEET_PANEL_CLOSE_SPLIT",
   "CC_GHOSTTY_OSASCRIPT",
 ];
 
@@ -137,24 +145,6 @@ const OPEN_SCRIPT = `on run argv
   end tell
 end run`;
 
-// 先找齐再关：在 `repeat with t in terminals` 里直接 close，会让正在遍历的集合当场失效，
-// 报 “不能获得 item N of every terminal。无效的索引 (-1719)”。
-const CLOSE_SCRIPT = `on run argv
-  set theId to item 1 of argv
-  tell application "Ghostty"
-    set target to missing value
-    repeat with t in terminals
-      if (id of t as text) is theId then
-        set target to t
-        exit repeat
-      end if
-    end repeat
-    if target is missing value then return "not-found"
-    close target
-    return "closed"
-  end tell
-end run`;
-
 if (action === "status") {
   console.log(JSON.stringify({
     pid: jobsLib.panelAlive(),
@@ -170,9 +160,12 @@ if (action === "close") {
     try { process.kill(pid, "SIGTERM"); } catch {}
     note(`已请求关闭面板进程 pid=${pid}`);
   }
+  // 面板进程收到 SIGTERM 后，命令串尾部的 helper 通常已经把分屏关掉了；这里再关一次是兜底
+  // （面板被 kill -9、或压根没启动起来时 helper 也可能没跑）。关一个已经没了的 surface 只会
+  // 返回 not-found，无害。
   const state = jobsLib.readPanelState();
   if (state.terminalId) {
-    const r = osa(CLOSE_SCRIPT, [String(state.terminalId)]);
+    const r = jobsLib.closeGhosttySurface(state.terminalId, { osascript: OSASCRIPT });
     note(r.ok ? `分屏 ${state.terminalId}: ${r.out}` : `关闭分屏失败: ${r.err}`);
   }
   jobsLib.writePanelState({});
@@ -199,8 +192,12 @@ if (!fs.existsSync(OSASCRIPT)) {
   bail(`找不到 osascript（${OSASCRIPT}）；请手动运行: ${PANEL_BIN}`);
 }
 
-// Ghostty 的 `command` 是单个命令字符串，交给 shell 执行。面板路径与参数各自加引号，
-// 保证路径里有空格也不会被拆开。
+// Ghostty 的 `command` **不是交给 shell 的一行脚本**：它自己先做「变量展开 + 按引号拆词」，
+// 再把拆出来的 argv 重新逐个加单引号，拼成 `login -flp <user> /bin/bash --noprofile --norc -c
+// "exec -l 'argv0' 'argv1' …"` 执行（2026-08-13 从进程表实测得到）。后果有两条：
+//   - `>` 重定向、`;` 串联通通不生效——它们只会变成某个 argv 的字面内容；
+//   - 无引号 / 双引号里的 `$…` 在拆词阶段就被 Ghostty 展开掉了。
+// 所以路径与参数各自加引号只是为了拆词正确，不要指望任何 shell 语法。
 //
 // 用 process.execPath 显式指定 node，而不是靠面板脚本的 `#!/usr/bin/env node`：分屏继承的是
 // Ghostty 的登录环境，pyenv/nvm 装的 node 不在那份 PATH 里，直接跑会 `env: node: No such file`
@@ -208,7 +205,30 @@ if (!fs.existsSync(OSASCRIPT)) {
 const quoteArg = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
 // 比例交给面板自己收敛：只有跑在分屏里的进程读得到分屏的列数，才能把像素换算成列。
 const ratioArgs = ratio > 0 && !panelArgs.includes("--target-ratio") ? ["--target-ratio", String(ratio)] : [];
-const cmd = [process.execPath, PANEL_BIN, ...panelArgs, ...ratioArgs].map(quoteArg).join(" ");
+const panelArgv = [process.execPath, PANEL_BIN, ...panelArgs, ...ratioArgs];
+
+// —— 分屏的收尾：面板退出后立刻把 surface 关掉 ——
+//
+// Ghostty 1.3.1 不会自己关：命令 exit 0 之后 surface 照样留着，显示
+// "Process exited. Press any key to close the terminal."，还要用户手动敲一下键（实测
+// `wait after command = false` 对 AppleScript 建出来的 split 无效）。所以在命令串末尾补一步。
+//
+// 三处形式都是实测逼出来的，改动前先看 tests/test-cc-fleet-panel-open.sh 的对应断言：
+//   1. 串联要生效必须显式 `/bin/sh -c`——Ghostty 自己不解释 `;`；
+//   2. 这层脚本必须用**单引号**包：Ghostty 会展开双引号里的 `$`，`$?` 会在拆词阶段就被吃成 0，
+//      helper 便永远看不到面板的真实退出码；单引号内不展开，`$?` 才能原样留给 sh；
+//   3. 于是脚本**内部**改用双引号引用各参数，不与外层单引号打架。
+// 用 `;` 而不是 `&&`：面板异常退出（甚至根本没跑起来）时也要走到这一步——helper 看 `$?`，
+// 非 0 就**保留**分屏让人看报错，而不是把故障现场一起关掉。
+// nonce 是归属凭证：helper 拿它跟状态文件里的记录比对，对不上就绝不动那个 surface。
+const dq = (s) => `"${String(s).replace(/(["\\$`])/g, "\\$1")}"`;
+const nonce = crypto.randomUUID();
+const script = `${panelArgv.map(dq).join(" ")}; ${[process.execPath, CLOSE_SURFACE_BIN, "--nonce", nonce, "--rc"].map(dq).join(" ")} "$?"`;
+// 参数里真出现单引号就会把外层单引号截断，而 Ghostty 的拆词器没有 POSIX 的 `'\''` 语义。
+// 这在实际路径 / RQ 号里几乎不可能出现；万一出现，宁可退回"分屏不自动关"，也不能让面板开不出来。
+const wrapped = closeSplit && !script.includes("'");
+if (closeSplit && !wrapped) note("⚠ 命令里含单引号，退回不自动关分屏的启动方式（面板退出后需手动关）。");
+const cmd = wrapped ? `/bin/sh -c '${script}'` : panelArgv.map(quoteArg).join(" ");
 const cwd = process.env.CC_FLEET_PANEL_CWD || process.cwd();
 
 const envBlob = ENV_PASSTHROUGH
@@ -226,6 +246,9 @@ jobsLib.writePanelState({
   direction,
   command: cmd,
   cwd,
+  // helper 只认这条 nonce：状态文件是全局共享的，没有它就无法证明"这块 surface 是本次开的"，
+  // 万一记录过期就会去关用户自己的终端。
+  nonce: wrapped ? nonce : "",
   openedAt: Math.floor(Date.now() / 1000),
 });
 note(`✅ Codex 面板已在 Ghostty ${direction} 侧分屏拉起（terminal ${res.out}）。`);

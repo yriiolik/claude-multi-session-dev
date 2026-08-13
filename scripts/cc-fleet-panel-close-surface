@@ -1,0 +1,91 @@
+#!/usr/bin/env node
+// cc-fleet-panel-close-surface — 面板退出后，把它所在的 Ghostty 分屏真正关掉。
+//
+// 为什么需要它：Ghostty 1.3.1 不会在分屏里的命令退出后收掉 surface（`wait after command = false`
+// 对 AppleScript 建出来的 split 无效，2026-08-13 实测），面板收工后只会留下一块
+// "Process exited. Press any key to close the terminal."，要用户手动敲键才消失。
+//
+// 为什么挂在**命令串尾部**而不是写在面板进程里：这样所有退出路径都覆盖得到——正常自动收工、
+// 按 q 退出、被 `--close` SIGTERM、甚至面板压根没启动起来（分屏的 PATH 里没有 node 之类）。
+// 面板进程自己关不了「自己没跑起来」的那种情况。
+//
+// 两条安全线（宁可留着分屏，也绝不误关用户的终端）：
+//   1. **退出码非 0 就不关**。面板异常退出时分屏里往往是唯一的现场（报错信息在图形界面上
+//      别处看不到），关掉等于把故障吞了。这类分屏保持 Ghostty 原样，用户敲一下键即可。
+//   2. **nonce 必须对得上**。terminal id 是从共享状态文件里读的，只有 `cc-fleet-panel-open`
+//      本次写进去的 nonce 与命令行传入的一致，才能证明那条记录就是本次分屏。
+//
+// 尽力而为：任何情况都退出 0。它是分屏命令串的最后一环，非 0 退出码只会让 Ghostty 觉得
+// 「命令异常结束」，反过来又把分屏留在屏幕上。
+
+"use strict";
+
+const jobsLib = require("./lib/codex-app-jobs.js");
+
+const opt = { nonce: "", terminal: "", rc: 0, quiet: false };
+
+function usage() {
+  console.error(`cc-fleet-panel-close-surface — 关掉面板所在的 Ghostty 分屏
+
+用法:
+  cc-fleet-panel-close-surface --nonce <nonce> [--rc <面板退出码>]
+  cc-fleet-panel-close-surface --terminal <terminal-id>   # 直接指定，跳过 nonce 校验
+
+选项:
+  --nonce N      只有与状态文件里记录的 nonce 一致才关（cc-fleet-panel-open 写入）
+  --terminal ID  直接关这个 surface（自己知道 id 时用）
+  --rc N         面板的退出码；非 0 时保留分屏供排查（默认 0）
+  --quiet        不打印提示
+
+环境变量:
+  CC_FLEET_PANEL_CLOSE_SPLIT=0   永远不自动关分屏（保持 Ghostty 原生行为）`);
+}
+
+for (let i = 2; i < process.argv.length; i++) {
+  const a = process.argv[i];
+  if (a === "--nonce") opt.nonce = process.argv[++i] || "";
+  else if (a === "--terminal") opt.terminal = process.argv[++i] || "";
+  else if (a === "--rc") opt.rc = Number(process.argv[++i]) || 0;
+  else if (a === "--quiet") opt.quiet = true;
+  else if (a === "-h" || a === "--help") { usage(); process.exit(0); }
+  else { console.error(`unknown flag: ${a}`); usage(); process.exit(0); }
+}
+
+function note(msg) {
+  if (!opt.quiet) console.error(msg);
+}
+
+if (process.env.CC_FLEET_PANEL_CLOSE_SPLIT === "0") {
+  note("CC_FLEET_PANEL_CLOSE_SPLIT=0：保留分屏，不自动关闭。");
+  process.exit(0);
+}
+
+// 安全线 1：异常退出留现场
+if (opt.rc !== 0) {
+  note(`⚠ 面板以退出码 ${opt.rc} 结束，保留分屏供排查（看完按任意键关闭）。`);
+  process.exit(0);
+}
+
+const state = jobsLib.readPanelState();
+const terminalId = opt.terminal || state.terminalId;
+if (!terminalId) {
+  note("状态文件里没有分屏 id，无需关闭。");
+  process.exit(0);
+}
+
+// 安全线 2：nonce 校验（--terminal 是显式指定，视为调用方自己负责）
+const matched = opt.terminal ? true : Boolean(opt.nonce) && state.nonce === opt.nonce;
+if (!matched) {
+  note(`状态文件记录的分屏不是本次面板（nonce 不匹配），不关闭 ${terminalId}。`);
+  process.exit(0);
+}
+
+const res = jobsLib.closeGhosttySurface(terminalId);
+if (!res.ok) {
+  note(`关闭分屏 ${terminalId} 失败: ${res.err}`);
+  process.exit(0);
+}
+// 状态文件描述的就是刚关掉的这块分屏，留着只会让下一次 `--close` 去关一个不存在的 surface。
+if (!opt.terminal) jobsLib.writePanelState({});
+note(`分屏 ${terminalId}: ${res.out}`);
+process.exit(0);

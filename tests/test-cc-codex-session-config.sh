@@ -20,7 +20,10 @@ OUT="$(CODEX_HOME="$TMP/home" "$CONFIG" init 2>&1)"; RC=$?
 [ "$RC" -eq 0 ] && ok || fail "init rc=$RC $OUT"
 [ "$(stat -f '%Lp' "$TMP/home/multi-session-dev.json" 2>/dev/null || stat -c '%a' "$TMP/home/multi-session-dev.json")" = "600" ] && ok || fail "配置权限不是 600"
 OUT="$(CODEX_HOME="$TMP/home" "$CONFIG" select deepseek-flash 2>&1)"; RC=$?
-[ "$RC" -eq 0 ] && [ "$OUT" = "active=deepseek-flash" ] && ok || fail "select rc=$RC $OUT"
+[ "$RC" -eq 0 ] && printf '%s' "$OUT" | grep -q '已激活路由: deepseek-flash' && ok || fail "select rc=$RC $OUT"
+printf '%s' "$OUT" | grep -q 'model: deepseek-v4-flash' && ok || fail "select 未显示模型: $OUT"
+printf '%s' "$OUT" | grep -q 'reasoningEffort: high' && ok || fail "select 未显示思考强度: $OUT"
+printf '%s' "$OUT" | grep -q 'thinking: enabled' && ok || fail "select 未显示思考状态: $OUT"
 OUT="$(CODEX_HOME="$TMP/home" DEEPSEEK_API_KEY=secret "$CONFIG" resolve --json 2>&1)"
 node -e 'const x=JSON.parse(process.argv[1]);if(x.modelProvider!=="deepseek"||x.model!=="deepseek-v4-flash"||x.reasoningEffort!=="high"||x.authEnv!=="DEEPSEEK_API_KEY"||x.authEnvSet!==true)process.exit(1)' "$OUT"
 [ "$?" -eq 0 ] && ok || fail "resolve 内容不对: $OUT"

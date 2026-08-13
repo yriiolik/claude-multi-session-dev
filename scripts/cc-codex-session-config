@@ -4,14 +4,17 @@
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const readline = require("readline");
 
 const codexHome = process.env.CODEX_HOME || path.join(process.env.HOME || os.homedir(), ".codex");
 const configPath = process.env.CODEX_MULTI_SESSION_CONFIG || path.join(codexHome, "multi-session-dev.json");
-const command = process.argv[2] || "resolve";
+const command = process.argv[2] || "interactive";
 const args = process.argv.slice(3);
 
 function usage() {
-  console.error(`cc-codex-session-config <command>
+  console.error(`cc-codex-session-config
+  (no arguments)        interactively select and activate a route
+  cc-codex-session-config <command>
   resolve [--json|--tsv]  resolve the active target (default: JSON)
   show                  print the config with no secret values
   validate              validate the config and active target
@@ -19,6 +22,19 @@ function usage() {
   select <target>       atomically change the active target
   path                  print the config path
   template              print a starter JSON document`);
+}
+
+function printCore(name, target) {
+  const field = (value, fallback = "<none>") => value == null || value === "" ? fallback : value;
+  console.log(`✅ 已激活路由: ${name}`);
+  console.log(`  mode: ${field(target.mode)}`);
+  console.log(`  modelProvider: ${field(target.modelProvider, "<inherit>")}`);
+  console.log(`  model: ${field(target.model, "<inherit>")}`);
+  console.log(`  reasoningEffort: ${field(target.reasoningEffort, "<inherit>")}`);
+  console.log(`  thinking: ${target.reasoningEffort ? "enabled" : "<inherit>"}`);
+  console.log(`  providerType: ${field(target.providerType, "<inherit>")}`);
+  console.log(`  authEnv: ${field(target.authEnv, "<provider config>")}`);
+  if (target.description) console.log(`  description: ${target.description}`);
 }
 
 function starter() {
@@ -133,8 +149,75 @@ function writeAtomic(document, { exclusive = false } = {}) {
   fs.chmodSync(configPath, 0o600);
 }
 
+function interactiveSelect() {
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    throw new Error("无参数模式需要交互式终端；脚本调用请使用 select <target>");
+  }
+  const loaded = load({ allowMissing: false });
+  const names = Object.keys(loaded.document.targets);
+  let index = Math.max(0, names.indexOf(loaded.document.active));
+  let closed = false;
+
+  readline.emitKeypressEvents(process.stdin);
+  process.stdin.setRawMode(true);
+  process.stdin.resume();
+  process.stdout.write("\x1b[?25l");
+
+  const render = () => {
+    process.stdout.write("\x1b[2J\x1b[H");
+    console.log("选择要激活的 Codex 路由（↑/↓ 移动，Enter 确认，Esc 取消）\n");
+    names.forEach((name, itemIndex) => {
+      const pointer = itemIndex === index ? "❯" : " ";
+      const active = name === loaded.document.active ? "  [当前]" : "";
+      console.log(`${pointer} ${name}${active}`);
+    });
+  };
+
+  const cleanup = () => {
+    if (closed) return;
+    closed = true;
+    process.stdin.removeListener("keypress", onKeypress);
+    process.stdin.setRawMode(false);
+    process.stdin.pause();
+    process.stdout.write("\x1b[?25h\x1b[2J\x1b[H");
+  };
+
+  const onKeypress = (_input, key = {}) => {
+    if (key.name === "up") {
+      index = (index - 1 + names.length) % names.length;
+      render();
+    } else if (key.name === "down") {
+      index = (index + 1) % names.length;
+      render();
+    } else if (key.name === "return") {
+      const name = names[index];
+      try {
+        if (loaded.document.active !== name) {
+          loaded.document.active = name;
+          writeAtomic(loaded.document);
+        }
+        cleanup();
+        printCore(name, loaded.document.targets[name]);
+      } catch (error) {
+        cleanup();
+        console.error(`❌ ${error.message || error}`);
+        process.exitCode = 2;
+      }
+    } else if (key.name === "escape" || (key.ctrl && key.name === "c")) {
+      cleanup();
+      console.log("已取消，路由未更改。");
+      process.exitCode = key.ctrl ? 130 : 0;
+    }
+  };
+
+  process.stdin.on("keypress", onKeypress);
+  render();
+}
+
 try {
-  if (command === "path") {
+  if (command === "interactive") {
+    interactiveSelect();
+  } else if (command === "path") {
     console.log(configPath);
   } else if (command === "template") {
     console.log(JSON.stringify(starter(), null, 2));
@@ -148,7 +231,7 @@ try {
     if (!loaded.document.targets[name]) throw new Error(`unknown target: ${name}`);
     loaded.document.active = name;
     writeAtomic(loaded.document);
-    console.log(`active=${name}`);
+    printCore(name, loaded.document.targets[name]);
   } else if (command === "show") {
     const loaded = load();
     console.log(JSON.stringify({ configPath, configExists: loaded.exists, ...loaded.document }, null, 2));

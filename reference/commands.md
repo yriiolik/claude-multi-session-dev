@@ -114,6 +114,7 @@ Codex worker 是 app-server 里的 thread，**永远不会出现在 `claude agen
 cc-fleet-panel-codex-app                 # 手动开（全局）
 cc-fleet-panel-codex-app --rq "$RQ"      # 只看一个 RQ
 cc-fleet-panel-open                      # 手动分屏拉起（幂等，已开则复用）
+cc-fleet-panel-open --ratio 0.25         # 面板占原面板 1/4 宽（默认 0.33；0=Ghostty 原生对半）
 cc-fleet-panel-open --close              # 手动关掉面板与分屏
 cc-fleet-panel-register --list           # 看注册表里有哪些协调目录
 ```

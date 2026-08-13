@@ -286,6 +286,33 @@ OUT="$(run_panel --once --plain --keys "$(keys_to done-mod)")"
 assert_contains "$OUT" "库存模块已完成" "详情摊开回执正文"
 assert_contains "$OUT" "已合回集成分支" "回执正文完整展示（不止首行）"
 
+# ---------------------------------------------------------------- 分屏比例换算
+CASE="分屏比例换算"
+OUT="$(node -e '
+const L=require(process.argv[1]+"/scripts/lib/codex-app-jobs.js");
+const out=[];
+// 刚 split 出来是对半：当前 100 列 ⇒ 源面板 200 列，目标 1/3 ≈ 66 列，要缩 34 列
+const a=L.planSplitResize({currentCols:100,ratio:1/3});
+out.push(["a",a.totalCols,a.targetCols,a.deltaCols,a.direction,a.done].join("|"));
+// 右侧面板变窄 = 把左边界往右推
+const b=L.planSplitResize({currentCols:100,ratio:0.7,totalCols:200});
+out.push(["b",b.targetCols,b.direction,b.done].join("|"));
+// 已经到位就别再动（避免来回抖）
+const c=L.planSplitResize({currentCols:66,ratio:1/3,totalCols:200});
+out.push(["c",c.done].join("|"));
+// 像素 = 列差 × 每列像素；每列像素由上一轮实测反推
+const d=L.planSplitResize({currentCols:100,ratio:0.5,totalCols:150,pxPerCol:12});
+out.push(["d",d.deltaCols,d.pixels].join("|"));
+// 再小也要留出可读宽度
+const e=L.planSplitResize({currentCols:100,ratio:0.01,totalCols:200});
+out.push(["e",e.targetCols].join("|"));
+console.log(out.join("\n"));' "$ROOT")"
+assert_contains "$OUT" "a|200|67|33|right|false" "对半推总宽、算目标列、算方向"
+assert_contains "$OUT" "b|140|left|false"        "要变宽时方向相反"
+assert_contains "$OUT" "c|true"                  "已到位就不再发 resize"
+assert_contains "$OUT" "d|25|300"                "像素按实测的每列像素换算"
+assert_contains "$OUT" "e|20"                    "比例过小时仍保底 20 列"
+
 # ---------------------------------------------------------------- 边界
 CASE="空注册表"
 OUT="$(HOME="$HOME_DIR" CC_FLEET_PANEL_REGISTRY="$TMP/none.json" "$PANEL" --once --plain 2>&1)"

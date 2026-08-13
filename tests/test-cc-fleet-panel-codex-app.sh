@@ -211,6 +211,51 @@ assert_eq "$(bucket_of "$OUT" running-mod)" "pending" "状态未定的老 worker
 sed -i '' "s/^started_at=.*/started_at=$(( $(now) - 600 ))/" "$COORD/done-mod.codex-app.env" "$COORD/running-mod.codex-app.env"
 touch "$COORD/done-mod.summary.md" "$COORD/done-mod.codex-app.env" "$COORD/running-mod.codex-app.env"
 
+# ---------------------------------------------------------------- 耗时口径
+# 时间列回答的是"这个 worker 干了多久"，不是"派发到现在过了多久"——后者对已收工的 worker 会一直
+# 往上涨，昨天派的写成 20h，看不出它其实只跑了几分钟。元数据里没有结束时间（thread 收工时没人
+# 往磁盘写），所以拿最后一次真实活动来算：回执 mtime > rollout mtime > meta mtime。
+CASE="耗时口径"
+assert_near(){ # $1=实得 $2=期望 $3=容差 $4=说明
+  local d=$(( $1 - $2 )); d=${d#-}
+  [[ $d -le $3 ]] && ok || fail "$4: 期望 ≈$2（±$3）实得 $1"
+}
+set_mtime(){ touch -t "$(date -r "$2" +%Y%m%d%H%M.%S)" "$1"; }
+
+NOW="$(now)"
+# 已回执：600 秒前派发，300 秒前落的回执 → 实际跑了 300 秒，而不是 600
+sed -i '' "s/^started_at=.*/started_at=$(( NOW - 600 ))/" "$COORD/done-mod.codex-app.env"
+set_mtime "$COORD/done-mod.summary.md" "$(( NOW - 300 ))"
+# meta 被编排者写过（status 脚本会往里追加 detail），mtime 比回执新——它不能算 worker 在干活
+touch "$COORD/done-mod.codex-app.env"
+OUT="$(run_panel --json)"
+assert_near "$(J "$OUT" '(j.jobs.find(x=>x.module==="done-mod")||{}).elapsed_sec')" 300 5 "已收工的显示实际执行耗时"
+assert_near "$(J "$OUT" '(j.jobs.find(x=>x.module==="done-mod")||{}).ended_at')" "$(( NOW - 300 ))" 5 "结束时间取回执落盘那一刻"
+
+# 还在跑：没有结束时间，耗时一直算到现在
+assert_eq "$(J "$OUT" '(j.jobs.find(x=>x.module==="running-mod")||{}).ended_at')" "0" "执行中的没有结束时间"
+assert_near "$(J "$OUT" '(j.jobs.find(x=>x.module==="running-mod")||{}).elapsed_sec')" 600 5 "执行中的算到此刻为止"
+
+# 需核验（idle 但没落回执）：没有回执可用，退回 rollout 日志的最后写入时间
+sed -i '' "s/^started_at=.*/started_at=$(( NOW - 600 ))/" "$COORD/idle-mod.codex-app.env"
+ROLL_IDLE="$CODEX/sessions/2026/08/13/rollout-2026-08-13T10-00-00-t-idle.jsonl"
+echo '{"type":"event_msg","payload":{"type":"agent_message","message":"我先跑到这里"}}' > "$ROLL_IDLE"
+set_mtime "$ROLL_IDLE" "$(( NOW - 120 ))"
+touch "$COORD/idle-mod.codex-app.env"   # meta 更新，同样不该被优先采信
+OUT="$(run_panel --json)"
+assert_near "$(J "$OUT" '(j.jobs.find(x=>x.module==="idle-mod")||{}).elapsed_sec')" 480 5 "没有回执时按 rollout 最后活动算耗时"
+assert_near "$(J "$OUT" '(j.jobs.find(x=>x.module==="idle-mod")||{}).ended_at')" "$(( NOW - 120 ))" 5 "结束时间取 rollout 最后写入时刻"
+
+# 详情页把两头摊开，免得一个数字分不清"跑了多久"和"什么时候跑的"
+DETAIL_IDX="$(J "$OUT" "j.jobs.findIndex(x=>x.module==='done-mod')")"
+KEYS="$(printf 'down,%.0s' $(seq 1 "$DETAIL_IDX"))right"
+OUT="$(run_panel --once --plain --keys "$KEYS")"
+assert_contains "$OUT" "耗时   5m" "详情页显示耗时"
+assert_contains "$OUT" "→" "详情页把开始/结束两头都摊开"
+
+set_mtime "$COORD/done-mod.summary.md" "$NOW"
+rm -f "$ROLL_IDLE"
+
 # ---------------------------------------------------------------- 渲染
 CASE="渲染"
 OUT="$(run_panel --once --plain)"

@@ -224,15 +224,53 @@ function fmtAge(sec) {
   return `${Math.floor(sec / 86400)}d`;
 }
 
+function mtimeOf(file) {
+  try {
+    return Math.floor(fs.statSync(file).mtimeMs / 1000);
+  } catch {
+    return 0;
+  }
+}
+
+function fmtClock(sec) {
+  const d = new Date(sec * 1000);
+  const p = (n) => String(n).padStart(2, "0");
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
 function jobMtime(job) {
   let t = Number(job.started_at) || 0;
-  for (const f of [job.summary_file, job.meta]) {
-    try {
-      const st = fs.statSync(f);
-      t = Math.max(t, Math.floor(st.mtimeMs / 1000));
-    } catch {}
-  }
+  for (const f of [job.summary_file, job.meta]) t = Math.max(t, mtimeOf(f));
   return t;
+}
+
+// 时间列回答的是「这个 worker 干了多久」，不是「派发到现在过了多久」。后者对已收工的 worker
+// 会一直往上涨——昨天派的会写成 20h，看不出它其实只跑了 12 分钟。
+//
+// 麻烦在于 Codex 元数据里只有 started_at：worker 是 app-server 里的 thread，收工时没有任何人
+// 往磁盘写一笔"结束了"。所以拿**最后一次真实活动**当结束时间，按可信度排序：
+//   ① 回执文件 mtime —— 落回执就是交付时刻，最准；
+//   ② rollout 日志 mtime —— 还没落回执的终态 worker（需核验/失败/被停），它记录 worker 最后
+//      一次说话或跑命令的时间；
+//   ③ meta mtime —— 兜底。
+// 特意不把 meta mtime 排在前面：status 脚本会往 meta 追加 detail，那是**编排者**写的，
+// 不代表 worker 还在干活，用它算耗时会把等待验收的时间也算进去。
+function jobEndedAt(job) {
+  if (jobsLib.ACTIVE_STATES.has(job.state)) return 0; // 还在跑，没有结束时间
+  const started = Number(job.started_at) || 0;
+  const rf = rolloutFor(job);
+  const candidates = [job.receipt ? mtimeOf(job.summary_file) : 0, rf ? mtimeOf(rf) : 0, mtimeOf(job.meta)];
+  // 早于开始时间的一律不认（文件没被更新过时 mtime 可能就是创建时刻，甚至更早）
+  return candidates.find((t) => t && t >= started) || 0;
+}
+
+// 已收工 → 实际耗时；还在跑 → 到现在为止已经跑了多久。拿不到开始时间返回 -1，fmtAge 显示 "-"。
+// 结束时间在 collect() 里算好挂到 job 上：渲染要跟着标记动画每 130ms 重跑一遍，不能每帧去 stat 文件。
+function jobElapsed(job, now) {
+  const started = Number(job.started_at) || 0;
+  if (!started) return -1;
+  const ended = job.endedAt === undefined ? jobEndedAt(job) : job.endedAt;
+  return Math.max(0, (ended || now) - started);
 }
 
 // ---------------------------------------------------------------- 采集
@@ -339,6 +377,7 @@ function collect() {
       job.ts = job.ts || jobMtime(job);
       job.group = group;
       job.cls = classify(job);
+      job.endedAt = jobEndedAt(job);
       job.detail = liveDetail(job) || job.detail;
       // 组标题已经写了 RQ，行内只留模块名，把宽度让给 detail
       job.displayName = `↳${job.module}`;
@@ -487,6 +526,13 @@ function detailLines(job, width) {
   }
 
   lines.push(C.dim(`thread ${job.thread_id || job.id || "-"}`));
+  // 列表里只有一个耗时数字，容易分不清"跑了多久"和"什么时候跑的"，详情页把两头都摊开。
+  const startedAt = Number(job.started_at) || 0;
+  if (startedAt) {
+    const ended = job.endedAt === undefined ? jobEndedAt(job) : job.endedAt;
+    const span = `${fmtClock(startedAt)} → ${ended ? fmtClock(ended) : "进行中"}`;
+    lines.push(C.dim(`耗时   ${fmtAge(jobElapsed(job, Math.floor(Date.now() / 1000)))}（${span}）`));
+  }
   lines.push(C.dim(`模型   ${meta.provider || job.model_provider || "?"}/${meta.model || job.model || "?"}${(meta.effort || job.reasoning_effort) ? ` · effort=${meta.effort || job.reasoning_effort}` : ""}`));
   if (job.branch) lines.push(C.dim(`分支   ${job.branch}`));
   const wd = meta.workdir || job.worktree_cwd;
@@ -568,7 +614,7 @@ function renderList(model, ui) {
       const name = padTo(truncate(job.displayName, nameW), nameW);
       const label = padTo(job.cls.label, stateW);
       const detail = padTo(truncate(job.detail || "", detailW), detailW);
-      const age = padTo(fmtAge(model.now - (Number(job.started_at) || model.now)), ageW);
+      const age = padTo(fmtAge(jobElapsed(job, model.now)), ageW);
       if (selected) {
         // 选中行整行反色，配色必须按无色文本排版，ANSI 转义混进 padTo 会算多
         lines.push(C.sel(padTo(`   ${markChar(job, ui.frame)} ${name} ${label} ${detail} ${age}`, width)));
@@ -589,7 +635,7 @@ function renderDetail(model, ui) {
   const g = job.group;
   const head = [
     `${C.bold(job.displayName)} ${C.dim(`· ${g.title} · ${g.rq}`)}`,
-    `${C[job.cls.tone](job.cls.label)} ${C.dim(fmtAge(model.now - (Number(job.started_at) || model.now)))} ${C.dim(truncate(job.detail || "", ui.width - 20))}`,
+    `${C[job.cls.tone](job.cls.label)} ${C.dim(fmtAge(jobElapsed(job, model.now)))} ${C.dim(truncate(job.detail || "", ui.width - 20))}`,
     "",
   ];
   const body = ui.detailLines || [C.dim("加载中…")];
@@ -845,6 +891,10 @@ if (opt.json) {
       receipt: j.receipt ? 1 : 0,
       thread_id: j.thread_id || j.id || "",
       detail: j.detail || "",
+      // 已收工的是实际执行耗时，还在跑的是"到现在为止"；ended_at=0 表示尚未结束
+      started_at: Number(j.started_at) || 0,
+      ended_at: j.endedAt || 0,
+      elapsed_sec: jobElapsed(j, model.now),
     })),
   }, null, 2));
   process.exit(0);

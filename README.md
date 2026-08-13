@@ -24,7 +24,10 @@ git clone git@github.com:yriiolik/claude-multi-session-dev.git ~/.claude/skills/
 
 取名 hook `~/.claude/hooks/auto-cn-title.sh` 与本技能**双向耦合**：
 - 本仓库 `tests/test-auto-cn-title.sh` 端到端测试该 hook；
-- 该 hook 依据 `⟦FLEET-WORKER⟧` 哨兵 / `FLEET_ROLE` 环境变量给 worker session 命名，并回调本仓库的 `scripts/cc-fleet-fix-display`。
+- 该 hook 依据 `⟦FLEET-WORKER⟧` 哨兵 / `FLEET_ROLE` 环境变量给 worker session 命名，并回调本仓库的 `scripts/cc-fleet-fix-display`（SessionStart 全局 sweep）与 `scripts/cc-fleet-name-guard`（state.json 还没出生时，把"等它出生再写名字"交给后台守护）。
+
+> 跑该 hook 的测试时可用 `AUTO_CN_TITLE_HOOK=<候选版本路径> bash tests/test-auto-cn-title.sh` 指向改造中的副本，
+> 验证通过再覆盖真实 hook——别拿线上那份当草稿纸。
 
 但 `auto-cn-title.sh` 是一个**通用取名 hook**（fleet 识别只是其中一部分），且位于技能目录之外，故**未纳入本仓库**。改动该 hook 时需自行同步，本仓库的 fleet 逻辑变更若牵动 worker 命名契约，务必一并核对该 hook。
 

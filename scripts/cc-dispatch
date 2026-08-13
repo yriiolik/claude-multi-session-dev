@@ -14,6 +14,11 @@
 #   --timeout-ms <N>         daemon 派发超时（默认 10000）
 #   --json                   输出 daemon 返回的原始 JSON
 #
+# 副作用（best-effort，不影响派发结果）:
+#   派发成功后自动拉起 `cc-fleet-name-guard --detach` 守住 FleetView 显示名——CC 2.1.231 起内建了
+#   LLM 自动取名器，会抢在我们之前把 job 的 `.name` 填成英文短语、把 `↳<module>@<RQ>` 顶掉
+#   （根因详见 cc-fleet-name-guard 头注释）。设 CC_FLEET_NAME_GUARD=0 可关闭。
+#
 # 退出码:
 #   0  派发成功
 #   2  daemon 不可达（未启动 / socket 找不到）—— 调用方应回退到手动派发
@@ -209,6 +214,12 @@ if ($parsed->{ok}) {
       warn "⚠ 无法写 --sid-file $opt_sid_file: $!（不影响派发，但 cc-fleet-status 将退回 name 关联）\n";
     }
   }
+  # 抢名守护（2.1.231「内建自动命名器把 ↳ 名换成英文短语」的根治，见 cc-fleet-name-guard 头注释）：
+  # daemon 对 source=fleet 的派发【不落 state.json 种子】，state.json 是 worker 自己起来后才建的；
+  # CC 内建 LLM 取名器会在那之后几秒抢先把 .name 填成 "2-4 word lowercase label"，`↳` 前缀就此丢失。
+  # 这里 fire-and-forget 一个脱离后台的守护，盯着 state.json 一出生就把 ↳名写进去（它一旦非空，
+  # 内建取名器就永久让位）。纯 best-effort：脚本缺失/失败一律不影响派发结果。
+  name_guard($parsed->{short} // $short, $opt_name);
   exit 0;
 }
 
@@ -230,6 +241,24 @@ warn "❌ daemon error: [$code] $err\n";
 exit 4;
 
 # --- helpers ---
+
+# name_guard —— 派发成功后拉起 cc-fleet-name-guard 守护 job 的 FleetView 显示名。
+# 只在同目录找得到该脚本时生效（脱离技能目录单独跑 cc-dispatch 时静默降级）。
+# CC_FLEET_NAME_GUARD=0 可关掉（测试用）；窗口默认 90s，够覆盖 worktree 建树 + 首轮回答。
+sub name_guard {
+  my ($short, $name) = @_;
+  return unless defined $short && length $short;
+  return unless defined $name  && length $name;
+  return if defined $ENV{CC_FLEET_NAME_GUARD} && $ENV{CC_FLEET_NAME_GUARD} eq '0';
+  (my $self_dir = $0) =~ s{/[^/]+$}{};
+  $self_dir = '.' unless length $self_dir;
+  my $bin = "$self_dir/cc-fleet-name-guard";
+  return unless -x $bin;
+  my @args = ($bin, '--short', $short, '--name', $name, '--detach', '--quiet');
+  push @args, ('--jobs-root', $ENV{CC_FLEET_JOBS_ROOT}) if $ENV{CC_FLEET_JOBS_ROOT};
+  system { $args[0] } @args;
+  return;
+}
 
 # reuse_guard —— 调用同目录 cc-fleet-coord --check-join 拦"复用别任务 RQ"。
 # coord = --sid-file 的父目录；module = 文件名去掉 .sid。它 exit 6 → 本进程同样 exit 6（停在派发前）。

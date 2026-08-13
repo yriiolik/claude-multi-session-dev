@@ -102,9 +102,9 @@ check "A 其它字段保留（detail 不丢）"   "A 完成"        "$(field aaa
 check "B name 不变"                    "↳moduleB@RQ-2026-0622-099" "$(field bbb22222 .name)"
 check "B createdAt 不变"               "$T_START"     "$(field bbb22222 .createdAt)"
 
-# D：运行中绝不碰
-check "D（running）name 仍 ∅（未被碰）" "∅"            "$(field ddd44444 .name)"
-check "D（running）createdAt 仍塌缩"    "$T_COLLAPSE"  "$(field ddd44444 .createdAt)"
+# D：运行中——只补名字（2.1.231 抢名故障就发生在运行中），时间戳绝不碰
+check "D（running）name 被补上"         "↳moduleD@$RQ" "$(field ddd44444 .name)"
+check "D（running）createdAt 仍塌缩（时间戳不碰）" "$T_COLLAPSE"  "$(field ddd44444 .createdAt)"
 
 # E：靠 sessionId 定位也能修
 check "E（sid定位）name → ↳moduleE@$RQ" "↳moduleE@$RQ" "$(field zzz99999 .name)"

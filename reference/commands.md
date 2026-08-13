@@ -207,8 +207,14 @@ cc-fleet-land <RQ>
 
 ## 显示自愈
 
-`cc-fleet-fix-display <RQ>` / `--all` — 修已完成 worker 在 FleetView 里名字退化成 `bg`、时长退化成 `0s`。
-watch/summary 已自动调用，主会话 SessionStart 也会 `--all` 兜底，通常无需手动。根因见 `fleet-display.md`。
+`cc-fleet-fix-display <RQ>` / `--all` — 修 FleetView 显示退化三类：名字变 `bg`、时长变 `0s`（已完成 worker）、
+**名字丢 `↳` 变英文短语**（运行中就会发生，CC 2.1.231+ 内建自动取名器抢名）。运行中的 job 只补名字、不动时间戳。
+watch/summary 已自动调用，主会话 SessionStart 也会 `--all` 兜底，通常无需手动。
+
+`cc-fleet-name-guard --short <8hex>|--job-dir <DIR> --name <NAME> [--detach]` — **事前**守住 job 的显示名，
+盯着 `state.json` 一出生就把期望名写进 `.name`，抢在内建自动取名器前面。`cc-dispatch` 派发成功后自动拉起
+（`CC_FLEET_NAME_GUARD=0` 关闭），取名 hook 也会在 state.json 缺失时拉起，**正常流程无需手动跑**。
+两者根因与分层见 `fleet-display.md`。
 
 ## Codex 后端维护（一般不用手动跑）
 

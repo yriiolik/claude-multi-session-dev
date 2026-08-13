@@ -397,7 +397,11 @@ Codex 后端把命令换成 `-codex-app` 后缀（见 `reference/codex-mode.md`�
 
 取名 hook（`~/.claude/hooks/auto-cn-title.sh`）检测到任一信号即判定 worker，把标题设成 `↳…`；主 session 走正常中文
 标题。三重信号是冗余设计：`--name`/`--env` 由派发脚本自动带，哨兵由 preamble 首行带，任一在身份就成立。
-worker 显示名/时长会自愈（完整根因与三层修复、回归用例见 **`reference/fleet-display.md`**），无需人工。
+worker 显示名/时长会自愈（完整根因与修复分层、回归用例见 **`reference/fleet-display.md`**），无需人工。
+
+> ⚠ **FleetView 列表显示的不是会话标题，而是 `~/.claude/jobs/<short>/state.json` 的 `.name`**。CC 2.1.231 起
+> 内建了 LLM 自动取名器会去抢这个字段（把 `↳<module>@<RQ>` 换成英文小写短语），`cc-dispatch` 因此在派发后
+> 自动拉起 `cc-fleet-name-guard` 抢占该字段。**新写任何派发路径时别忘了这一步**，否则子 session 会丢 `↳` 标识。
 
 ## 失效降级
 

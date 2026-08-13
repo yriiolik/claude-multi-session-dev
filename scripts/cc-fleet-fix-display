@@ -1,5 +1,21 @@
 #!/usr/bin/env bash
-# cc-fleet-fix-display — 修复【已完成 worker 在 FleetView 里名字显示成 "bg"、时长显示成 "0s"】的显示退化。
+# cc-fleet-fix-display — 修复 worker 在 FleetView 里的显示退化，共三类：
+#   A. 名字显示成 "bg"          （已完成 worker，`.name` 被 daemon 抹空）
+#   B. 时长显示成 "0s"          （已完成 worker，时间戳被塌缩成同一瞬间）
+#   C. 名字丢了 `↳` 变英文短语   （2.1.231+ 内建 LLM 自动取名器抢名，运行中就发生）
+#
+# ── C 类（2026-08-13 实测，cli 2.1.231）────────────────────────────────────────
+#   现象：运行中的 worker 在 FleetView 里叫 "fleet warehouse config" 之类的英文小写短语，
+#         `↳<module>@<RQ>` 前缀没了，主 session 一眼分不出哪些是子 session。
+#   根因：2.1.231 起 CC 内建 LLM 取名器（side-query `querySource:"agent_namer"`）会写
+#         `.name` + `.nameSource="auto"`；它只在写回前重读发现 `.name` 已非空时才让位。
+#         而 daemon 对 `source:"fleet"` 的派发不落 state.json 种子，取名 hook 在
+#         UserPromptSubmit 时刻 state.json 往往还没出生 → 我们输掉这场抢跑。
+#   正解是**抢在它前面**（`cc-fleet-name-guard`，由 cc-dispatch 派发后自动拉起）；本脚本是
+#         **事后兜底**：把已经被抢走的名字夺回来。C 类允许修【运行中】的 job（只改 name，
+#         绝不动运行中 job 的时间戳），A/B 两类仍只修终态。
+#
+# ── A/B 类（2026-06-22 实测，cli 2.1.185）──────────────────────────────────────
 #
 # 现象（2026-06-22 实测，cli 2.1.185）：被 cc-dispatch 派发的 worker【完成后】，FleetView「Completed」区
 #   名字列显示成字面量 "bg"、时间列显示成 "0s"。只影响【刚完成】的 worker；运行中的、以及更早完成的都正常。
@@ -13,11 +29,13 @@
 #   完成后这两个事件都不再触发，所以补不回来。daemon 是闭源二进制、改不了；这份完成态记录【写完即稳定】
 #   （updatedAt 此后不再变），所以在完成后用权威数据把它【修回去】就能稳稳生效——这就是本脚本干的事。
 #
-# 修法（幂等、原子、只动【已完成】的 worker、绝不碰运行中/普通会话）：
-#   · name        ← 名册/守护名得到的 `↳<module>@<RQ>`（FleetView 真正读的字段），并打 nameSource=user。
-#   · createdAt    ← 该 session transcript 里【首个】时间戳（worker 真实起点）。
-#   · firstTerminalAt / updatedAt ← transcript 里【最后一个】时间戳（worker 真实终点）。
-#   仅当确有可修项（name 缺失/不符，或时间戳塌缩）且能从 transcript 取到 首<末 的有效时间才落盘；否则跳过。
+# 修法（幂等、原子、绝不碰普通会话，运行中的 job 只改 name）：
+#   · name        ← 名册/哨兵得到的 `↳<module>@<RQ>`（FleetView 真正读的字段），并打 nameSource=user。
+#                   ⚠ 现名是用户 Ctrl+R 手改的（nameSource=user 且非 ↳ 形）→ 一律不覆盖。
+#   · createdAt    ← 该 session transcript 里【首个】时间戳（worker 真实起点）。【仅终态】
+#   · firstTerminalAt / updatedAt ← transcript 里【最后一个】时间戳（worker 真实终点）。【仅终态】
+#   仅当确有可修项（name 缺失/被抢/不符，或时间戳塌缩）且能从 transcript 取到 首<末 的有效时间才落盘；
+#   运行中的 job 落盘前再比一次 mtime（check-and-set），被 daemon 抢先写过就放弃本轮。
 #
 # 数据源 = cc-fleet-status <RQ> --json（单一事实源：复用其 SID 名册关联 / 候选协调目录 / gone 合成名，
 #   绝不在这里另起一套关联逻辑）。每个 roster 模块都能拿到 _module / name / sessionId / short / state，
@@ -36,8 +54,9 @@
 #      跟进 worker（如 schedule-unify-fix）没人再修 → 永远卡 bg/0s。
 #   ② 名册-cwd 盲区：per-RQ 靠 cc-fleet-status 从【编排者当前 cwd】解析 <git-common-dir>/fleet/<RQ>；
 #      worker 跑在【别的仓库路径】（如 /a/supply-agent vs /b/.../supply-agent）时解析不到那份名册 → 看不见。
-#   --all 绕开两者：按【每个 job 自己的 cwd】回溯【它自己的】git-common-dir/fleet/*/*.sid（sid 内容==sessionId
-#   → 模块名 + RQ），再兜底 transcript 的 ⟦FLEET-WORKER⟧ 哨兵。完全不依赖 RQ / 编排者 cwd / daemon。
+#   --all 绕开两者：身份来源按可靠度 ① state.json 自己的 `.intent` 首行 ⟦FLEET-WORKER⟧ 哨兵（最便宜最稳，
+#   不 fork git、不读别的文件）→ ② 按【每个 job 自己的 cwd】回溯它自己的 git-common-dir/fleet/*/*.sid
+#   （sid 内容==sessionId → 模块名 + RQ）→ ③ transcript 哨兵。完全不依赖 RQ / 编排者 cwd / daemon。
 #
 #   测试通道（绕过 daemon）:
 #   cc-fleet-fix-display <RQ> --mock-status F --jobs-root DIR
@@ -67,7 +86,7 @@ while [ $# -gt 0 ]; do
     --dry-run)       DRY=1; shift ;;
     --quiet)         QUIET=1; shift ;;
     -h|--help)
-      sed -n '2,44p' "$0"; exit 0 ;;
+      sed -n '2,64p' "$0"; exit 0 ;;
     -*) echo "未知参数: $1" >&2; exit 2 ;;
     *)  RQ="$1"; shift ;;
   esac
@@ -121,11 +140,28 @@ resolve_sentinel_name() {
   if [ -n "$rq" ]; then printf '↳%s@%s' "$mod" "$rq"; else printf '↳%s' "$mod"; fi
 }
 
+# ⭐最强身份来源：state.json 自己的 `.intent`——daemon 把 worker 的首条 prompt 原样存在这里，
+# 而 cc-dispatch 的 dispatch-preamble 首行恒为 `⟦FLEET-WORKER⟧ rq=… module=…`。
+# 比 sid 名册（要 git、要 job 的 cwd 还在）和 transcript（要 linkScanPath 有效）都便宜且稳：
+# 不碰磁盘上的别的文件、不 fork git、跨 worktree/跨仓库路径都成立。
+# 严格判定：只认【intent 首个非空行以哨兵开头】，避免正文里引用哨兵的普通会话被误判成 worker。
+resolve_intent_name() {
+  local intent="$1" sline rest rq mod
+  [ -n "$intent" ] || return 0
+  sline="$(printf '%s' "$intent" | awk '/[^[:space:]]/{sub(/^[[:space:]]+/,""); print; exit}' 2>/dev/null || true)"
+  case "$sline" in "⟦FLEET-WORKER⟧"*) : ;; *) return 0 ;; esac
+  rest="${sline#*FLEET-WORKER}"
+  rq="$(printf '%s' "$rest"  | grep -oE 'rq=[A-Za-z0-9_.-]+'     | head -1 | cut -d= -f2- || true)"
+  mod="$(printf '%s' "$rest" | grep -oE 'module=[A-Za-z0-9_.-]+' | head -1 | cut -d= -f2- || true)"
+  [ -n "$mod" ] || return 0
+  if [ -n "$rq" ]; then printf '↳%s@%s' "$mod" "$rq"; else printf '↳%s' "$mod"; fi
+}
+
 # 全局兜底：扫 $JOBS_ROOT/<short>/state.json，对【可识别为 fleet worker 且显示退化】的 job 合成
 # 一份与 cc-fleet-status 同构的 {jobs:[{_module,name,sessionId,short,state}]}，喂给下面同一套 apply 循环。
 # 只收【已退化】的（name 不是 ↳ 形 或 时间戳塌缩），健康的直接排除——既省事又让汇总只报真改的。
 build_all_jobs_json() {
-  local now cutoff sj dir cur sid cwd st name tmpl created term want
+  local now cutoff sj dir cur sid cwd st name nsrc tmpl created term intent want
   now="$(date +%s 2>/dev/null || echo 0)"
   cutoff=0
   [ "$MAXAGE" != 0 ] && [ "$now" != 0 ] && cutoff=$((now - MAXAGE * 3600))
@@ -136,28 +172,48 @@ build_all_jobs_json() {
     fi
     cur="$(cat "$sj" 2>/dev/null)"
     printf '%s' "$cur" | jq -e . >/dev/null 2>&1 || continue
-    # 只动终态——绝不碰运行中（避免与 daemon 并发写竞态）
     st="$(printf '%s' "$cur" | jq -r '.state // empty')"
-    case "$st" in running|working|starting|blocked) continue ;; esac
-    IFS=$'\t' read -r sid cwd name tmpl created term < <(printf '%s' "$cur" \
-      | jq -r '[(.sessionId//""),(.cwd//""),(.name//""),(.template//""),(.createdAt//""),(.firstTerminalAt//"")]|@tsv')
+    local running=0
+    case "$st" in running|working|starting|blocked) running=1 ;; esac
+    # ⚠ 不能用 @tsv + IFS=$'\t' read：制表符属于 IFS 空白，**连续分隔符会被折叠成一个**，
+    #   于是 name 为空时后面所有字段整体左移（实测把 template "bg" 读成了 name）。
+    #   改用 \x1f（单元分隔符，非 IFS 空白）→ 空字段如实保留。
+    IFS=$'\x1f' read -r sid cwd name nsrc tmpl created term < <(printf '%s' "$cur" \
+      | jq -r '[(.sessionId//""),(.cwd//""),(.name//""),(.nameSource//""),(.template//""),(.createdAt//""),(.firstTerminalAt//"")]|join("\u001f")')
+    intent="$(printf '%s' "$cur" | jq -r '.intent // empty')"
     dir="$(basename "$(dirname "$sj")")"
-    # 退化判据（只修用户实际抱怨的两种）：name 空（→ FleetView 回退显示 template "bg"）｜ 时间戳塌缩（→ "0s"）。
-    # 二者皆否 → 不碰（哪怕缺 ↳ 前缀也只是外观、非本 bug，不制造无谓 churn / 不动非 fleet 的普通会话）。
-    local name_bg=0 ts_bad=0
-    [ -z "$name" ] && name_bg=1
-    { [ -z "$term" ] || [ "$created" = "$term" ]; } && ts_bad=1
-    [ "$name_bg" = 1 ] || [ "$ts_bad" = 1 ] || continue
-    # 解析期望 ↳名：已是 ↳ 直接沿用；否则按【job 自己 cwd】查 sid 名册 → 兜底 transcript 哨兵。
-    # ⚠ 必须始终拿到 ↳ 前缀名才落盘——apply 循环对非 ↳ 名会用全局 $RQ 误拼，且拿不到 ↳ 名等于无法确认是 fleet
-    #   worker，宁可跳过也不乱碰（含 ts 坏但身份不明的普通会话）。
+
+    # 解析期望 ↳名（身份确认 = 拿得到 ↳名；拿不到就一律不碰）。来源按可靠度：
+    #   ① 现名已是 ↳ → 沿用  ② state.json 自己的 intent 哨兵（最便宜最稳）
+    #   ③ 按【job 自己 cwd】查 sid 名册    ④ transcript 哨兵
     if [ "${name#↳}" != "$name" ]; then
       want="$name"
     else
-      want="$(resolve_sid_name "$cwd" "$sid")"
+      want="$(resolve_intent_name "$intent")"
+      [ -n "$want" ] || want="$(resolve_sid_name "$cwd" "$sid")"
       [ -n "$want" ] || want="$(resolve_sentinel_name "$(printf '%s' "$cur" | jq -r '.linkScanPath // empty')")"
     fi
     case "$want" in ↳*) : ;; *) continue ;; esac
+
+    # 退化判据（三类，全都只在【确认是 fleet worker】后才判）：
+    #   A. name 空          → FleetView 回退显示 template "bg"     【仅终态】
+    #   B. 时间戳塌缩       → 时长显示 "0s"                        【仅终态】
+    #   C. 名字被抢         → 现名非 ↳ 且 nameSource != user       【终态 + 运行中都修】
+    #      C 是 2.1.231 内建 LLM 自动取名器造成的（详见 cc-fleet-name-guard 头注释）：它把 `.name`
+    #      写成英文短语 + nameSource=auto，`↳` 前缀丢失。此时 job 往往【正在运行】，所以这一类
+    #      必须放行运行中的 job——但只改 name，绝不动运行中 job 的时间戳。
+    #      nameSource=user 的现名是用户 Ctrl+R 手改的，一律不碰。
+    local name_bg=0 ts_bad=0 name_stolen=0
+    [ -z "$name" ] && name_bg=1
+    { [ -z "$term" ] || [ "$created" = "$term" ]; } && ts_bad=1
+    if [ -n "$name" ] && [ "${name#↳}" = "$name" ] && [ "$nsrc" != "user" ]; then name_stolen=1; fi
+    if [ "$running" = 1 ]; then
+      # 运行中：只处理名字类退化（A / C），时间戳是活会话的实时字段，一律不碰
+      { [ "$name_bg" = 1 ] || [ "$name_stolen" = 1 ]; } || continue
+    else
+      [ "$name_bg" = 1 ] || [ "$ts_bad" = 1 ] || [ "$name_stolen" = 1 ] || continue
+    fi
+
     local mod="${want#↳}"; mod="${mod%@*}"
     jq -nc --arg m "$mod" --arg n "$want" --arg s "$sid" --arg sh "$dir" --arg st "$st" \
       '{_module:$m, name:$n, sessionId:$s, short:$sh, state:$st}'
@@ -187,7 +243,7 @@ fixed=0
 scanned=0
 
 # 逐 job 处理：把 cc-fleet-status 的 jobs[] 压成 TSV（_module / name / sessionId / short / state）
-while IFS=$'\t' read -r mod name sid short jstate; do
+while IFS=$'\x1f' read -r mod name sid short jstate; do
   [ -z "${mod}${name}${sid}${short}" ] && continue
   scanned=$((scanned+1))
 
@@ -219,23 +275,30 @@ while IFS=$'\t' read -r mod name sid short jstate; do
   cur="$(cat "$sj" 2>/dev/null)"
   printf '%s' "$cur" | jq -e . >/dev/null 2>&1 || continue
 
-  # 只动【已完成/终态】的记录——绝不碰运行中的 session（避免与 daemon 并发写竞态、避免误改活会话）
+  # 运行中的 job：只允许改 name（2.1.231 抢名故障就发生在运行中），时间戳一律不动——
+  # 那是活会话的实时字段，改了会和 daemon 打架。终态 job 则名字+时间戳都可修（老的 bg/0s 故障）。
   disk_state="$(printf '%s' "$cur" | jq -r '.state // empty')"
+  running=0
   case "$disk_state" in
-    running|working|starting|blocked) continue ;;
+    running|working|starting|blocked) running=1 ;;
   esac
 
   cur_name="$(printf '%s' "$cur" | jq -r '.name // empty')"
+  cur_src="$(printf '%s' "$cur" | jq -r '.nameSource // empty')"
   cur_created="$(printf '%s' "$cur" | jq -r '.createdAt // empty')"
   cur_term="$(printf '%s' "$cur" | jq -r '.firstTerminalAt // empty')"
 
   # ---- 决定 name 是否要修 ----
+  # 尊重用户 Ctrl+R 手改名：nameSource=user 且现名非空又不是 ↳ 形 → 那是人改的，不覆盖。
   name_fix=0
   if [ "$cur_name" != "$want" ]; then name_fix=1; fi
+  if [ "$name_fix" = 1 ] && [ -n "$cur_name" ] && [ "$cur_src" = "user" ] && [ "${cur_name#↳}" = "$cur_name" ]; then
+    name_fix=0
+  fi
 
   # ---- 决定时间戳是否要修（塌缩=三者同点 或 firstTerminalAt 缺失）----
   ts_fix=0
-  if [ -z "$cur_term" ] || [ "$cur_created" = "$cur_term" ]; then ts_fix=1; fi
+  if [ "$running" = 0 ] && { [ -z "$cur_term" ] || [ "$cur_created" = "$cur_term" ]; }; then ts_fix=1; fi
 
   new_created="$cur_created"
   new_term="$cur_term"
@@ -272,6 +335,9 @@ while IFS=$'\t' read -r mod name sid short jstate; do
   fi
 
   # ---- 原子 read-modify-write：保留其余字段、pretty 输出（与 daemon 写法对齐）----
+  # 运行中的 job 由 daemon 持续写盘，read-modify-write 有覆盖它并发写入的风险。用 mtime 做
+  # check-and-set 把窗口压到最小：落盘前若文件已被改过就放弃这一轮（守护/下次 sweep 会再来）。
+  pre_mtime="$(file_mtime_epoch "$sj")"
   tmp="${sj}.fixdisplay.${PIDSFX}"
   if printf '%s' "$cur" | jq \
         --argjson namefix "$name_fix" \
@@ -282,26 +348,30 @@ while IFS=$'\t' read -r mod name sid short jstate; do
         (if $namefix==1 then .name=$name | .nameSource="user" else . end)
         | (if $tsfix==1 then .createdAt=$created | .firstTerminalAt=$term | .updatedAt=$term else . end)
       ' > "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
-    mv -f "$tmp" "$sj" 2>/dev/null && {
-      echo "✓ 修复 ${mod:-$short}: $desc"
-      fixed=$((fixed+1))
-    } || rm -f "$tmp" 2>/dev/null
+    if [ "$running" = 1 ] && [ "$(file_mtime_epoch "$sj")" != "$pre_mtime" ]; then
+      rm -f "$tmp" 2>/dev/null            # 被 daemon 抢先写过 → 放弃本轮，不覆盖它
+    else
+      mv -f "$tmp" "$sj" 2>/dev/null && {
+        echo "✓ 修复 ${mod:-$short}: $desc"
+        fixed=$((fixed+1))
+      } || rm -f "$tmp" 2>/dev/null
+    fi
   else
     rm -f "$tmp" 2>/dev/null
   fi
 
 done < <(printf '%s' "$STATUS_JSON" | jq -r '
-  .jobs[]? | [ (._module // ""), (.name // ""), (.sessionId // ""), (.short // ""), (.state // "") ] | @tsv')
+  .jobs[]? | [ (._module // ""), (.name // ""), (.sessionId // ""), (.short // ""), (.state // "") ] | join("\u001f")')
 
 # ⚠ CJK 全角标点（，（）紧跟 $var 时，bash 会把多字节首字节并进变量名 → set -u 误报 unbound；
 #   一律用 ${var} 花括号定界，杜绝该坑。
 if [ "$QUIET" = 1 ]; then
-  [ "${fixed}" -gt 0 ] && echo "✓ cc-fleet-fix-display ${RQ}: 修复了 ${fixed} 个已完成 worker 的显示（名字/时长）"
+  [ "${fixed}" -gt 0 ] && echo "✓ cc-fleet-fix-display ${RQ}: 修复了 ${fixed} 个 worker 的 FleetView 显示（名字/时长）"
 else
   if [ "${fixed}" -gt 0 ]; then
-    echo "▶ ${RQ}: 扫描 ${scanned}，修复 ${fixed} 个已完成 worker 的 FleetView 显示（名字 bg→↳模块名 / 时长 0s→真实时长）"
+    echo "▶ ${RQ}: 扫描 ${scanned}，修复 ${fixed} 个 worker 的 FleetView 显示（名字 bg/被抢→↳模块名 / 时长 0s→真实时长）"
   else
-    echo "▶ ${RQ}: 扫描 ${scanned}，无需修复（名字/时长均正常或非完成态）"
+    echo "▶ ${RQ}: 扫描 ${scanned}，无需修复（名字/时长均正常）"
   fi
 fi
 exit 0

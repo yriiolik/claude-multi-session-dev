@@ -1,0 +1,175 @@
+#!/usr/bin/env bash
+# cc-fleet-name-guard — 守住 job 的 FleetView 显示名，别被 Claude Code 内建的【自动命名器】抢走。
+#
+# 现象（2026-08-13 实测，cli 2.1.231）：cc-dispatch 派发的 worker 在 FleetView 里【运行中就】丢了 `↳`
+#   前缀，名字变成一串英文小写短语（"fleet warehouse config" / "voms foundation context setup"），
+#   主 session 一眼分不出哪些是子 session。前台会话同理：取名 hook 出的中文名被英文短语顶掉。
+#
+# 根因（2.1.231 二进制逆向 + 实测，与 fix-display 的 "bg/0s" 是两个独立故障）：
+#   · 2.1.231 起 CC 内建了一个 LLM 取名器（side-query `querySource:"agent_namer"`，提示词
+#     "2-4 word lowercase label for this job"），命中后写
+#     `~/.claude/jobs/<short>/state.json` 的 `.name` + `.nameSource="auto"`，
+#     并同步成会话的 ai-title / agent-name。FleetView 列表显示读的就是这个 `.name`。
+#   · 它有唯一的让位条件：**写回前重读 state.json，若 `.name` 已非空就永久放弃**（实测：一旦被占，
+#     后续再不重取）。所以这不是"持续覆盖"，而是**一次性的抢跑竞态**——谁先把 name 写进去谁赢。
+#   · 我们输在起跑线上：cc-dispatch 走 daemon `source:"fleet"` 派发，daemon **不在派发时落 state.json
+#     种子**（`spawnBgSession` 对 fleet/spare 跳过 seed 写盘），state.json 是 worker 自己起来后才建的。
+#     取名 hook 在 UserPromptSubmit 时刻去写 `.name`，此时 state.json 往往【还不存在】→ 静默 no-op →
+#     几秒后自动命名器建好文件并填上英文名 → `↳` 永久丢失。worktree 隔离的 worker 建树更慢，几乎必输。
+#
+# 对策（本脚本）：一个**脱离父进程的后台小守护**，在给定时间窗内反复确保 `.name == <期望名>`：
+#   · state.json 还没出生 → 继续等（这正是竞态的关键窗口，等到它一出生就立刻写进去）；
+#   · 已被自动命名器占成 `nameSource=auto` 的名字 → 夺回（写 `.name` + `nameSource=user`）；
+#   · 已是期望名 → 静默跳过（幂等，不制造无谓写盘）；
+#   · 用户 Ctrl+R 手改过的名（`nameSource=user` 且与期望名不同）→ **默认不碰**（除非 --force）。
+#   连续 STABLE 轮观察到期望名仍在，即认定竞态窗口已过、自动命名器已永久让位，提前收工。
+#
+# 为什么"写运行中会话的 state.json"是安全的（实测验证过，2026-08-13）：
+#   daemon 每次落盘前都会**重读**磁盘上的 state.json 再合并（`name:k?.name`），所以我们写进去的名字
+#   会被它原样带走，不会被旧内存值盖掉；实测给两个运行中的 worker 写回 `↳` 名后 30s 内稳定不变。
+#   写法上仍用【同目录 tmp + mv】原子替换，并只改 `.name`/`.nameSource` 两个字段，其余原样保留。
+#
+# 用法:
+#   cc-fleet-name-guard --job-dir <DIR>  --name <NAME> [选项]
+#   cc-fleet-name-guard --short <8hex>   --name <NAME> [选项]   # 等价 --job-dir ~/.claude/jobs/<short>
+#
+# 选项:
+#   --window <秒>     守护总时长上限，默认 90（自动命名器一般在首轮回答前后几秒内出手）
+#   --interval <秒>   轮询间隔，默认 1
+#   --stable <次>     连续观察到期望名多少次即提前收工，默认 3
+#   --force           连 nameSource=user 的既有名也覆盖（默认不覆盖，保护用户手动改名）
+#   --detach          立刻 fork 到后台并返回（cc-dispatch / hook 用这个，绝不阻塞主流程）
+#   --jobs-root <DIR> 覆盖 ~/.claude/jobs（测试用）
+#   --quiet           静默（只在真改了才打印一行）
+#
+# 退出码: 0 正常（含"窗口内没等到 state.json"这种 best-effort 放弃）/ 2 参数错误。
+# 设计为 best-effort：任何异常都静默跳过，绝不影响派发/取名主流程。
+
+set -uo pipefail
+
+JOB_DIR=""
+SHORT=""
+NAME=""
+WINDOW=90
+INTERVAL=1
+STABLE=3
+FORCE=0
+DETACH=0
+QUIET=0
+JOBS_ROOT="${HOME}/.claude/jobs"
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --job-dir)   JOB_DIR="$2"; shift 2 ;;
+    --short)     SHORT="$2"; shift 2 ;;
+    --name)      NAME="$2"; shift 2 ;;
+    --window)    WINDOW="$2"; shift 2 ;;
+    --interval)  INTERVAL="$2"; shift 2 ;;
+    --stable)    STABLE="$2"; shift 2 ;;
+    --jobs-root) JOBS_ROOT="$2"; shift 2 ;;
+    --force)     FORCE=1; shift ;;
+    --detach)    DETACH=1; shift ;;
+    --quiet)     QUIET=1; shift ;;
+    -h|--help)   sed -n '2,50p' "$0"; exit 0 ;;
+    *) echo "未知参数: $1" >&2; exit 2 ;;
+  esac
+done
+
+[ -n "$NAME" ] || { echo "用法: $0 --job-dir DIR|--short 8hex --name NAME [--window N] [--detach]" >&2; exit 2; }
+[ -n "$JOB_DIR" ] || { [ -n "$SHORT" ] && JOB_DIR="$JOBS_ROOT/$SHORT"; }
+[ -n "$JOB_DIR" ] || { echo "用法: $0 --job-dir DIR|--short 8hex --name NAME" >&2; exit 2; }
+
+command -v jq >/dev/null 2>&1 || exit 0   # 没 jq 就当没这回事，绝不因此拖垮调用方
+
+# --detach：把自己重新拉起成脱离进程，立刻返回。用 setsid（有就用）确保脱离进程组，
+# 父进程（cc-dispatch / hook）退出时不会带走守护。
+if [ "$DETACH" = 1 ]; then
+  args=(--job-dir "$JOB_DIR" --name "$NAME" --window "$WINDOW" --interval "$INTERVAL"
+        --stable "$STABLE" --jobs-root "$JOBS_ROOT" --quiet)
+  [ "$FORCE" = 1 ] && args+=(--force)
+  if command -v setsid >/dev/null 2>&1; then
+    ( setsid "$0" "${args[@]}" </dev/null >/dev/null 2>&1 & ) 2>/dev/null
+  else
+    ( "$0" "${args[@]}" </dev/null >/dev/null 2>&1 & ) 2>/dev/null
+  fi
+  exit 0
+fi
+
+SJ="$JOB_DIR/state.json"
+
+# 单例：同一个 job 只跑一个守护（hook 与 cc-dispatch 可能都想守同一个 job）。
+# ⚠ 锁【不能】放在 job 目录里：本守护最关键的场景就是 job 目录还没被 daemon 建出来（fleet 派发不落种子），
+#   那时 `mkdir "$JOB_DIR/.lock"` 必然失败 → 守护直接退出，正好在最需要它的时候罢工（实测踩过）。
+#   所以锁落在与 job 目录无关的临时区，并按 job 路径派生锁名；同时也避免往 daemon 的目录里塞东西。
+# 用 mkdir 做原子锁；锁目录带过期时间，避免守护被 kill 后残留锁挡住后续自愈。
+LOCK_ROOT="${TMPDIR:-/tmp}/cc-fleet-name-guard-$(id -u 2>/dev/null || echo 0)"
+mkdir -p "$LOCK_ROOT" 2>/dev/null || true
+LOCK="$LOCK_ROOT/$(printf '%s' "$JOB_DIR" | tr -c 'A-Za-z0-9._-' '_').lock"
+lock_acquired=0
+if mkdir "$LOCK" 2>/dev/null; then
+  lock_acquired=1
+else
+  # 锁已存在：超过窗口时长 + 60s 视为陈旧，抢过来；否则让位退出（另一个守护在干同样的事）。
+  lock_mtime="$(stat -f %m "$LOCK" 2>/dev/null || stat -c %Y "$LOCK" 2>/dev/null || echo 0)"
+  now="$(date +%s 2>/dev/null || echo 0)"
+  if [ "$lock_mtime" != 0 ] && [ "$now" != 0 ] && [ $((now - lock_mtime)) -gt $((WINDOW + 60)) ]; then
+    rm -rf "$LOCK" 2>/dev/null || true
+    mkdir "$LOCK" 2>/dev/null && lock_acquired=1
+  fi
+fi
+[ "$lock_acquired" = 1 ] || exit 0
+trap 'rm -rf "$LOCK" 2>/dev/null || true' EXIT INT TERM
+
+# 把期望名写进 state.json 的 .name（原子、只动两个字段）。
+# 返回 0=写了 / 1=没写（不需要写、或不该写、或写失败）。
+apply_name() {
+  local cur cur_name cur_src tmp
+  [ -f "$SJ" ] || return 1
+  cur="$(cat "$SJ" 2>/dev/null)" || return 1
+  printf '%s' "$cur" | jq -e . >/dev/null 2>&1 || return 1
+
+  cur_name="$(printf '%s' "$cur" | jq -r '.name // empty' 2>/dev/null)"
+  cur_src="$(printf '%s' "$cur"  | jq -r '.nameSource // empty' 2>/dev/null)"
+
+  [ "$cur_name" = "$NAME" ] && return 1                       # 幂等：已经是期望名
+  # 用户手动改过的名字（nameSource=user 且非空且不是我们写的）→ 尊重它，不覆盖
+  if [ "$FORCE" != 1 ] && [ -n "$cur_name" ] && [ "$cur_src" = "user" ]; then
+    return 1
+  fi
+
+  tmp="${SJ}.nameguard.$$"
+  if printf '%s' "$cur" | jq --arg n "$NAME" '.name=$n | .nameSource="user"' > "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
+    if mv -f "$tmp" "$SJ" 2>/dev/null; then
+      # 只在【真改了】时输出一行（quiet 也输出——调用方要的是"没动静=没改"）
+      echo "✓ cc-fleet-name-guard: '${cur_name:-∅}' → '$NAME'"
+      return 0
+    fi
+  fi
+  rm -f "$tmp" 2>/dev/null
+  return 1
+}
+
+# 主循环：窗口内轮询。连续 STABLE 轮看到期望名就收工（竞态窗口已过）。
+deadline_loops=$(( WINDOW / INTERVAL ))
+[ "$deadline_loops" -lt 1 ] && deadline_loops=1
+stable_hits=0
+i=0
+while [ "$i" -lt "$deadline_loops" ]; do
+  i=$((i+1))
+  if [ -f "$SJ" ]; then
+    apply_name
+    cur_name="$(jq -r '.name // empty' "$SJ" 2>/dev/null)"
+    if [ "$cur_name" = "$NAME" ]; then
+      stable_hits=$((stable_hits+1))
+      [ "$stable_hits" -ge "$STABLE" ] && break
+    else
+      # 名字不是期望值且我们又不该覆盖（用户手改）→ 没必要再守，直接收工
+      cur_src="$(jq -r '.nameSource // empty' "$SJ" 2>/dev/null)"
+      if [ "$FORCE" != 1 ] && [ -n "$cur_name" ] && [ "$cur_src" = "user" ]; then break; fi
+      stable_hits=0
+    fi
+  fi
+  sleep "$INTERVAL"
+done
+
+exit 0

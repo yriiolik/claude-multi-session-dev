@@ -1,7 +1,64 @@
-# FleetView 显示名/时长自愈（bg / 0s 根因与三层修复）
+# FleetView 显示名/时长自愈（bg / 0s / 被抢名 的根因与修复）
 
-> **主 session 运行时不需要读本文**——显示名与时长由取名 hook + `cc-fleet-watch`/`cc-fleet-summary`
-> 自动修复，无需人工。本文是这套自愈机制的根因考古与回归依据，供维护脚本时参考。
+> **主 session 运行时不需要读本文**——显示名与时长由取名 hook + `cc-fleet-name-guard` +
+> `cc-fleet-watch`/`cc-fleet-summary` 自动修复，无需人工。本文是这套自愈机制的根因考古与回归依据，
+> 供维护脚本时参考。
+
+FleetView 列表显示名读的**始终**是 `~/.claude/jobs/<short>/state.json` 的 `.name`（缺失时回退显示
+`.template`，daemon spare 池的模板名就是字面量 `bg`）。围绕这个字段目前有两条独立的故障线：
+
+| | 故障线 A/B：`bg` / `0s` | 故障线 C：名字被抢 |
+|---|---|---|
+| 现象 | 已完成 worker 名字变 `bg`、时长变 `0s` | **运行中**就丢 `↳`，名字变英文小写短语 |
+| 首次实测 | 2026-06-22 / cli 2.1.185 | 2026-08-13 / cli 2.1.231 |
+| 肇事者 | daemon 完成态落盘把记录写成极简形态 | CC 内建 LLM 自动取名器（`agent_namer`） |
+| 正解 | 事后用权威数据修回（`cc-fleet-fix-display`） | 事前抢占（`cc-fleet-name-guard`） |
+
+下面先讲 C（新），再讲 A/B（旧）。
+
+---
+
+## 故障线 C：名字被内建自动取名器抢走（2.1.231+）
+
+**现象.** 主 session 一眼分不出哪些是子 session：FleetView 里运行中的 worker 叫
+`fleet warehouse config` / `voms foundation context setup` 这类英文小写短语，`↳<module>@<RQ>` 没了。
+前台普通会话同理——取名 hook 出的中文名被 `deploy to cce test` 这类英文短语顶掉。
+
+**根因（2.1.231 二进制逆向 + 实测）.**
+- 2.1.231 起 CC 内建了一个 LLM 取名器：side-query `querySource:"agent_namer"`，提示词是
+  *"2-4 word lowercase label for this job"*，命中后写 `state.json` 的 `.name` + `.nameSource="auto"`，
+  并同步成会话的 ai-title / agent-name。
+- 它唯一的让位条件：**写回前重读 `state.json`，若 `.name` 已非空就永久放弃**（`if(a.name) return`，
+  实测一旦被占后续再不重取）。所以这不是"持续覆盖"，而是**一次性抢跑**——谁先写进去谁赢。
+- 我们输在起跑线：`cc-dispatch` 走 daemon `source:"fleet"` 派发，而 daemon 对 fleet/spare 派发
+  **不在派发时落 state.json 种子**（`spawnBgSession` 跳过 seed 写盘），state.json 是 worker 自己起来后才建的。
+  取名 hook 在 UserPromptSubmit 时刻去写 `.name`，此时文件往往**还不存在** → 静默 no-op → 几秒后被占。
+  worktree 隔离的 worker 建树更慢，几乎必输。
+- 注意 transcript 里的 `custom-title` **一直是对的**（实测某 worker 有 24 条 `↳…` 的 custom-title），
+  所以"看标题以为没事、看列表却是英文名"——排查时别被标题误导，**认 `state.json.name`**。
+
+**修复分层.**
+1. **事前抢占（主）**：`cc-fleet-name-guard` —— 脱离父进程的后台守护，在时间窗内反复确保
+   `.name == 期望名`；state.json 还没出生就等它出生。`cc-dispatch` 派发成功后自动 `--detach` 拉起
+   （`CC_FLEET_NAME_GUARD=0` 可关），取名 hook 在 state.json 缺失时也会拉起它。
+   ⚠ 它的单例锁**不能**放在 job 目录里——那时目录还不存在，锁建不出来就会在最该干活时罢工（踩过）。
+2. **事后兜底**：`cc-fleet-fix-display` 新增 C 类判据（现名非 `↳` 形且 `nameSource != user`），
+   **允许修运行中的 job**（只改 `.name`，绝不动运行中 job 的时间戳，落盘前再比一次 mtime）。
+   身份来源新增最强的一条：`state.json.intent` 首行的 `⟦FLEET-WORKER⟧` 哨兵——不 fork git、不读别的文件、
+   跨 worktree/跨仓库路径都成立。
+3. **取名 hook**：不再只写 worker 的名字——**普通会话的 `.name` 也要写**（否则中文名同样被英文短语顶掉）。
+   唯一不碰的是用户 Ctrl+R 手改名（`nameSource=user` 且非 `↳` 形）。DeepSeek 2s 没赶上转后台的那条路径，
+   拿到结果后也立刻落盘 + 起守护，不再干等下一条 prompt（很多会话根本没有下一条）。
+
+**为什么"写运行中会话的 state.json"是安全的**：daemon 每次落盘前都会重读磁盘上的 state.json 再合并
+（`name: k?.name`），我们写进去的名字会被它原样带走。实测给两个运行中的 worker 写回 `↳` 名后 30s 稳定不变。
+
+**回归用例**：`tests/test-cc-fleet-name-guard.sh`（25 项）、`tests/test-name-guard-e2e.sh`
+（端到端：假 daemon socket → cc-dispatch → 守护 vs 自动取名器抢跑；含**关掉守护必须复现故障**的反证）。
+
+---
+
+## 故障线 A/B：bg / 0s
 
 ## 现象
 
@@ -49,10 +106,17 @@ best-effort 调用**它。
 > ⚠ 若某次升级后**运行中**或**更早完成**的 worker 也开始 `bg`/`0s`，说明退化形态变了，照
 > `cc-fleet-fix-display` 头注释更新判定/恢复来源即可。
 
-## 回归用例
+## 回归用例（两条故障线合计）
 
-- `tests/test-auto-cn-title.sh`（多源恢复 / `state.json.name` 持久化 / 普通会话不被改写 / 缺 state.json 不崩 /
-  幂等 / SessionStart sweep 门控·节流·调起，29 项）
-- `tests/test-cc-fleet-fix-display.sh`（per-RQ，21 项）
-- `tests/test-cc-fleet-fix-display-all.sh`（`--all` 全局兜底：sid 还原·哨兵还原·非 fleet 不碰·纯外观不 churn·
-  running 不碰·max-age·幂等，23 项）
+- `tests/test-auto-cn-title.sh`（多源恢复 / `state.json.name` 持久化 / **普通会话空名与被抢名都要写、
+  用户手改名不覆盖** / **缺 state.json 时调起守护** / 幂等 / SessionStart sweep 门控·节流·调起，35 项）
+- `tests/test-cc-fleet-name-guard.sh`（守护本体：等 state.json 出生·夺回 auto 名·幂等·尊重手改名·
+  `--force`·`--detach`·**锁不落在 job 目录**·job 目录整个不存在也能干活，25 项）
+- `tests/test-name-guard-e2e.sh`（端到端：假 daemon socket → `cc-dispatch` → 守护 vs 自动取名器抢跑；
+  含**关掉守护必须复现故障**的反证 + `--all` 事后夺回，11 项）
+- `tests/test-cc-fleet-fix-display.sh`（per-RQ；含"运行中只补名字、时间戳不碰"，21 项）
+- `tests/test-cc-fleet-fix-display-all.sh`（`--all` 全局兜底：intent 哨兵还原·sid 还原·transcript 哨兵还原·
+  非 fleet 不碰·纯外观不 churn·**被抢名夺回**·用户手改名不覆盖·正文引用哨兵不误判·max-age·幂等，31 项）
+
+> ⚠ 已知与本机制无关的既有失败：`test-cc-fleet-panel-*` / `test-codex-rollout` / `test-panel-codex-e2e`
+> 共 5 个文件在 main 上就红（断言值里混进了 ANSI 颜色码），与显示名自愈无关。

@@ -81,11 +81,41 @@ mk_job jcos0001 "$(jq -nc --arg s "$T_START" --arg e "$T_END" --arg cwd "$REPO_S
   '{state:"done",template:"bg",name:"moduleJ@RQ-old",sessionId:"sid-J",cwd:$cwd,
     createdAt:$s,updatedAt:$e,firstTerminalAt:$e}')"
 
-# ---- K: 运行中（塌缩+无 name），cwd 自带名册 → 终态守卫，绝不能碰 ----
+# ---- K: 运行中（塌缩+无 name），cwd 自带名册 → 只补 name，时间戳（活会话实时字段）绝不能碰 ----
 mk_sid "$REPO_SID" "${RQ_A}" "moduleK" "sid-K"
 mk_job krun0001 "$(jq -nc --arg t "$T_COLLAPSE" --arg cwd "$REPO_SID" \
   '{state:"running",template:"bg",tempo:"active",sessionId:"sid-K",cwd:$cwd,
     createdAt:$t,updatedAt:$t,firstTerminalAt:$t}')"
+
+# ---- M: ⭐C 类「名字被内建自动命名器抢走」——运行中、英文名 + nameSource=auto，身份靠 intent 哨兵 ----
+#      这是 2.1.231 的新故障形态：既不是 name 空（"bg"）也不是时间戳塌缩，光看 A/B 判据发现不了。
+mk_job mste0001 "$(jq -nc --arg s "$T_START" --arg e "$T_END" \
+  '{state:"working",template:"bg",tempo:"active",name:"fleet warehouse config",nameSource:"auto",
+    intent:"⟦FLEET-WORKER⟧ rq=RQ-2026-0813-004 module=factory-warehouse-code\n\n任务卡正文…",
+    sessionId:"sid-M",cwd:"/nonexistent-path",
+    createdAt:$s,updatedAt:$e,firstTerminalAt:null}')"
+
+# ---- N: 已完成、名字被抢（同 C 类，但终态）→ 名字夺回 + 时间戳也该修 ----
+mk_tx "$TMP/tx-N.jsonl" "$T_START" "$T_END"
+mk_job nste0001 "$(jq -nc --arg tx "$TMP/tx-N.jsonl" --arg t "$T_COLLAPSE" \
+  '{state:"done",template:"bg",name:"voms foundation setup",nameSource:"auto",
+    intent:"⟦FLEET-WORKER⟧ rq=RQ-2026-0813-004 module=voms-foundation\n\n正文",
+    sessionId:"sid-N",cwd:"/nonexistent-path",linkScanPath:$tx,
+    createdAt:$t,updatedAt:$t,firstTerminalAt:$t}')"
+
+# ---- O: 运行中，用户 Ctrl+R 手改过名（nameSource=user、非 ↳ 形）→ 尊重用户，绝不覆盖 ----
+mk_job oman0001 "$(jq -nc --arg s "$T_START" --arg e "$T_END" \
+  '{state:"working",template:"bg",tempo:"active",name:"我手动改的名字",nameSource:"user",
+    intent:"⟦FLEET-WORKER⟧ rq=RQ-2026-0813-004 module=manual-renamed\n\n正文",
+    sessionId:"sid-O",cwd:"/nonexistent-path",
+    createdAt:$s,updatedAt:$e,firstTerminalAt:null}')"
+
+# ---- P: 普通会话，正文里【引用】了哨兵（不是首行）→ 不能被误判成 worker ----
+mk_job pfak0001 "$(jq -nc --arg s "$T_START" --arg e "$T_END" \
+  '{state:"working",template:"claude",name:"改进多session技能",nameSource:"auto",
+    intent:"帮我看看这段：⟦FLEET-WORKER⟧ rq=RQ-x module=fake 这个哨兵是干嘛的",
+    sessionId:"sid-P",cwd:"/nonexistent-path",
+    createdAt:$s,updatedAt:$e,firstTerminalAt:null}')"
 
 echo "================= --all --dry-run 不落盘 ================="
 out="$("$SCRIPT" --all --jobs-root "$JOBS" --dry-run 2>&1)"
@@ -119,8 +149,18 @@ check "J（纯外观）name 不变"                "moduleJ@RQ-old"  "$(field jc
 check "J（纯外观）createdAt 不变"           "$T_START"        "$(field jcos0001 .createdAt)"
 
 # K：运行中 → 一动不动
-check "K（running）name 仍 ∅"               "∅"              "$(field krun0001 .name)"
-check "K（running）createdAt 仍塌缩"         "$T_COLLAPSE"    "$(field krun0001 .createdAt)"
+check "K（running）name 被补上"             "↳moduleK@${RQ_A}" "$(field krun0001 .name)"
+check "K（running）createdAt 仍塌缩（时间戳不碰）" "$T_COLLAPSE"  "$(field krun0001 .createdAt)"
+
+# C 类：名字被内建自动命名器抢走
+check "M（running·被抢名）夺回 ↳"   "↳factory-warehouse-code@RQ-2026-0813-004" "$(field mste0001 .name)"
+check "M nameSource → user"          "user"        "$(field mste0001 .nameSource)"
+check "M createdAt 不被碰（运行中）" "$T_START"    "$(field mste0001 .createdAt)"
+check "M 靠 intent 哨兵认身份（cwd 不存在也成立）" "sid-M" "$(field mste0001 .sessionId)"
+check "N（done·被抢名）夺回 ↳"      "↳voms-foundation@RQ-2026-0813-004" "$(field nste0001 .name)"
+check "N 终态时间戳同时被修"        "$T_START"    "$(field nste0001 .createdAt)"
+check "O（用户手改名）绝不覆盖"      "我手动改的名字" "$(field oman0001 .name)"
+check "P（正文引用哨兵的普通会话）不被误判" "改进多session技能" "$(field pfak0001 .name)"
 
 echo "================= --max-age-hours 过滤 ================="
 # L：退化 worker，但把 state.json mtime 设到很早 → --max-age-hours 1 应跳过；--max-age-hours 0 应修复

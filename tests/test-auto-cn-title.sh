@@ -8,7 +8,9 @@
 # 断言 hook 输出的 sessionTitle。纯本地、可重复、零网络。
 
 set -u
-HOOK="$HOME/.claude/hooks/auto-cn-title.sh"
+# 被测 hook 路径：默认是装好的那份；改造 hook 时用 AUTO_CN_TITLE_HOOK 指向候选版本先验证再安装，
+# 避免"没验证就先污染真实 hook"。
+HOOK="${AUTO_CN_TITLE_HOOK:-$HOME/.claude/hooks/auto-cn-title.sh}"
 [ -f "$HOOK" ] || { echo "❌ 找不到 hook: $HOOK"; exit 1; }
 
 PASS=0; FAIL=0
@@ -118,16 +120,49 @@ JD=$(mk_job worker-ups '{"state":"working","template":"bg"}')
 out=$(run_hook "$(jq -nc --arg p "$ups" '{session_id:"ups-w2", prompt:$p, hook_event_name:"UserPromptSubmit"}')" CLAUDE_JOB_DIR="$JD")
 check "② worker UPS 写 state.json.name → ↳foo@RQ-2026-0602-009" "↳foo@RQ-2026-0602-009" "$(name_in "$JD/state.json")"
 
-# ③ 普通会话绝不碰 state.json.name（标题不带 ↳ → 不写；保护用户对普通会话的手动改名）
+# ③ 用户 Ctrl+R 手改名（nameSource=user 且非 ↳ 形）→ 神圣不可覆盖
 JD=$(mk_job normal '{"state":"working","template":"claude","name":"我的手动改名","nameSource":"user"}')
 out=$(run_hook "$(jq -nc --arg tp "$CTITLE_TX" '{session_id:"ss-normal", transcript_path:$tp, hook_event_name:"SessionStart", source:"resume"}')" CLAUDE_JOB_DIR="$JD")
-check "③ 普通会话 state.json.name 不被改写（仍为手动名）" "我的手动改名" "$(name_in "$JD/state.json")"
+check "③ 用户手改名不被覆盖（仍为手动名）" "我的手动改名" "$(name_in "$JD/state.json")"
+
+# ③b 普通会话 name 为空 → 也要写（2.1.231 起不写就会被内建自动命名器占成英文短语）
+JD=$(mk_job normal-empty '{"state":"working","template":"claude"}')
+out=$(run_hook "$(jq -nc --arg tp "$CTITLE_TX" '{session_id:"ss-normal-empty", transcript_path:$tp, hook_event_name:"SessionStart", source:"resume"}')" CLAUDE_JOB_DIR="$JD")
+check "③b 普通会话空 name → 写入中文标题" "我的中文标题" "$(name_in "$JD/state.json")"
+check "③b 普通会话 nameSource → user" "user" "$(nsrc_in "$JD/state.json")"
+
+# ③c ⭐普通会话已被内建自动命名器占成英文短语（nameSource=auto）→ 夺回中文标题
+JD=$(mk_job normal-stolen '{"state":"working","template":"claude","name":"deploy to cce test","nameSource":"auto"}')
+out=$(run_hook "$(jq -nc --arg tp "$CTITLE_TX" '{session_id:"ss-normal-stolen", transcript_path:$tp, hook_event_name:"SessionStart", source:"resume"}')" CLAUDE_JOB_DIR="$JD")
+check "③c 自动命名器抢的英文名被夺回" "我的中文标题" "$(name_in "$JD/state.json")"
+
+# ③d ⭐worker 被抢名（nameSource=auto 的英文短语）→ 夺回 ↳名
+JD=$(mk_job worker-stolen '{"state":"working","template":"bg","name":"fleet gateway config","nameSource":"auto"}')
+out=$(run_hook "$(jq -nc --arg tp "$WORKER_TX" '{session_id:"ss-w-stolen", transcript_path:$tp, hook_event_name:"SessionStart", source:"resume"}')" CLAUDE_JOB_DIR="$JD")
+check "③d worker 被抢名 → 夺回 ↳gateway@RQ-2026-0602-001" "↳gateway@RQ-2026-0602-001" "$(name_in "$JD/state.json")"
 
 # ④ 缺 state.json：CLAUDE_JOB_DIR 指向无 state.json 的目录 → 不崩、仍正常 emit sessionTitle
 JD="$TMPROOT/jobs/no-state"; mkdir -p "$JD"
 out=$(run_hook "$(jq -nc --arg tp "$WORKER_TX" '{session_id:"ss-nofile", transcript_path:$tp, hook_event_name:"SessionStart", source:"resume"}')" CLAUDE_JOB_DIR="$JD")
 check "④ 缺 state.json 不崩，sessionTitle 仍照常输出" "↳gateway@RQ-2026-0602-001" "$(title_of "$out")"
 check "④ 缺 state.json 时不会凭空创建文件" "no" "$([ -f "$JD/state.json" ] && echo yes || echo no)"
+
+# ④b ⭐缺 state.json（fleet 派发不落种子的常态）→ 必须把"等它出生再写"交给 cc-fleet-name-guard 守护，
+#     否则几秒后内建自动命名器建好文件并占名，↳ 前缀永久丢失（这正是 2.1.231 的抢跑竞态）。
+GUARD_DIR="$FAKE_HOME/.claude/skills/multi-session-dev/scripts"; mkdir -p "$GUARD_DIR"
+GREC="$TMPROOT/guard-invocations.log"
+cat > "$GUARD_DIR/cc-fleet-name-guard" <<EOF
+#!/usr/bin/env bash
+echo "invoked: \$*" >> "$GREC"
+EOF
+chmod +x "$GUARD_DIR/cc-fleet-name-guard"
+rm -f "$GREC"
+JD="$TMPROOT/jobs/no-state-guard"; mkdir -p "$JD"
+run_hook "$(jq -nc --arg tp "$WORKER_TX" '{session_id:"ss-noguard", transcript_path:$tp, hook_event_name:"SessionStart", source:"resume"}')" CLAUDE_JOB_DIR="$JD" >/dev/null
+# 守护是 fire-and-forget 的脱离进程 → 轮询等它落记录，别用固定 sleep（会偶发抖动）
+for _ in 1 2 3 4 5 6 7 8 9 10; do [ -s "$GREC" ] && break; sleep 0.5; done
+check "④b 缺 state.json → 调起 name-guard 守护" "yes" "$(grep -q -- '--detach' "$GREC" 2>/dev/null && echo yes || echo no)"
+check "④b 守护带上正确的期望名" "yes" "$(grep -q -- '↳gateway@RQ-2026-0602-001' "$GREC" 2>/dev/null && echo yes || echo no)"
 
 # ⑤ 幂等：name 已一致 → 不重写文件（mtime 不变，把与 daemon 的竞态收敛到仅首次自愈）
 JD=$(mk_job idem '{"state":"running","template":"bg","name":"↳gateway@RQ-2026-0602-001","nameSource":"user"}')

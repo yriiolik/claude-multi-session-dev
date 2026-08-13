@@ -7,6 +7,10 @@
 # 的协调目录【已被别的模块占用且超出新鲜窗口】，cc-dispatch 在派发前就 exit 6 拦下，而不是静默混入。
 #
 # 测试铁律：断言只增强不削弱；失败一律是脚本 bug，改脚本不改断言。
+
+# 派发脚本现在会自动拉起 Ghostty 分屏面板并写全局注册表。测试里一律关掉：
+# 否则跑一次测试就会在真实 Ghostty 上弹出一堆分屏，还会污染 ~/.claude/fleet。
+export CC_FLEET_PANEL=0
 set -u
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

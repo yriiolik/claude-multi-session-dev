@@ -21,6 +21,7 @@ SKILL.md 只列「哪些场景有命令可用」；参数、退出码、坑在�
 | 换新 session 重跑 | `cc-fleet-respawn` | `cc-fleet-respawn --dispatch cc-dispatch-codex-app` |
 | 收回执 | `cc-fleet-summary` | 同左（共用） |
 | worker 落地 | `cc-fleet-land` | 同左（共用） |
+| 终端可视面板 | `claude agents` | `cc-fleet-panel-codex-app`（派发时自动分屏拉起） |
 
 `-codex` 是 `-codex-app` 的短别名，完全等价。Codex 后端的模型路由与后端就绪细节见
 `codex-mode.md`——**日常派发不需要读它，脚本会自己处理**。
@@ -86,6 +87,25 @@ preamble**，每张卡需自包含。
 ### 派发后立刻机械验证（漏做＝没派）
 跑 `claude agents`（Codex 用 `cc-fleet-status-codex-app "$RQ"`），逐个模块确认看到 `↳<module>@<RQ>`。
 看不到（或只有一个无名 `source=spare` 的 running 条目）→ **你误用了 `Agent` 工具**，立刻改用 `cc-dispatch` 重派。
+
+### Codex 终端面板（自动分屏，无需你操心）
+
+Codex worker 是 app-server 里的 thread，**永远不会出现在 `claude agents` 里**。所以
+`cc-dispatch-codex-app` 派发成功后会自动做两件事：把本次 `$COORD` 登记进全局注册表、在当前
+Ghostty 窗口右侧分屏拉起 `cc-fleet-panel-codex-app`。面板是**全局**的——跨 session、跨仓库派发的
+worker 都汇总在同一块屏上；全部收工后面板自行退出、分屏随之关闭。
+
+```bash
+cc-fleet-panel-codex-app                 # 手动开（全局）
+cc-fleet-panel-codex-app --rq "$RQ"      # 只看一个 RQ
+cc-fleet-panel-open                      # 手动分屏拉起（幂等，已开则复用）
+cc-fleet-panel-open --close              # 手动关掉面板与分屏
+cc-fleet-panel-register --list           # 看注册表里有哪些协调目录
+```
+
+面板交互：`↑↓` 选择 · `→` 进详情（实时看 reasoning / 执行的命令 / 文件改动 / 回执）· `←` 返回 · `r` 刷新 · `q` 退出。
+面板**只读**，不会替你 resume / unarchive / 改元数据；编排决策仍以 `cc-fleet-status-codex-app` 与
+`cc-fleet-summary` 为准。不想要它：派发加 `--no-panel`，或全局 `export CC_FLEET_PANEL=0`。
 
 ## 监控（零轮询，让 harness 推给你）
 

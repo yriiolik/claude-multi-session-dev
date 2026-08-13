@@ -3,6 +3,10 @@
 # 用 --dry-run + --coord + 桩 prompt-file 断言三步计划正确：
 #   kill 命令、旧回执归档判定、重派命令（↳名/FLEET_* env/--join/--sid-file/--prompt-file/dispatch 选择）、参数校验退出码。
 # 测试铁律：断言只增强不削弱；失败一律是脚本 bug，改脚本不改断言。
+
+# 派发脚本现在会自动拉起 Ghostty 分屏面板并写全局注册表。测试里一律关掉：
+# 否则跑一次测试就会在真实 Ghostty 上弹出一堆分屏，还会污染 ~/.claude/fleet。
+export CC_FLEET_PANEL=0
 set -u
 
 BIN="$(cd "$(dirname "$0")/.." && pwd)/scripts/cc-fleet-respawn"

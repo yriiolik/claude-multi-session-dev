@@ -1,0 +1,32 @@
+#!/usr/bin/env node
+// cc-fleet-panel-register — 把一个协调目录登记进 Codex 面板的全局注册表。
+//
+// 面板要跨 session、跨仓库看到所有 codex worker，但满盘扫 `.git/fleet` 又慢又不可靠
+// （worker 的仓库路径和编排者的 cwd 常常不是一个）。所以由派发脚本在派发成功时主动登记一行。
+// 注册表里目录已消失的条目由面板侧自动剔除，这里只负责写入。
+
+"use strict";
+
+const path = require("path");
+const jobsLib = require("./lib/codex-app-jobs.js");
+
+const args = process.argv.slice(2).filter((a) => a !== "--");
+if (!args.length || args[0] === "-h" || args[0] === "--help") {
+  console.error(`cc-fleet-panel-register <coord-dir> [rq]
+
+  coord-dir  协调目录，通常是 <git-common-dir>/fleet/<RQ>
+  rq         RQ id；省略时取 coord-dir 的目录名
+
+  --list     打印当前注册表（已剔除失效目录）`);
+  process.exit(args.length ? 0 : 5);
+}
+
+if (args[0] === "--list") {
+  console.log(JSON.stringify(jobsLib.listCoords(), null, 2));
+  process.exit(0);
+}
+
+const coord = args[0];
+const rq = args[1] || path.basename(path.resolve(coord));
+jobsLib.registerCoord(coord, rq);
+console.log(`✅ 已登记到 Codex 面板注册表: ${path.resolve(coord)} (rq=${rq})`);

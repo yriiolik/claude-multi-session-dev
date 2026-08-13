@@ -6,6 +6,10 @@
 set -u
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
+# 兜底：任何测试都不该去动真实 Ghostty / 真实 ~/.claude/fleet。
+# 需要走面板路径的测试（test-panel-codex-e2e.sh）会自己带假 osascript 再打开。
+export CC_FLEET_PANEL=0
 FILTER="${1:-}"
 FAILED=()
 TOTAL=0

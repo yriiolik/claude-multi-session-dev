@@ -16,6 +16,8 @@ COORD_BIN="$SCRIPT_DIR/cc-fleet-coord"
 APP_CALL_BIN="${CODEX_APP_CALL_BIN:-$SCRIPT_DIR/cc-codex-app-call}"
 PIN_BIN="${CODEX_APP_PIN_BIN:-$SCRIPT_DIR/cc-codex-app-pin}"
 SESSION_CONFIG_BIN="${CODEX_SESSION_CONFIG_BIN:-$SCRIPT_DIR/cc-codex-session-config}"
+PANEL_OPEN_BIN="${CC_FLEET_PANEL_OPEN_BIN:-$SCRIPT_DIR/cc-fleet-panel-open}"
+PANEL_REGISTER_BIN="${CC_FLEET_PANEL_REGISTER_BIN:-$SCRIPT_DIR/cc-fleet-panel-register}"
 PREAMBLE_TMPL="$ROOT_DIR/reference/codex-app-dispatch-preamble.md"
 
 OPT_CWD=""
@@ -37,6 +39,8 @@ OPT_WORKTREE_DIR=""
 OPT_APP_VISIBLE_CWD=""
 OPT_PIN_POLICY="auto"
 OPT_START_APP_SERVER=1
+# 派发成功后自动在 Ghostty 分屏拉起 Codex 面板。CC_FLEET_PANEL=0 可全局关掉。
+OPT_PANEL=$([[ "${CC_FLEET_PANEL:-1}" == "0" ]] && echo 0 || echo 1)
 ENV_KVS=()
 
 usage() {
@@ -67,6 +71,7 @@ cc-dispatch-codex-app — 启动 Codex App 可见 worker thread
   --no-inject-claude-md  不注入三层 CLAUDE.md（通常不用）
   --dry-run              只打印计划，不创建 worktree、不启动 thread
   --keep-on-failure      thread 创建失败时保留 worktree/分支现场（默认自动回滚）
+  --no-panel             不自动拉起 Ghostty 分屏面板（默认拉起；CC_FLEET_PANEL=0 可全局关掉）
   --json                 启动成功后输出 JSON
 
 说明:
@@ -110,6 +115,8 @@ while [[ $# -gt 0 ]]; do
     --no-inject-claude-md) OPT_INJECT_CLAUDE_MD=0; shift ;;
     --dry-run) OPT_DRY_RUN=1; shift ;;
     --keep-on-failure) OPT_KEEP_ON_FAILURE=1; shift ;;
+    --panel) OPT_PANEL=1; shift ;;
+    --no-panel) OPT_PANEL=0; shift ;;
     --json) OPT_JSON=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) die_usage "未知参数: $1" ;;
@@ -995,6 +1002,20 @@ EOF
 printf '%s\n' "$THREAD_ID" > "$OPT_SID_FILE" || {
   echo "⚠ 无法写 --sid-file ${OPT_SID_FILE}（不影响已启动，但 status-codex-app 将无法从 sid 兜底）" >&2
 }
+
+# —— 终端面板（cc-fleet-panel-codex-app）——
+# Codex worker 是 app-server 里的 thread，进不了 `claude agents` 的 FleetView，所以这里主动：
+#   ① 把本次协调目录登记进全局注册表（面板据此跨 session、跨仓库发现所有 worker）；
+#   ② 在当前 Ghostty 窗口分屏拉起面板（已开则复用）。
+# 全程 best-effort：登记失败、Ghostty 没开、没授权自动化 —— 都只提示，绝不让已经派发成功的
+# thread 因为"面板没开出来"而被判失败。
+if [[ "$OPT_PANEL" -eq 1 ]]; then
+  "$PANEL_REGISTER_BIN" "$COORD" "$RQ" >/dev/null 2>&1 \
+    || echo "⚠ 面板注册表登记失败（不影响派发；面板可能看不到本次 RQ）" >&2
+  if [[ -x "$PANEL_OPEN_BIN" ]]; then
+    CC_FLEET_PANEL_CWD="$OPT_CWD" "$PANEL_OPEN_BIN" --quiet || true
+  fi
+fi
 
 if [[ "$OPT_JSON" -eq 1 ]]; then
   printf '{"ok":true,"threadId":"%s","turnId":"%s","rq":"%s","module":"%s","worktree":"%s","appVisibleCwd":"%s","visibilityPinned":%s}\n' \

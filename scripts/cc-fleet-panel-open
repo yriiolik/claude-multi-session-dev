@@ -1,0 +1,221 @@
+#!/usr/bin/env node
+// cc-fleet-panel-open — 在当前 Ghostty 窗口分屏拉起 Codex 面板（等价于手按 ⌘D 再敲命令）。
+//
+// 走 Ghostty 1.3+ 的 AppleScript 字典（`split ... with configuration`）而不是用 System Events
+// 模拟 ⌘D：模拟按键要辅助功能权限、会被前台应用抢走、还拿不到新 surface 的句柄。
+// AppleScript 路线能直接指定命令与工作目录，并**返回新 terminal 的 id**，关闭时才有的放矢。
+//
+// 幂等：面板进程活着就什么都不做（pidfile 判定，见 lib/codex-app-jobs.js 里的说明）。
+// 尽力而为：Ghostty 没开、没授权、不是 macOS —— 一律只提示不报错，绝不因为"面板没开出来"
+// 让派发失败。要严格失败用 --strict。
+
+"use strict";
+
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
+const { spawnSync } = require("child_process");
+const jobsLib = require("./lib/codex-app-jobs.js");
+
+const PANEL_BIN = path.join(__dirname, "cc-fleet-panel-codex-app");
+const OSASCRIPT = process.env.CC_GHOSTTY_OSASCRIPT || "/usr/bin/osascript";
+
+let action = "open";
+let direction = process.env.CC_FLEET_PANEL_DIRECTION || "right";
+let focusPanel = false;
+let strict = false;
+let quiet = false;
+const panelArgs = [];
+
+function usage() {
+  console.error(`cc-fleet-panel-open — Ghostty 分屏拉起/关闭 Codex 面板
+
+用法:
+  cc-fleet-panel-open [--direction right|down|left|up] [-- <面板参数...>]
+  cc-fleet-panel-open --close
+  cc-fleet-panel-open --status
+
+选项:
+  --direction DIR   分屏方向（默认 right，可用 CC_FLEET_PANEL_DIRECTION 覆盖）
+  --focus           分屏后把焦点留在面板（默认焦点还给原来的终端，别打断你打字）
+  --strict          Ghostty 不可用时以非 0 退出（默认只提示）
+  --quiet           不打印提示
+  --close           关掉已开的面板（先 SIGTERM 面板进程，再兜底关 surface）
+  --status          打印面板状态 JSON
+  -- <args>         "--" 之后的参数原样传给 cc-fleet-panel-codex-app`);
+}
+
+for (let i = 2; i < process.argv.length; i++) {
+  const a = process.argv[i];
+  if (a === "--") { panelArgs.push(...process.argv.slice(i + 1)); break; }
+  else if (a === "--direction") direction = process.argv[++i] || "right";
+  else if (a === "--focus") focusPanel = true;
+  else if (a === "--strict") strict = true;
+  else if (a === "--quiet") quiet = true;
+  else if (a === "--close") action = "close";
+  else if (a === "--status") action = "status";
+  else if (a === "-h" || a === "--help") { usage(); process.exit(0); }
+  else { console.error(`unknown flag: ${a}`); usage(); process.exit(5); }
+}
+
+function note(msg) {
+  if (!quiet) console.error(msg);
+}
+
+function bail(msg) {
+  note(msg);
+  process.exit(strict ? 4 : 0);
+}
+
+function osa(script, args) {
+  const res = spawnSync(OSASCRIPT, ["-", ...args], {
+    input: script,
+    encoding: "utf8",
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  return {
+    ok: res.status === 0,
+    out: String(res.stdout || "").trim(),
+    err: String(res.stderr || "").trim() || `osascript exit ${res.status}`,
+  };
+}
+
+// 分屏里的进程继承的是 **Ghostty 自己的**环境（登录环境），不是本进程的环境。所以派发 session
+// 里设的 CODEX_HOME 之类必须显式带过去，否则面板会去读另一套 Codex 配置、看到另一批 thread。
+const ENV_PASSTHROUGH = [
+  // PATH 必须带：分屏拿到的是 Ghostty 的登录环境，pyenv/nvm/homebrew 那套 PATH 都不在里面。
+  // 面板自己用 process.execPath 启动不受影响，但它 spawn 的 cc-codex-app-call（同样是
+  // `#!/usr/bin/env node`）和 git 会因为 PATH 太干净而找不到。
+  "PATH",
+  "CODEX_HOME",
+  "CODEX_CLI_PATH",
+  "CODEX_APP_CALL_BIN",
+  "CC_FLEET_PANEL_REGISTRY",
+  "CC_FLEET_PANEL_STATE",
+  "CC_FLEET_PANEL_PIDFILE",
+];
+
+// 值全部走 argv 传进 AppleScript，不做字符串拼接——命令里带引号/空格/中文都不会破坏脚本。
+const OPEN_SCRIPT = `on run argv
+  set theCmd to item 1 of argv
+  set theDir to item 2 of argv
+  set theDirection to item 3 of argv
+  set keepFocus to (item 4 of argv is "1")
+  set envBlob to item 5 of argv
+  tell application "Ghostty"
+    set cfg to new surface configuration
+    set command of cfg to theCmd
+    set initial working directory of cfg to theDir
+    set wait after command of cfg to false
+    if envBlob is not "" then
+      set savedDelims to AppleScript's text item delimiters
+      set AppleScript's text item delimiters to linefeed
+      set envList to every text item of envBlob
+      set AppleScript's text item delimiters to savedDelims
+      set environment variables of cfg to envList
+    end if
+    set src to focused terminal of selected tab of front window
+    if theDirection is "down" then
+      set nt to split src direction down with configuration cfg
+    else if theDirection is "left" then
+      set nt to split src direction left with configuration cfg
+    else if theDirection is "up" then
+      set nt to split src direction up with configuration cfg
+    else
+      set nt to split src direction right with configuration cfg
+    end if
+    if keepFocus then focus src
+    return id of nt
+  end tell
+end run`;
+
+// 先找齐再关：在 `repeat with t in terminals` 里直接 close，会让正在遍历的集合当场失效，
+// 报 “不能获得 item N of every terminal。无效的索引 (-1719)”。
+const CLOSE_SCRIPT = `on run argv
+  set theId to item 1 of argv
+  tell application "Ghostty"
+    set target to missing value
+    repeat with t in terminals
+      if (id of t as text) is theId then
+        set target to t
+        exit repeat
+      end if
+    end repeat
+    if target is missing value then return "not-found"
+    close target
+    return "closed"
+  end tell
+end run`;
+
+if (action === "status") {
+  console.log(JSON.stringify({
+    pid: jobsLib.panelAlive(),
+    pidFile: jobsLib.panelPidFile(),
+    state: jobsLib.readPanelState(),
+  }, null, 2));
+  process.exit(0);
+}
+
+if (action === "close") {
+  const pid = jobsLib.panelAlive();
+  if (pid) {
+    try { process.kill(pid, "SIGTERM"); } catch {}
+    note(`已请求关闭面板进程 pid=${pid}`);
+  }
+  const state = jobsLib.readPanelState();
+  if (state.terminalId) {
+    const r = osa(CLOSE_SCRIPT, [String(state.terminalId)]);
+    note(r.ok ? `分屏 ${state.terminalId}: ${r.out}` : `关闭分屏失败: ${r.err}`);
+  }
+  jobsLib.writePanelState({});
+  jobsLib.clearPanelPid(pid);
+  process.exit(0);
+}
+
+// ---- open ----
+
+if (process.env.CC_FLEET_PANEL === "0") {
+  bail("CC_FLEET_PANEL=0，跳过拉起 Codex 面板。");
+}
+
+const alive = jobsLib.panelAlive();
+if (alive) {
+  note(`Codex 面板已在运行（pid=${alive}），复用现有分屏。`);
+  process.exit(0);
+}
+
+if (os.platform() !== "darwin") {
+  bail(`当前平台 ${os.platform()} 不支持 Ghostty AppleScript 分屏；请手动运行: ${PANEL_BIN}`);
+}
+if (!fs.existsSync(OSASCRIPT)) {
+  bail(`找不到 osascript（${OSASCRIPT}）；请手动运行: ${PANEL_BIN}`);
+}
+
+// Ghostty 的 `command` 是单个命令字符串，交给 shell 执行。面板路径与参数各自加引号，
+// 保证路径里有空格也不会被拆开。
+//
+// 用 process.execPath 显式指定 node，而不是靠面板脚本的 `#!/usr/bin/env node`：分屏继承的是
+// Ghostty 的登录环境，pyenv/nvm 装的 node 不在那份 PATH 里，直接跑会 `env: node: No such file`
+// 然后分屏一闪而过——这类失败在图形界面上完全看不到,只会表现为"面板没开出来"。
+const quoteArg = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
+const cmd = [process.execPath, PANEL_BIN, ...panelArgs].map(quoteArg).join(" ");
+const cwd = process.env.CC_FLEET_PANEL_CWD || process.cwd();
+
+const envBlob = ENV_PASSTHROUGH
+  .filter((k) => process.env[k])
+  .map((k) => `${k}=${process.env[k]}`)
+  .join("\n");
+
+const res = osa(OPEN_SCRIPT, [cmd, cwd, direction, focusPanel ? "0" : "1", envBlob]);
+if (!res.ok) {
+  bail(`拉起 Codex 面板失败（Ghostty 未运行或未授权自动化？）: ${res.err}\n手动运行: ${PANEL_BIN}`);
+}
+
+jobsLib.writePanelState({
+  terminalId: res.out,
+  direction,
+  command: cmd,
+  cwd,
+  openedAt: Math.floor(Date.now() / 1000),
+});
+note(`✅ Codex 面板已在 Ghostty ${direction} 侧分屏拉起（terminal ${res.out}）。`);

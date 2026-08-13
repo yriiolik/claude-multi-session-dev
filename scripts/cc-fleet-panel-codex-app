@@ -1,0 +1,645 @@
+#!/usr/bin/env node
+// cc-fleet-panel-codex-app — Codex App worker 的终端面板（对标 `claude agents` 的 FleetView）。
+//
+// 为什么要有它：Codex worker 是 app-server 里的 thread，没有进程、没有 PTY，也不在
+// `~/.claude/sessions/<pid>.json` 里自注册，所以**永远不可能**出现在 `claude agents` 的列表里
+// （实测伪造 jobs/state.json 与 sessions/<pid>.json 均不被列出）。这个面板就是 codex 侧的等价物。
+//
+// 三条硬约束：
+//   1. **只读**。面板每几秒刷一次，任何 unarchive/resume/unpin/写回元数据的副作用都会被放大成
+//      刷屏级写入，还会和编排者的 status 调用互相打架。状态判定复用 lib/codex-app-jobs.js 的纯函数。
+//   2. **全局视角**。worker 是跨 session、跨仓库派发的，面板读全局注册表而不是某个 cwd 的 .git/fleet。
+//   3. **"空闲 ≠ 完成"**。Codex 的 turn 跑完就 idle，只有 summary 首行是 `result:` 才算真交付。
+//      所以 idle-without-receipt 单独归入「需核验」组，不混进 Completed，也不触发自动关闭。
+//
+// 交互：↑↓/jk 选择 · →/l/Enter 进详情 · ←/h/Esc 返回 · r 刷新 · q 退出。
+
+"use strict";
+
+const fs = require("fs");
+const path = require("path");
+const jobsLib = require("./lib/codex-app-jobs.js");
+
+// ---------------------------------------------------------------- 参数
+
+const opt = {
+  coords: [],
+  rq: "",
+  interval: 3000,
+  detailInterval: 2000,
+  autoClose: process.env.CC_FLEET_PANEL_AUTOCLOSE !== "0",
+  closeGrace: 20,
+  idleTimeout: 300,
+  closeOnAttention: false,
+  maxAgeHours: 24,
+  once: false,
+  plain: !process.stdout.isTTY,
+  json: false,
+  keys: [],
+  codexBin: "",
+  startAppServer: true,
+};
+
+function usage() {
+  console.error(`cc-fleet-panel-codex-app — Codex App worker 面板（只读）
+
+用法:
+  cc-fleet-panel-codex-app                  # 全局：读注册表里所有协调目录
+  cc-fleet-panel-codex-app --rq RQ-2026-...  # 只看一个 RQ
+  cc-fleet-panel-codex-app --coord DIR       # 额外纳入一个协调目录（可重复）
+
+选项:
+  --interval MS          列表刷新间隔（默认 3000）
+  --detail-interval MS   详情刷新间隔（默认 2000）
+  --max-age-hours N      只展示 N 小时内派发/收尾的 worker（默认 24）
+  --auto-close           全部 worker 收工后自动退出（默认开；分屏随之关闭）
+  --no-auto-close        常驻，不自动退出
+  --close-grace SEC      收工后等待多久再退出（默认 20）
+  --close-on-attention   有「需核验/异常」也照样自动退出（默认不退，留着让你看）
+  --idle-timeout SEC     一直没见到活跃 worker 就退出（默认 300，0=不退）
+  --once                 渲染一帧到 stdout 后退出（不进 raw 模式）
+  --plain                关闭 ANSI 颜色
+  --json                 输出状态模型 JSON 后退出
+  --keys a,b,c           先按一串键再渲染（配合 --once，测试用）
+  --codex-bin PATH       指定 Codex CLI
+  --no-start-app-server  只连已有 app-server`);
+}
+
+for (let i = 2; i < process.argv.length; i++) {
+  const a = process.argv[i];
+  if (a === "--coord") opt.coords.push(process.argv[++i] || "");
+  else if (a === "--rq") opt.rq = process.argv[++i] || "";
+  else if (a === "--interval") opt.interval = Number(process.argv[++i]) || 3000;
+  else if (a === "--detail-interval") opt.detailInterval = Number(process.argv[++i]) || 2000;
+  else if (a === "--max-age-hours") opt.maxAgeHours = Number(process.argv[++i]) || 0;
+  else if (a === "--auto-close") opt.autoClose = true;
+  else if (a === "--no-auto-close") opt.autoClose = false;
+  else if (a === "--close-grace") opt.closeGrace = Number(process.argv[++i]) || 0;
+  else if (a === "--close-on-attention") opt.closeOnAttention = true;
+  else if (a === "--idle-timeout") opt.idleTimeout = Number(process.argv[++i]) || 0;
+  else if (a === "--once") opt.once = true;
+  else if (a === "--plain") opt.plain = true;
+  else if (a === "--json") opt.json = true;
+  else if (a === "--keys") opt.keys = String(process.argv[++i] || "").split(",").map((s) => s.trim()).filter(Boolean);
+  else if (a === "--codex-bin") opt.codexBin = process.argv[++i] || "";
+  else if (a === "--start-app-server") opt.startAppServer = true;
+  else if (a === "--no-start-app-server") opt.startAppServer = false;
+  else if (a === "-h" || a === "--help") { usage(); process.exit(0); }
+  else { console.error(`unknown flag: ${a}`); usage(); process.exit(5); }
+}
+
+// ---------------------------------------------------------------- 显示宽度
+
+// 终端按列排版，CJK 与多数 emoji 占 2 列。宽度算错只会让右边界毛糙，不影响正确性，
+// 所以这里用一份够用的区间表，不引外部依赖。
+function charWidth(cp) {
+  if (cp === 0) return 0;
+  if (cp < 32 || (cp >= 0x7f && cp < 0xa0)) return 0;
+  if (cp >= 0x0300 && cp <= 0x036f) return 0;
+  if (cp >= 0xfe00 && cp <= 0xfe0f) return 0; // variation selectors
+  if (
+    (cp >= 0x1100 && cp <= 0x115f) ||
+    (cp >= 0x231a && cp <= 0x231b) ||
+    (cp >= 0x23e9 && cp <= 0x23fa) ||
+    (cp >= 0x2600 && cp <= 0x26ff) ||
+    (cp >= 0x2b1b && cp <= 0x2b1c) ||
+    (cp >= 0x2e80 && cp <= 0xa4cf) ||
+    (cp >= 0xac00 && cp <= 0xd7a3) ||
+    (cp >= 0xf900 && cp <= 0xfaff) ||
+    (cp >= 0xfe30 && cp <= 0xfe6f) ||
+    (cp >= 0xff00 && cp <= 0xff60) ||
+    (cp >= 0xffe0 && cp <= 0xffe6) ||
+    (cp >= 0x1f300 && cp <= 0x1f9ff) ||
+    (cp >= 0x20000 && cp <= 0x3fffd)
+  ) return 2;
+  return 1;
+}
+
+function dispWidth(str) {
+  let w = 0;
+  for (const ch of String(str)) w += charWidth(ch.codePointAt(0));
+  return w;
+}
+
+function truncate(str, max) {
+  if (max <= 0) return "";
+  const s = String(str).replace(/[\r\n\t]+/g, " ");
+  if (dispWidth(s) <= max) return s;
+  let out = "";
+  let w = 0;
+  for (const ch of s) {
+    const cw = charWidth(ch.codePointAt(0));
+    if (w + cw > max - 1) break;
+    out += ch;
+    w += cw;
+  }
+  return `${out}…`;
+}
+
+function padTo(str, width) {
+  const gap = width - dispWidth(str);
+  return gap > 0 ? str + " ".repeat(gap) : str;
+}
+
+// ---------------------------------------------------------------- 配色
+
+const C = opt.plain
+  ? new Proxy({}, { get: () => (s) => String(s) })
+  : {
+      dim: (s) => `\x1b[2m${s}\x1b[22m`,
+      bold: (s) => `\x1b[1m${s}\x1b[22m`,
+      cyan: (s) => `\x1b[36m${s}\x1b[39m`,
+      green: (s) => `\x1b[32m${s}\x1b[39m`,
+      yellow: (s) => `\x1b[33m${s}\x1b[39m`,
+      red: (s) => `\x1b[31m${s}\x1b[39m`,
+      magenta: (s) => `\x1b[35m${s}\x1b[39m`,
+      sel: (s) => `\x1b[7m${s}\x1b[27m`,
+    };
+
+// ---------------------------------------------------------------- 分组模型
+
+// 组的划分直接对应技能里的验收语义，不要随便合并：
+//   needs-check = thread 空闲但没落回执 —— 这正是最容易被误判成"完成"的一类。
+const GROUPS = [
+  { key: "blocked", title: "待输入", color: "yellow", match: (j) => j.state === "blocked" },
+  { key: "working", title: "Working", color: "cyan", match: (j) => j.state === "running" },
+  { key: "needs-check", title: "需核验", color: "yellow", match: (j) => (j.state === "done" && !j.receipt) || j.state === "unknown" },
+  { key: "attention", title: "异常", color: "red", match: (j) => ["failed", "stopped", "lost"].includes(j.state) },
+  { key: "completed", title: "Completed", color: "green", match: (j) => j.state === "done" && !!j.receipt },
+];
+
+function groupOf(job) {
+  return GROUPS.find((g) => g.match(job)) || GROUPS[GROUPS.length - 1];
+}
+
+function fmtAge(sec) {
+  if (!Number.isFinite(sec) || sec < 0) return "-";
+  if (sec < 60) return `${Math.floor(sec)}s`;
+  if (sec < 3600) return `${Math.floor(sec / 60)}m`;
+  if (sec < 86400) return `${Math.floor(sec / 3600)}h`;
+  return `${Math.floor(sec / 86400)}d`;
+}
+
+function jobMtime(job) {
+  let t = Number(job.started_at) || 0;
+  for (const f of [job.summary_file, job.meta]) {
+    try {
+      const st = fs.statSync(f);
+      t = Math.max(t, Math.floor(st.mtimeMs / 1000));
+    } catch {}
+  }
+  return t;
+}
+
+// ---------------------------------------------------------------- 采集
+
+function activeCoords() {
+  const seen = new Set();
+  const out = [];
+  const add = (coord, rq) => {
+    if (!coord) return;
+    const abs = path.resolve(coord);
+    if (seen.has(abs)) return;
+    try {
+      if (!fs.statSync(abs).isDirectory()) return;
+    } catch { return; }
+    seen.add(abs);
+    out.push({ coord: abs, rq: rq || path.basename(abs) });
+  };
+  for (const c of opt.coords) add(c, opt.rq);
+  for (const c of jobsLib.listCoords()) add(c.coord, c.rq);
+  return opt.rq ? out.filter((c) => c.rq === opt.rq) : out;
+}
+
+function collect() {
+  const now = Math.floor(Date.now() / 1000);
+  const cutoff = opt.maxAgeHours > 0 ? now - opt.maxAgeHours * 3600 : 0;
+  const jobs = [];
+  let appUnavailable = false;
+  const coords = activeCoords();
+  for (const c of coords) {
+    const snap = jobsLib.readOnlySnapshot(c.coord, {
+      codexBin: opt.codexBin,
+      startAppServer: opt.startAppServer,
+      // 老 RQ 的已收工 worker 会永远留在注册表里。时间窗必须在 thread/read 之前就把它们挡掉，
+      // 否则面板每一次刷新都会为历史记录 spawn 一堆 app 调用。
+      //
+      // 但只剔除「光看磁盘就能确定终态」的（有回执 / 被主控 kill 过）。状态未知的一律放行去问
+      // app-server —— 一个连跑两天的 worker 磁盘文件根本不动，按 mtime 一刀切会让它从面板上消失。
+      filter: (job) => {
+        if (!cutoff) return true;
+        job.ts = jobMtime(job);
+        if (!job.ts || job.ts >= cutoff) return true;
+        const settled = jobsLib.receiptDone(job.summary_file) || job.terminated === "1";
+        return !settled;
+      },
+    });
+    if (snap.appUnavailable) appUnavailable = true;
+    for (const job of snap.jobs) {
+      job.rq = job.rq || c.rq;
+      job.ts = job.ts || jobMtime(job);
+      job.displayName = job.name || `↳${job.module}@${job.rq}`;
+      job.group = groupOf(job).key;
+      jobs.push(job);
+    }
+  }
+  jobs.sort((a, b) => {
+    const ga = GROUPS.findIndex((g) => g.key === a.group);
+    const gb = GROUPS.findIndex((g) => g.key === b.group);
+    if (ga !== gb) return ga - gb;
+    return (b.ts || 0) - (a.ts || 0);
+  });
+  const counts = {};
+  for (const g of GROUPS) counts[g.key] = jobs.filter((j) => j.group === g.key).length;
+  return { now, coords, jobs, counts, appUnavailable };
+}
+
+// ---------------------------------------------------------------- 详情
+
+function readThread(job) {
+  const threadId = job.thread_id || job.id;
+  if (!threadId) return { error: "缺少 thread_id" };
+  try {
+    const callApp = jobsLib.makeAppCaller({
+      coord: job.coord,
+      codexBin: opt.codexBin,
+      startAppServer: opt.startAppServer,
+    });
+    return callApp("thread/read", { threadId, includeTurns: true });
+  } catch (e) {
+    return { error: String(e.message || e) };
+  }
+}
+
+function itemLines(item) {
+  const out = [];
+  const t = item?.type;
+  if (t === "agentMessage" || t === "plan") {
+    const label = t === "plan" ? "📋 计划" : "💬 回复";
+    out.push(C.green(label));
+    for (const line of String(item.text || "").split(/\r?\n/)) out.push(`   ${line}`);
+  } else if (t === "reasoning") {
+    const summary = Array.isArray(item.summary) ? item.summary : [];
+    if (summary.length) {
+      out.push(C.dim("🧠 思考"));
+      for (const s of summary) {
+        for (const line of String(s).split(/\r?\n/)) out.push(C.dim(`   ${line}`));
+      }
+    }
+  } else if (t === "commandExecution") {
+    const status = item.status || "";
+    const exit = item.exitCode === null || item.exitCode === undefined ? "" : ` exit=${item.exitCode}`;
+    const mark = status === "failed" || (item.exitCode && item.exitCode !== 0) ? C.red("✗") : C.cyan("$");
+    out.push(`${mark} ${item.command || ""} ${C.dim(`[${status}${exit}]`)}`);
+    const output = String(item.aggregatedOutput || "").split(/\r?\n/).filter((l) => l !== "");
+    for (const line of output.slice(-6)) out.push(C.dim(`   ${line}`));
+  } else if (t === "fileChange") {
+    const n = Array.isArray(item.changes) ? item.changes.length : 0;
+    out.push(`${C.magenta("✎ 文件改动")} ${n} 处 ${C.dim(`[${item.status || ""}]`)}`);
+    for (const ch of (item.changes || []).slice(0, 10)) {
+      out.push(C.dim(`   ${ch.kind || ch.type || ""} ${ch.path || ""}`));
+    }
+  } else if (t) {
+    out.push(C.dim(`· ${t}${item.status ? ` [${item.status}]` : ""}`));
+  }
+  return out;
+}
+
+function detailLines(job, thread, width) {
+  const lines = [];
+  const push = (s) => lines.push(s);
+  if (thread?.error) {
+    push(C.red(`❌ 读取 thread 失败: ${thread.error}`));
+    push("");
+  }
+  const t = thread?.thread || {};
+  push(C.dim(`thread ${job.thread_id || job.id || "-"}`));
+  push(C.dim(`模型   ${job.model_provider || "?"}/${job.model || "?"}${job.reasoning_effort ? ` · effort=${job.reasoning_effort}` : ""}`));
+  if (job.branch) push(C.dim(`分支   ${job.branch}`));
+  if (job.worktree_cwd) push(C.dim(`工作树 ${job.worktree_cwd}`));
+  push(C.dim(`回执   ${job.receipt ? `🧾 在案 ${job.summary_file}` : "未落回执"}`));
+  push(C.dim("─".repeat(Math.max(10, Math.min(width, 120)))));
+
+  // 有回执时先把回执正文摆出来——这是验收时唯一有契约保证的内容。
+  if (job.receipt) {
+    push(C.green("🧾 回执"));
+    try {
+      for (const line of fs.readFileSync(job.summary_file, "utf8").split(/\r?\n/)) push(`   ${line}`);
+    } catch (e) {
+      push(C.red(`   读取回执失败: ${String(e.message || e)}`));
+    }
+    push(C.dim("─".repeat(Math.max(10, Math.min(width, 120)))));
+  }
+
+  const turns = Array.isArray(t.turns) ? t.turns : [];
+  if (!turns.length && !thread?.error) push(C.dim("（该 thread 还没有可读的 turn）"));
+  turns.forEach((turn, idx) => {
+    push(C.bold(`[turn ${idx + 1}] ${turn.status || ""}`));
+    const items = Array.isArray(turn.items) ? turn.items : [];
+    for (const item of items) for (const l of itemLines(item)) push(l);
+    push("");
+  });
+  return lines;
+}
+
+// ---------------------------------------------------------------- 渲染
+
+function renderList(model, ui) {
+  const width = ui.width;
+  const lines = [];
+  const scope = opt.rq ? `RQ ${opt.rq}` : "全局";
+  lines.push(`${C.bold("Codex Fleet")} ${C.dim(`· ${scope} · ${model.coords.length} 协调目录 · ${model.jobs.length} worker`)}`);
+  const parts = [];
+  for (const g of GROUPS) {
+    if (!model.counts[g.key]) continue;
+    parts.push(C[g.color](`${model.counts[g.key]} ${g.title}`));
+  }
+  lines.push(parts.length ? parts.join(C.dim(" · ")) : C.dim("暂无 worker"));
+  if (model.appUnavailable) lines.push(C.red("⚠ app-server 不可达；未落回执的线程状态读不到"));
+  lines.push("");
+
+  const rows = [];
+  let lastGroup = "";
+  for (const job of model.jobs) {
+    if (job.group !== lastGroup) {
+      lastGroup = job.group;
+      const g = GROUPS.find((x) => x.key === job.group);
+      rows.push({ type: "header", text: C.dim(g.title) });
+    }
+    rows.push({ type: "job", job });
+  }
+  if (!rows.length) {
+    rows.push({ type: "header", text: C.dim("（还没有 Codex worker；派发后会自动出现在这里）") });
+  }
+
+  // 名字列宽随内容自适应，但给 detail 留住至少一半宽度。
+  const nameW = Math.min(
+    Math.max(20, ...model.jobs.map((j) => dispWidth(j.displayName))),
+    Math.floor(width * 0.42)
+  );
+  const ageW = 5;
+  const detailW = Math.max(10, width - 3 - nameW - 2 - ageW - 1);
+
+  for (const row of rows) {
+    if (row.type === "header") { lines.push(row.text); continue; }
+    const job = row.job;
+    const g = GROUPS.find((x) => x.key === job.group);
+    const selected = model.jobs[ui.cursor] === job;
+    // 列宽必须按**无色文本**算——ANSI 转义序列不占列，混进来 padTo 就会算多。
+    const name = padTo(truncate(job.displayName, nameW), nameW);
+    const detail = padTo(truncate(job.detail || "", detailW), detailW);
+    const age = padTo(fmtAge(model.now - (Number(job.started_at) || model.now)), ageW);
+    if (selected) {
+      lines.push(C.sel(padTo(` ✳ ${name}  ${detail} ${age}`, width)));
+    } else {
+      lines.push(` ${C[g.color]("✳")} ${name}  ${C.dim(detail)} ${C.dim(age)}`);
+    }
+  }
+
+  lines.push("");
+  lines.push(C.dim("↑↓ 选择 · → 进详情 · ← 返回 · r 刷新 · q 退出"));
+  return lines;
+}
+
+function renderDetail(model, ui) {
+  const job = model.jobs[ui.cursor];
+  if (!job) return [C.dim("（没有选中的 worker）")];
+  const g = GROUPS.find((x) => x.key === job.group);
+  const head = [
+    `${C.bold(job.displayName)}  ${C[g.color](g.title)} ${C.dim(fmtAge(model.now - (Number(job.started_at) || model.now)))}`,
+    C.dim(job.detail || ""),
+    "",
+  ];
+  const body = ui.detailLines || [C.dim("加载中…")];
+  const foot = [C.dim("← 返回 · ↑↓ 滚动 · r 刷新 · q 退出")];
+  const avail = Math.max(3, ui.height - head.length - foot.length - 1);
+  const maxOff = Math.max(0, body.length - avail);
+  if (ui.follow) ui.detailOffset = maxOff;
+  ui.detailOffset = Math.max(0, Math.min(ui.detailOffset, maxOff));
+  const view = body.slice(ui.detailOffset, ui.detailOffset + avail);
+  const pos = maxOff > 0 ? C.dim(` [${ui.detailOffset}/${maxOff}${ui.follow ? " 跟随" : ""}]`) : "";
+  return [...head, ...view, "", `${foot[0]}${pos}`];
+}
+
+function paint(lines, ui) {
+  const body = lines.slice(0, ui.height).join("\r\n");
+  if (opt.once) {
+    process.stdout.write(`${lines.join("\n")}\n`);
+    return;
+  }
+  process.stdout.write(`\x1b[H\x1b[2J${body}`);
+}
+
+// ---------------------------------------------------------------- 主循环状态
+
+const ui = {
+  view: "list",
+  cursor: 0,
+  detailOffset: 0,
+  follow: true,
+  detailLines: null,
+  detailKey: "",
+  width: process.stdout.columns || 100,
+  height: process.stdout.rows || 30,
+};
+
+let model = collect();
+let sawActive = false;
+let allDoneSince = 0;
+const startedAt = Date.now();
+
+function anyActive(m) {
+  return m.jobs.some((j) => jobsLib.ACTIVE_STATES.has(j.state));
+}
+
+function anyAttention(m) {
+  return m.jobs.some((j) => j.group === "needs-check" || j.group === "attention");
+}
+
+// 自动关闭：只有「见过活跃 worker」之后才可能触发，避免面板刚被派发脚本拉起、
+// 第一个 thread 还没建好就自己关掉。跨 session 的新派发会重新写进注册表，
+// 下一 tick 就会被 collect() 看到并重置计时。
+function maybeAutoClose() {
+  if (!opt.autoClose) return false;
+  const active = anyActive(model);
+  if (active) { sawActive = true; allDoneSince = 0; return false; }
+  if (!sawActive) {
+    if (opt.idleTimeout > 0 && Date.now() - startedAt > opt.idleTimeout * 1000) return true;
+    return false;
+  }
+  if (!opt.closeOnAttention && anyAttention(model)) return false;
+  if (!allDoneSince) allDoneSince = Date.now();
+  return Date.now() - allDoneSince >= opt.closeGrace * 1000;
+}
+
+function clampCursor() {
+  if (!model.jobs.length) { ui.cursor = 0; return; }
+  ui.cursor = Math.max(0, Math.min(ui.cursor, model.jobs.length - 1));
+}
+
+let lastDetailAt = 0;
+
+function refreshDetail(force) {
+  const job = model.jobs[ui.cursor];
+  if (!job) { ui.detailLines = null; return; }
+  const key = `${job.coord}::${job.module}`;
+  const stale = Date.now() - lastDetailAt >= opt.detailInterval;
+  // 换了 worker 必须立刻重读；同一个 worker 则按 detail-interval 节流，
+  // 不跟着列表刷新频率走（列表刷新会更频繁，thread/read 是进程级开销）。
+  if (!force && ui.detailKey === key && ui.detailLines && !stale) return;
+  ui.detailKey = key;
+  ui.detailLines = detailLines(job, readThread(job), ui.width);
+  lastDetailAt = Date.now();
+}
+
+function draw() {
+  ui.width = process.stdout.columns || ui.width;
+  ui.height = process.stdout.rows || ui.height;
+  clampCursor();
+  paint(ui.view === "detail" ? renderDetail(model, ui) : renderList(model, ui), ui);
+}
+
+// ---------------------------------------------------------------- 按键
+
+function applyKey(key) {
+  if (key === "q") return "quit";
+  if (key === "r") {
+    model = collect();
+    if (ui.view === "detail") refreshDetail(true);
+    return "";
+  }
+  if (ui.view === "list") {
+    if (key === "up") ui.cursor = Math.max(0, ui.cursor - 1);
+    else if (key === "down") ui.cursor = Math.min(Math.max(0, model.jobs.length - 1), ui.cursor + 1);
+    else if (key === "home") ui.cursor = 0;
+    else if (key === "end") ui.cursor = Math.max(0, model.jobs.length - 1);
+    else if (key === "right" || key === "enter") {
+      if (model.jobs.length) {
+        ui.view = "detail";
+        ui.detailOffset = 0;
+        ui.follow = true;
+        refreshDetail(true);
+      }
+    }
+    return "";
+  }
+  // detail
+  if (key === "left" || key === "esc") { ui.view = "list"; return ""; }
+  if (key === "up") { ui.follow = false; ui.detailOffset = Math.max(0, ui.detailOffset - 1); return ""; }
+  if (key === "down") { ui.detailOffset += 1; return ""; }
+  if (key === "pgup") { ui.follow = false; ui.detailOffset = Math.max(0, ui.detailOffset - (ui.height - 6)); return ""; }
+  if (key === "pgdn") { ui.detailOffset += ui.height - 6; return ""; }
+  if (key === "end") { ui.follow = true; return ""; }
+  if (key === "home") { ui.follow = false; ui.detailOffset = 0; return ""; }
+  return "";
+}
+
+function decodeKey(buf) {
+  const s = buf.toString("utf8");
+  if (s === "\x03") return "q";            // ctrl-c
+  if (s === "\x1b[A" || s === "k" || s === "\x10") return "up";
+  if (s === "\x1b[B" || s === "j" || s === "\x0e") return "down";
+  if (s === "\x1b[C" || s === "l") return "right";
+  if (s === "\x1b[D" || s === "h") return "left";
+  if (s === "\x1b[5~") return "pgup";
+  if (s === "\x1b[6~") return "pgdn";
+  if (s === "\x1b[H" || s === "g") return "home";
+  if (s === "\x1b[F" || s === "G") return "end";
+  if (s === "\r" || s === "\n") return "enter";
+  if (s === "\x1b") return "esc";
+  if (s === "q") return "q";
+  if (s === "r") return "r";
+  return "";
+}
+
+// ---------------------------------------------------------------- 入口
+
+for (const k of opt.keys) {
+  if (applyKey(k) === "quit") break;
+}
+
+if (opt.json) {
+  const out = {
+    scope: opt.rq || "global",
+    coords: model.coords,
+    counts: model.counts,
+    appUnavailable: model.appUnavailable,
+    view: ui.view,
+    cursor: ui.cursor,
+    selected: model.jobs[ui.cursor]
+      ? { module: model.jobs[ui.cursor].module, rq: model.jobs[ui.cursor].rq, group: model.jobs[ui.cursor].group }
+      : null,
+    jobs: model.jobs.map((j) => ({
+      module: j.module,
+      rq: j.rq,
+      name: j.displayName,
+      state: j.state,
+      group: j.group,
+      receipt: j.receipt ? 1 : 0,
+      thread_id: j.thread_id || j.id || "",
+      detail: j.detail || "",
+    })),
+  };
+  console.log(JSON.stringify(out, null, 2));
+  process.exit(0);
+}
+
+if (opt.once) {
+  if (ui.view === "detail") refreshDetail(true);
+  draw();
+  process.exit(0);
+}
+
+// —— 常驻模式 ——
+// pidfile 是 cc-fleet-panel-open 判断"面板已经开着"的唯一依据，必须在常驻循环起来之前写。
+jobsLib.writePanelPid(process.pid);
+
+let closing = false;
+function shutdown(code) {
+  if (closing) return;
+  closing = true;
+  jobsLib.clearPanelPid(process.pid);
+  if (!opt.plain) process.stdout.write("\x1b[?25h\x1b[?1049l");
+  try { process.stdin.setRawMode(false); } catch {}
+  process.exit(code || 0);
+}
+
+if (!opt.plain) process.stdout.write("\x1b[?1049h\x1b[?25l");
+process.on("SIGINT", () => shutdown(0));
+process.on("SIGTERM", () => shutdown(0));
+process.stdout.on("error", () => shutdown(0));
+
+if (process.stdin.isTTY) {
+  process.stdin.setRawMode(true);
+  process.stdin.resume();
+  process.stdin.on("data", (buf) => {
+    const key = decodeKey(buf);
+    if (!key) return;
+    if (applyKey(key) === "quit") return shutdown(0);
+    draw();
+  });
+}
+
+draw();
+
+const listTimer = setInterval(() => {
+  const before = model.jobs[ui.cursor];
+  model = collect();
+  if (before) {
+    const idx = model.jobs.findIndex((j) => j.coord === before.coord && j.module === before.module);
+    if (idx >= 0) ui.cursor = idx;
+  }
+  if (ui.view === "detail") refreshDetail(false);
+  draw();
+  if (maybeAutoClose()) {
+    clearInterval(listTimer);
+    if (!opt.plain) process.stdout.write("\x1b[?25h\x1b[?1049l");
+    console.log("✅ Codex worker 全部收工，面板自动关闭。");
+    shutdown(0);
+  }
+}, opt.interval);
+
+process.on("exit", () => {
+  jobsLib.clearPanelPid(process.pid);
+  if (!opt.plain && !closing) process.stdout.write("\x1b[?25h\x1b[?1049l");
+});

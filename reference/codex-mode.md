@@ -59,6 +59,31 @@
 Codex App 侧栏直接显示这些非 ephemeral、已命名 thread；CLI 用 `codex resume --all` 看全局列表。
 编排视角的最新状态仍以 `cc-fleet-status-codex-app` / `cc-fleet-read-codex-app` 为准。
 
+## 终端面板（`cc-fleet-panel-codex-app`）
+
+**为什么必须单独做一个**：`claude agents` 的 FleetView 只列 `~/.claude/sessions/<pid>.json`（活着的
+claude 进程自注册）+ `~/.claude/daemon/roster.json`（daemon 托管的 PTY worker）里的条目。Codex worker
+既没有独立进程也没有 PTY，伪造 `jobs/<short>/state.json` 或 `sessions/<pid>.json` 实测都不会被列出
+（有进程/密钥校验）。所以 codex 侧的可视化只能自己出一个等价面板。
+
+`cc-dispatch-codex-app` 派发成功后**自动**：登记 `$COORD` 进全局注册表 → 在当前 Ghostty 窗口右侧
+分屏拉起面板。用法与按键见 `commands.md`。设计上的几条硬约束：
+
+1. **只读**。面板每几秒刷一次，绝不 `thread/resume` / `thread/unarchive` / 取消 pin / 写回 `.codex-app.env`
+   ——否则会和编排者的 status 调用互相打架，还会把副作用放大成刷屏级写入。状态判定与 status 脚本
+   共用 `scripts/lib/codex-app-jobs.js` 的纯函数，两边对同一 worker 的答案必然一致。
+2. **全局**。worker 是跨 session、跨仓库派发的，面板读全局注册表
+   （`~/.claude/fleet/codex-coords.json`）而不是某个 cwd 的 `.git/fleet`。
+3. **「空闲 ≠ 完成」照旧**。thread idle 但没落 `result:` 回执的，单独归入**需核验**组，不混进
+   Completed，**也不触发自动关闭**——那正是最需要你看一眼的状态。
+4. **自动关闭**只在「见过活跃 worker → 现在全部收工」时触发，跨 session 的新派发会重置计时。
+   全绿收工才关；有需核验/异常就一直留着（要强制关加 `--close-on-attention`）。
+
+分屏走 Ghostty 1.3+ 的 AppleScript 字典（`split ... with configuration`），不是模拟 ⌘D：模拟按键要
+辅助功能权限、会被前台应用抢走、也拿不到新 surface 的句柄用于幂等与关闭。首次会弹一次"允许控制
+Ghostty"授权框。Ghostty 没开 / 没授权 / 非 macOS —— 一律只提示不报错，**绝不让已派发成功的 thread
+因为面板没开出来而被判失败**。
+
 ## 排障
 
 先看对应 `-codex-app` 命令的报错与 `--help`，再依次：

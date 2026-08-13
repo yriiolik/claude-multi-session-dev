@@ -12,3 +12,6 @@
 # 测试临时目录（若有脚本把中间产物写到本目录下）
 tmp/
 .tmp/
+
+# 任务隔离工作树（Claude Code / git worktree）
+.claude/worktrees/

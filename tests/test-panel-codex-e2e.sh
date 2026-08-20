@@ -3,6 +3,14 @@
 # 全程假 codex app-server + 假 osascript，不碰真实 Ghostty / Codex。
 set -u
 
+# Claude Code 之类的环境会注入 FORCE_COLOR，node -pe 会给输出套 ANSI 颜色码，
+# 精确等值断言就会撞出 "期望 [0] 实得 [^[[33m0^[[39m]" 这种假失败。测试里一律关掉着色。
+export FORCE_COLOR=0 NO_COLOR=1
+
+# RQ 序号池/注册表现在是【跨仓库全局】的（~/.claude/fleet）。测试一律指到临时目录，
+# 否则会污染真实全局池、甚至抬高真实高水位。
+export CC_FLEET_HOME="${CC_FLEET_HOME_TEST_OVERRIDE:-$(mktemp -d)}"
+
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DISPATCH="$ROOT/scripts/cc-dispatch-codex-app"
 PANEL="$ROOT/scripts/cc-fleet-panel-codex-app"

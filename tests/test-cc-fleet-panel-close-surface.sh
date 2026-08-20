@@ -5,6 +5,10 @@
 # 这个脚本的两条安全线是重点：退出码非 0 要留现场、nonce 对不上绝不关（那可能是用户自己的终端）。
 set -u
 
+# Claude Code 之类的环境会注入 FORCE_COLOR，node -pe 会给输出套 ANSI 颜色码，
+# 精确等值断言就会撞出 "期望 [0] 实得 [^[[33m0^[[39m]" 这种假失败。测试里一律关掉着色。
+export FORCE_COLOR=0 NO_COLOR=1
+
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/scripts/cc-fleet-panel-close-surface"
 PASS=0

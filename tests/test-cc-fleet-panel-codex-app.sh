@@ -3,6 +3,10 @@
 # 时间窗、导航、执行中标记动画、详情走 rollout。
 set -u
 
+# Claude Code 之类的环境会注入 FORCE_COLOR，node -pe 会给输出套 ANSI 颜色码，
+# 精确等值断言就会撞出 "期望 [0] 实得 [^[[33m0^[[39m]" 这种假失败。测试里一律关掉着色。
+export FORCE_COLOR=0 NO_COLOR=1
+
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PANEL="$ROOT/scripts/cc-fleet-panel-codex-app"
 PASS=0

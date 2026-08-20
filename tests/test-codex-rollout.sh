@@ -2,6 +2,10 @@
 # codex-rollout 解析器回归：rollout 定位、事件→时间线、命令/输出配对、cd 前缀剥离、最近活动。
 set -u
 
+# Claude Code 之类的环境会注入 FORCE_COLOR，node -pe 会给输出套 ANSI 颜色码，
+# 精确等值断言就会撞出 "期望 [0] 实得 [^[[33m0^[[39m]" 这种假失败。测试里一律关掉着色。
+export FORCE_COLOR=0 NO_COLOR=1
+
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PASS=0; FAIL=0; CASE="init"
 TMP="$(mktemp -d)"

@@ -43,12 +43,31 @@ eval "$(~/.claude/skills/multi-session-dev/scripts/cc-fleet-init)"
 > 🚫 **RQ 只能由脚本现场分配，绝不凭「今天日期+NNN」在脑内重构**（真实串台事故见 `pitfalls.md`）。
 > 同一 RQ 的后续批次（契约先行第二批、修复批）**复用本轮 `$RQ`，别重跑 init**——init 会另发新号。
 
+### 序号池是【跨仓库全局】的
+
+RQ 是全机命名空间（worker 名 `↳<模块>@<RQ>`、job 列表、面板都按它认人），所以序号池和
+「RQ→owner 协调目录」注册表放在 **`~/.claude/fleet`**（`CC_FLEET_HOME` 可改，测试用）：
+
+| 路径 | 作用 |
+|------|------|
+| `~/.claude/fleet/.seq/<stem>` | 全局高水位序号（只增不减，目录被 GC 也不回退） |
+| `~/.claude/fleet/registry/<RQ>` | 这个号归谁：owner 仓库 + 协调目录 + 分配时间 |
+
+取号 = `max(本仓目录扫描, 本仓 .seq, 全局 .seq, 全局注册表)` + 1，并**先取全局锁再取本仓锁**，
+所以两个主 session 在**不同仓库同时** `cc-fleet-init` 也各拿各号。全局目录不可写时只告警不阻断，
+退化成旧的「本仓唯一」。
+
+```bash
+cc-fleet-coord --seed-global   # 老仓库升级用：把本仓已有 RQ 灌进全局池 + 注册表（幂等；顺带报出历史撞号）
+```
+每个用过 fleet 的仓库跑一次即可，不跑的话升级后第一次分配仍可能撞上别仓当天已用的号。
+
 ## 协调目录
 
 ```bash
 cc-fleet-coord <RQ>                       # 解析 canonical 目录 <git-common-dir>/fleet/<RQ>
 cc-fleet-coord <RQ> --no-mkdir            # 只读解析
-cc-fleet-coord <RQ> --fresh               # 防撞：已被往轮占用则 exit 4（用户给显式 RQ 时用）
+cc-fleet-coord <RQ> --fresh               # 防撞：已被往轮 run 占用、或全局注册表显示归别的仓库 → exit 4
 cc-fleet-coord <RQ> --put <rel> [src]     # 把文件落进协调目录（绕开后台 job 的 Write 隔离闸）
 ```
 

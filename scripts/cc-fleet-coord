@@ -4,9 +4,11 @@
 # 三种职责（默认=解析；加 --alloc=分配；加 --fresh=解析并防撞）：
 #   1) 解析（默认，向后兼容）：把【已定的】<RQ-id> 映射到 worktree 无关的 canonical 绝对路径
 #        <git-common-dir>/fleet/<RQ>，并 mkdir -p。worker / cc-fleet-status / cc-fleet-summary 都靠它。
-#   2) 分配（--alloc）：扫【所有通道】（canonical + 主树/各 worktree 的 .fleet + tasks 布局），自动挑
-#        同日下一个【没被占用】的序号，claim（建 canonical 目录占位）后把新 RQ-id 打到 stdout。
-#        —— 根治「主 session 同一天起多个 run、肉眼挑 001 又撞上早些时候已用的协调目录」这一典型事故。
+#   2) 分配（--alloc）：扫【所有通道】（canonical + 主树/各 worktree 的 .fleet + tasks 布局）**以及跨仓库
+#        共享的全局序号池/注册表（~/.claude/fleet，CC_FLEET_HOME 可改）**，自动挑下一个【全机没被占用】的
+#        序号，claim（建 canonical 目录占位 + 登记 owner）后把新 RQ-id 打到 stdout。
+#        —— 根治两类事故：①同仓库同日多轮肉眼挑 001 撞上早些时候的目录；②两个主 session 在【不同仓库】
+#           各自从 001 起、同日发出同一个 RQ（2026-08-20 实际发生：supply-agent 与 supply-all/qzc 都是 -001）。
 #   3) 防撞（--fresh）：解析一个【显式 RQ】，但若它已被【往轮 run】占用（任一通道已有
 #        *.sid / *.summary.md / contracts/）→ 报错退出（exit 4），提示改用 --alloc。
 #        供"用户/调用方给了显式 RQ 名"时兜底，避免静默复用别人的协调目录。
@@ -25,6 +27,7 @@
 #   cc-fleet-coord --check-join <coord> <m> [--join]  # 派发兜底闸：新模块写进已被【别的模块】占用且超新鲜窗口的协调目录则 exit 6（疑似复用别任务 RQ）
 #   cc-fleet-coord <RQ> --put <relpath> [src] # 把文件落进协调目录（绕开后台 job 的 Write/Edit 隔离闸）；省略 src 从 stdin 读；打印目标绝对路径
 #   cc-fleet-coord --gc [days]             # 清理：删 canonical fleet 里 mtime 超 days(默认7) 天的协调目录 + 过期序号池文件（cc-fleet-init 每次自动调）
+#   cc-fleet-coord --seed-global           # 一次性：把本仓库已有 RQ 灌进【全局】序号池/注册表（升级到全局池后每个老仓库跑一次）
 #
 # 注：日常派发别单独敲这些子命令 —— 用一次性入口 `cc-fleet-init`（同目录），一句 eval 就 GC + 取新号 + 建集成分支 + 落任务信息。
 #
@@ -55,6 +58,7 @@ for a in "$@"; do
     --check-join)  MODE=checkjoin ;;
     --put)         MODE=put ;;
     --gc)          MODE=gc ;;
+    --seed-global) MODE=seedglobal ;;
     --join)        JOIN=1 ;;
     -*) echo "未知选项: $a" >&2; exit 2 ;;
     *)  POS+=("$a") ;;
@@ -62,6 +66,62 @@ for a in "$@"; do
 done
 # 兼容 macOS bash 3.2：空数组下 ${POS[0]:-} 安全，"${POS[@]}" 在 set -u 会炸，故都用默认形/先判长度。
 ARG="${POS[0]:-}"
+
+# ---- 全局序号池 / 注册表：RQ 编号必须【全机唯一】，不能只在本仓库内唯一 ----
+# 2026-08-20 事故：两个主 session 分别在 /Users/lik/ai/supply-agent 与 /Users/lik/ai/supply-all/qzc
+#   各跑一次 cc-fleet-init。两仓的序号池 <git-common-dir>/fleet/.seq 互不可见 → 同一天都发出
+#   RQ-2026-0820-001。但 RQ 是【全机命名空间】：worker session 名 ↳<模块>@<RQ>、job 列表、fleet 面板、
+#   watch/status/reply/kill 全按它认人 —— 两个毫不相干的任务在同一屏里同号，人和工具都分不清谁是谁。
+# 根治：把「高水位序号池」和「RQ→owner 协调目录 注册表」提到跨仓库共享的 ~/.claude/fleet：
+#   • alloc 取 max(本仓目录扫描, 本仓 .seq, 全局 .seq, 全局注册表同 stem 序号) + 1 —— 任一通道见过就跳过；
+#   • 分配成功把 RQ 连同 owner 仓库/协调目录写进注册表，--fresh / --check-join 据此识别「这个号是别的仓库的」。
+# 隔离/降级：CC_FLEET_HOME 可指向别处（测试用）；全局目录不可写时**只告警不阻断**，退化成旧的本仓唯一。
+GLOBAL_FLEET_DIR="${CC_FLEET_HOME:-$HOME/.claude/fleet}"
+GLOBAL_SEQ_DIR="$GLOBAL_FLEET_DIR/.seq"
+GLOBAL_REG_DIR="$GLOBAL_FLEET_DIR/registry"
+
+_global_usable(){ mkdir -p "$GLOBAL_SEQ_DIR" "$GLOBAL_REG_DIR" 2>/dev/null && [[ -w "$GLOBAL_SEQ_DIR" && -w "$GLOBAL_REG_DIR" ]]; }
+
+# registry_owner_coord <RQ> —— 打印该 RQ 在全局注册表里登记的 owner 协调目录（未登记则 exit 1、无输出）
+registry_owner_coord(){
+  local f="$GLOBAL_REG_DIR/$1" line
+  [[ -f "$f" ]] || return 1
+  line="$(grep -m1 '^coord=' "$f" 2>/dev/null)" || return 1
+  [[ -n "$line" ]] || return 1
+  printf '%s\n' "${line#coord=}"
+}
+
+# _same_path <a> <b> —— 路径等价比较（软链/私有前缀 /var↔/private/var 归一，避免误拦）
+_same_path(){
+  local a="$1" b="$2" ra rb
+  [[ "$a" == "$b" ]] && return 0
+  ra="$(cd "$a" 2>/dev/null && pwd -P)" || ra="$a"
+  rb="$(cd "$b" 2>/dev/null && pwd -P)" || rb="$b"
+  [[ "$ra" == "$rb" ]]
+}
+
+# global_taken_serials <stem> —— 全局注册表里该 stem【已发出去过】的序号（每行一个，含别的仓库发的）
+global_taken_serials(){
+  local stem="$1" f base serial
+  [[ -d "$GLOBAL_REG_DIR" ]] || return 0
+  for f in "$GLOBAL_REG_DIR/$stem"-*; do
+    [[ -f "$f" ]] || continue
+    base="$(basename "$f")"; serial="${base#"$stem"-}"
+    [[ "$serial" =~ ^[0-9]+$ ]] && printf '%s\n' "$serial"
+  done
+}
+
+# write_registry <RQ> <coord> —— 把「这个编号归谁」登记进全局注册表（跨仓库撞号的判据）
+write_registry(){
+  local rq="$1" coord="$2" f="$GLOBAL_REG_DIR/$1"
+  {
+    echo "rq=$rq"
+    echo "coord=$coord"
+    echo "repo=${TOP:-$(pwd)}"
+    echo "cwd=$(pwd)"
+    echo "allocated_at=$(date '+%Y-%m-%d %H:%M:%S')"
+  } > "$f" 2>/dev/null || { echo "⚠ 写全局注册表失败：$f（忽略）" >&2; return 1; }
+}
 
 # ---- check-join：派发兜底闸（cc-dispatch / cc-dispatch-batch 调用）----
 # 用途：把一个【新模块】写进【已被别的模块占用、且最后活动超出新鲜窗口】的协调目录前，先在这里拦一道。
@@ -79,6 +139,22 @@ if [[ "$MODE" == checkjoin ]]; then
   [[ -n "$coord" && -n "$module" ]] || {
     echo "用法: cc-fleet-coord --check-join <coord-dir> <module> [--join]" >&2; exit 2; }
   [[ -n "${FLEET_NO_REUSE_GUARD:-}" ]] && exit 0   # 闸总开关：关
+
+  # 跨仓库同号闸（2026-08-20 事故）：本 RQ 若已在全局注册表登记给【另一个仓库】的协调目录，
+  #   说明两个主 session 撞了同一个编号 —— 派发当场拦下，别让两个任务的 worker 在同一屏里同名。
+  #   注册表由 --alloc / --seed-global 写；旧的、没登记过的 RQ 查不到 owner → 不拦（向后兼容）。
+  reg_owner="$(registry_owner_coord "$(basename "$coord")" 2>/dev/null || true)"
+  if [[ -n "$reg_owner" ]] && ! _same_path "$reg_owner" "$coord"; then
+    echo "❌ RQ '$(basename "$coord")' 在全局注册表里属于【另一个仓库】：" >&2
+    echo "     注册 owner : ${reg_owner}" >&2
+    echo "     本次要写的 : ${coord}" >&2
+    echo "   两个主 session 撞号了（各自仓库的序号池独立时会同日都发 -001）。正解：" >&2
+    echo "   • 本任务重新取号：eval \"\$(cc-fleet-init)\" —— 全局池会跳过所有已发编号。" >&2
+    echo "   • 若确认是同一任务跨仓库协作（罕见）→ 本次派发加 --join 放行。" >&2
+    [[ "$JOIN" -eq 1 ]] || exit 6
+    echo "↩ --join 已确认，放行。" >&2
+  fi
+
   [[ -d "$coord" ]] || exit 0                      # 目录还不存在 = 全新，放行
   newest=0; others=()
   for f in "$coord"/*.sid "$coord"/*.summary.md; do
@@ -121,10 +197,12 @@ _age_secs(){ local m; m="$(_epoch_of "$1")"; [[ "$m" =~ ^[0-9]+$ ]] || m=0; echo
 
 # ---- 原子锁：mkdir 是 POSIX 原子操作，作 alloc 的临界区锁，杜绝并发 alloc 同时算出同一空号 ----
 #   短生命周期脚本，锁只在单次 --alloc 期间持有。陈旧锁（>30s，多半是崩溃残留）自动破除，不会永久卡死。
-FLEET_LOCK=""
-_acquire_lock(){
-  local lockdir="$FLEET_DIR/.lock" waited=0 m
-  mkdir -p "$FLEET_DIR" 2>/dev/null || true
+#   跨仓库并发（两个主 session 在不同仓库同时 alloc）只有【全局锁】拦得住，故 alloc 先取全局锁、
+#   再取本仓锁 —— 顺序固定（全局→本仓）才不会两把锁交叉死锁。
+FLEET_LOCKS=()
+_acquire_lock_at(){
+  local dir="$1" lockdir="$1/.lock" waited=0 m
+  mkdir -p "$dir" 2>/dev/null || return 0     # 目录建不出来（如全局池不可写）→ 视作无锁，绝不卡死调用方
   while ! mkdir "$lockdir" 2>/dev/null; do
     # 破除陈旧锁：仅当拿到【真实且为正】的 mtime 且确实超 30s 才破。
     #   ⚠ 高并发下 stat 可能与 rmdir 竞争而失败(返回 0)——把 0/失败当作"锁还活着"重试，
@@ -134,11 +212,15 @@ _acquire_lock(){
       rm -rf "$lockdir" 2>/dev/null; continue
     fi
     sleep 0.1; waited=$((waited+1))
-    (( waited >= 100 )) && { echo "⚠ 获取 fleet 锁超时(10s)，继续（可能与并发 alloc 竞争）" >&2; return 0; }
+    (( waited >= 100 )) && { echo "⚠ 获取 fleet 锁超时(10s)：${lockdir}（继续，可能与并发 alloc 竞争）" >&2; return 0; }
   done
-  FLEET_LOCK="$lockdir"
+  FLEET_LOCKS+=("$lockdir")
 }
-_release_lock(){ [[ -n "$FLEET_LOCK" ]] && rmdir "$FLEET_LOCK" 2>/dev/null; FLEET_LOCK=""; }
+_release_lock(){
+  local i
+  for (( i=${#FLEET_LOCKS[@]}-1; i>=0; i-- )); do rmdir "${FLEET_LOCKS[$i]}" 2>/dev/null; done
+  FLEET_LOCKS=()
+}
 
 # ---- gc_old_dirs [days] —— 删 canonical fleet 里 mtime 超 days(默认7) 天的协调目录 + 过期序号文件 ----
 #   只清 canonical <git-common-dir>/fleet/RQ-*，不碰各 worktree 的 .fleet（那些归 worker，由 ExitWorktree 清）。
@@ -155,12 +237,13 @@ gc_old_dirs(){
     age="$(_age_secs "$d")"
     if (( age > cutoff )); then rm -rf "$d" 2>/dev/null && removed=$((removed+1)); else kept=$((kept+1)); fi
   done
-  if [[ -d "$FLEET_DIR/.seq" ]]; then
-    for f in "$FLEET_DIR/.seq"/*; do
+  for seqdir in "$FLEET_DIR/.seq" "$GLOBAL_SEQ_DIR" "$GLOBAL_REG_DIR"; do
+    [[ -d "$seqdir" ]] || continue
+    for f in "$seqdir"/*; do
       [[ -f "$f" ]] || continue
       (( $(_age_secs "$f") > cutoff )) && rm -f "$f" 2>/dev/null
     done
-  fi
+  done
   echo "🧹 fleet GC：删除 ${removed} 个 >${days} 天的协调目录，保留 ${kept} 个（canonical ${FLEET_DIR}）" >&2
 }
 
@@ -284,6 +367,48 @@ has_run_artifacts() {
   return 1
 }
 
+# ---- seed-global：把【本仓库已有的 RQ】灌进全局序号池 + 注册表（升级到全局池时跑一次）----
+# 为什么需要：全局池是本次新加的，此前各仓库各自从 001 起，池里空着。若不灌种，升级后第一次 alloc
+#   仍会撞上别的仓库当天已用的号。对每个用过 fleet 的仓库各跑一次即可（幂等，可重复跑）：
+#     cd <repo> && cc-fleet-coord --seed-global
+#   顺带体检：同一个 RQ 已被别的仓库登记 → 打印⚠，把历史撞号显式暴露出来（不改数据，人来裁定）。
+if [[ "$MODE" == seedglobal ]]; then
+  _global_usable || { echo "❌ 全局池不可写：${GLOBAL_FLEET_DIR}" >&2; exit 2; }
+  trap '_release_lock' EXIT INT TERM
+  _acquire_lock_at "$GLOBAL_FLEET_DIR"
+  seeded=0; bumped=0; dups=0
+  _bump_global_seq(){   # <stem> <serial>：全局高水位只增不减
+    local stem="$1" serial="$2" cur=0 f="$GLOBAL_SEQ_DIR/$1"
+    [[ -f "$f" ]] && { read -r cur < "$f" || cur=0; [[ "$cur" =~ ^[0-9]+$ ]] || cur=0; }
+    if (( serial > cur )); then printf '%s\n' "$serial" > "$f"; bumped=$((bumped+1)); fi
+  }
+  for d in "$FLEET_DIR"/RQ-*; do
+    [[ -d "$d" ]] || continue
+    rq="$(basename "$d")"; stem="${rq%-*}"; serial="${rq##*-}"
+    [[ "$serial" =~ ^[0-9]+$ ]] || continue
+    _bump_global_seq "$stem" "$((10#$serial))"
+    owner="$(registry_owner_coord "$rq" 2>/dev/null || true)"
+    if [[ -z "$owner" ]]; then
+      write_registry "$rq" "$d" && seeded=$((seeded+1))
+    elif ! _same_path "$owner" "$d"; then
+      dups=$((dups+1))
+      echo "⚠ 历史撞号：${rq} 已登记给 ${owner}，本仓也有 ${d} —— 两个任务同号，请人工确认后再收编号。" >&2
+    fi
+  done
+  # 本仓 .seq 里的高水位也并进去（对应目录可能已被 GC 掉，但那些号确实发出去过）
+  if [[ -d "$FLEET_DIR/.seq" ]]; then
+    for f in "$FLEET_DIR/.seq"/*; do
+      [[ -f "$f" ]] || continue
+      v=0; read -r v < "$f" || v=0; [[ "$v" =~ ^[0-9]+$ ]] || continue
+      _bump_global_seq "$(basename "$f")" "$((10#$v))"
+    done
+  fi
+  _release_lock; trap - EXIT INT TERM
+  echo "✅ 已灌种全局池：新登记 ${seeded} 个 RQ、抬高 ${bumped} 个 stem 高水位、发现 ${dups} 处历史撞号（全局目录 ${GLOBAL_FLEET_DIR}）" >&2
+  printf '%s\n' "$GLOBAL_FLEET_DIR"
+  exit 0
+fi
+
 if [[ "$MODE" == alloc ]]; then
   # 计算 stem：无参→今天 RQ-YYYY-MMDD；ISO 日期→归一化为 RQ-YYYY-MMDD；其余→当作自定义前缀原样用。
   if [[ -z "$ARG" ]]; then
@@ -295,9 +420,12 @@ if [[ "$MODE" == alloc ]]; then
   fi
   # 临界区：加锁后读高水位→claim→写回，杜绝并发 alloc 同时算出同一空号。锁在退出/中断时释放。
   trap '_release_lock' EXIT INT TERM
-  _acquire_lock
-  # 高水位 = max(跨所有通道的目录序号扫描, 持久序号池 .seq/<stem>)。
-  #   目录扫描抓活着的目录（含别 worktree 的 .fleet）；.seq 是持久池，即便目录被 GC/手删也不回退 → 永不重号。
+  GLOBAL_OK=0; _global_usable && GLOBAL_OK=1
+  (( GLOBAL_OK == 1 )) && _acquire_lock_at "$GLOBAL_FLEET_DIR"   # 顺序固定：先全局锁
+  _acquire_lock_at "$FLEET_DIR"                                  # 再本仓锁
+  # 高水位 = max(本仓跨通道目录扫描, 本仓 .seq, 全局 .seq, 全局注册表同 stem 已发序号)。
+  #   目录扫描抓活着的目录（含别 worktree 的 .fleet）；.seq 是持久池，即便目录被 GC/手删也不回退；
+  #   全局两路让【别的仓库】发过的号也算占用 —— 这是「跨仓库同日都发 -001」的根治点。
   max=0
   while IFS= read -r s; do
     s=$((10#$s)); (( s > max )) && max=$s
@@ -308,16 +436,36 @@ if [[ "$MODE" == alloc ]]; then
     [[ "$seqval" =~ ^[0-9]+$ ]] || seqval=0
     (( seqval > max )) && max=$seqval
   fi
+  global_seqfile="$GLOBAL_SEQ_DIR/$stem"
+  if (( GLOBAL_OK == 1 )); then
+    while IFS= read -r s; do
+      s=$((10#$s)); (( s > max )) && max=$s
+    done < <(global_taken_serials "$stem")
+    if [[ -f "$global_seqfile" ]]; then
+      read -r gseqval < "$global_seqfile" || gseqval=0
+      [[ "$gseqval" =~ ^[0-9]+$ ]] || gseqval=0
+      (( gseqval > max )) && max=$gseqval
+    fi
+  fi
   next=$((max + 1))
   rq="$(printf '%s-%03d' "$stem" "$next")"
   coord="$FLEET_DIR/$rq"
   mkdir -p "$coord"                       # claim：占位目录
   mkdir -p "$FLEET_DIR/.seq"
-  printf '%s\n' "$next" > "$local_seqfile" # 持久池写回高水位（不回退的单一事实源）
+  printf '%s\n' "$next" > "$local_seqfile" # 本仓持久池写回高水位
+  if (( GLOBAL_OK == 1 )); then
+    printf '%s\n' "$next" > "$global_seqfile"   # 全局持久池写回高水位（跨仓库单一事实源）
+    write_registry "$rq" "$coord"               # 登记 owner：谁的仓库、哪个协调目录
+  fi
   _release_lock; trap - EXIT INT TERM
   # 全角标点紧跟变量时必须用 ${..} 花括号界定变量名，否则 set -u 会把全角字节并进名字 → 误判 unbound
   echo "✓ 分配新 RQ：${rq}（stem=${stem} 已用最高序号 ${max} → 取 ${next}；持久池 .seq/${stem}=${next}）" >&2
   echo "  canonical 协调目录：${coord}" >&2
+  if (( GLOBAL_OK == 1 )); then
+    echo "  全局序号池：${GLOBAL_SEQ_DIR}/${stem}=${next}（跨仓库共享，保证 RQ 全机唯一）" >&2
+  else
+    echo "  ⚠ 全局序号池不可写（${GLOBAL_FLEET_DIR}）——本次只保证【本仓库内】不重号，跨仓库仍可能撞号。" >&2
+  fi
   printf '%s\n' "$rq"
   exit 0
 fi
@@ -329,6 +477,17 @@ fi
 }
 RQ="$ARG"
 
+if [[ "$MODE" == fresh ]]; then
+  # 跨仓库同号：本 RQ 在全局注册表里属于别的仓库 → 和「被往轮 run 占用」等价，一样拒绝复用。
+  reg_owner="$(registry_owner_coord "$RQ" 2>/dev/null || true)"
+  if [[ -n "$reg_owner" ]] && ! _same_path "$reg_owner" "$COMMON_DIR/fleet/$RQ"; then
+    echo "❌ RQ '$RQ' 在全局注册表里属于【另一个仓库】的协调目录：${reg_owner}" >&2
+    echo "   （RQ 是全机命名空间：worker 名 ↳<模块>@<RQ>、job 列表、面板都按它认人，重号必串台。）" >&2
+    echo "   改用：eval \"\$(cc-fleet-init)\" 取一个全新空号（全局池会跳过所有已发编号）。" >&2
+    exit 4
+  fi
+fi
+
 if [[ "$MODE" == fresh ]] && has_run_artifacts "$RQ"; then
   echo "❌ RQ '$RQ' 的协调目录已被往轮 run 占用（任一通道已有 .sid/.summary.md/contracts）。" >&2
   echo "   别复用别人的协调目录 —— 改用：RQ=\"\$(cc-fleet-coord --alloc)\" 取一个全新空号。" >&2
@@ -337,4 +496,22 @@ fi
 
 COORD="$COMMON_DIR/fleet/$RQ"
 [[ "$MKDIR" -eq 1 ]] && mkdir -p "$COORD"
+
+# 解析时【补登记】：把没在全局注册表里的 RQ 认领到本仓，并把它的序号并进全局高水位。
+#   为什么：--alloc 只覆盖"按规矩取号"的路径，可有人手工建了协调目录（旧脚本、手拼编号、外部工具）。
+#   那种号对全局池是隐身的，别的仓库照样能再发一次 → 又是一次跨仓库重号。解析是所有路径的必经之地
+#   （worker / dispatch / status / watch 都会调），在这里补登记等于把隐身编号拉回全局视野。
+#   只在【尚未登记】时写，绝不改已有 owner —— 谁先登记谁是 owner，冲突交给 --fresh / --check-join 去拦。
+if [[ "$MKDIR" -eq 1 ]] && _global_usable; then
+  if ! registry_owner_coord "$RQ" >/dev/null 2>&1; then
+    write_registry "$RQ" "$COORD" 2>/dev/null || true
+    rq_stem="${RQ%-*}"; rq_serial="${RQ##*-}"
+    if [[ "$rq_serial" =~ ^[0-9]+$ ]]; then
+      gcur=0; gf="$GLOBAL_SEQ_DIR/$rq_stem"
+      [[ -f "$gf" ]] && { read -r gcur < "$gf" || gcur=0; [[ "$gcur" =~ ^[0-9]+$ ]] || gcur=0; }
+      (( 10#$rq_serial > gcur )) && printf '%s\n' "$((10#$rq_serial))" > "$gf" 2>/dev/null
+    fi
+  fi
+fi
+
 printf '%s\n' "$COORD"

@@ -6,7 +6,10 @@
 #   手拼编号，就会复用别任务的协调目录 → .sid/回执串台、Monitor 盯错 RQ、job 列表编号重复。
 #   本脚本把四件事收敛成【一条 eval】，从结构上砍掉"绕过 --alloc / 手拼编号"的机会：
 #     ① GC：删 canonical fleet 里 >7 天的旧协调目录 + 过期序号池文件（可 --no-gc / --gc-days N）
-#     ② --alloc：从【持久序号池 .seq/<stem> + 原子锁】取全新单调 RQ，目录被清也永不回退重号
+#     ② --alloc：从【持久序号池 .seq/<stem> + 原子锁】取全新单调 RQ，目录被清也永不回退重号。
+#        序号池是【跨仓库全局】的（~/.claude/fleet，CC_FLEET_HOME 可改）——RQ 是全机命名空间
+#        （worker 名 ↳<模块>@<RQ>、job 列表、面板都按它认人），只在本仓库内唯一不够：2026-08-20
+#        两个主 session 分别在 supply-agent 与 supply-all/qzc 各跑一次 init，同日都拿到 -001。
 #     ③ 解析 canonical COORD（<git-common-dir>/fleet/<RQ>，worktree 无关绝对路径）
 #     ④ --init-base：在 base（默认当前分支）上幂等建集成分支 fleet/<RQ>，并把任务信息写进 <COORD>/task.meta
 #

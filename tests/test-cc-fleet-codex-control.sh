@@ -3,6 +3,9 @@
 # 派发脚本现在会自动拉起 Ghostty 分屏面板并写全局注册表。测试里一律关掉：
 # 否则跑一次测试就会在真实 Ghostty 上弹出一堆分屏，还会污染 ~/.claude/fleet。
 export CC_FLEET_PANEL=0
+# RQ 序号池/注册表现在是【跨仓库全局】的（~/.claude/fleet）。测试一律指到临时目录，
+# 否则会污染真实全局池、甚至抬高真实高水位。
+export CC_FLEET_HOME="${CC_FLEET_HOME_TEST_OVERRIDE:-$(mktemp -d)}"
 set -u
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"

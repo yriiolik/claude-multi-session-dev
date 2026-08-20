@@ -6,6 +6,10 @@
 # 测试铁律：断言只增强不削弱；失败一律是脚本 bug，改脚本不改断言。
 set -u
 
+# RQ 序号池/注册表现在是【跨仓库全局】的（~/.claude/fleet）。测试一律指到临时目录，
+# 否则会污染真实全局池、甚至抬高真实高水位。
+export CC_FLEET_HOME="${CC_FLEET_HOME_TEST_OVERRIDE:-$(mktemp -d)}"
+
 SCRIPTS="$(cd "$(dirname "$0")/.." && pwd)/scripts"
 INIT_BIN="$SCRIPTS/cc-fleet-init"
 COORD_BIN="$SCRIPTS/cc-fleet-coord"

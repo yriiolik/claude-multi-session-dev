@@ -8,6 +8,9 @@
 # 派发脚本现在会自动拉起 Ghostty 分屏面板并写全局注册表。测试里一律关掉：
 # 否则跑一次测试就会在真实 Ghostty 上弹出一堆分屏，还会污染 ~/.claude/fleet。
 export CC_FLEET_PANEL=0
+# RQ 序号池/注册表现在是【跨仓库全局】的（~/.claude/fleet）。测试一律指到临时目录，
+# 否则会污染真实全局池、甚至抬高真实高水位。
+export CC_FLEET_HOME="${CC_FLEET_HOME_TEST_OVERRIDE:-$(mktemp -d)}"
 set -u
 
 COORD_BIN="$(cd "$(dirname "$0")/.." && pwd)/scripts/cc-fleet-coord"
@@ -49,8 +52,8 @@ RQ3="$("$COORD_BIN" --alloc RQ-2026-0605 2>/dev/null)"
 # ④ ISO 日期前缀归一化：2026-06-05 → RQ-2026-0605-NNN（YYYY-MMDD，非 ISO 的 YYYY-MM-DD）
 CASE="ISO日期归一化为YYYY-MMDD"
 new_repo >/dev/null
-RQ4="$("$COORD_BIN" --alloc 2026-06-05 2>/dev/null)"
-[[ "$RQ4" == "RQ-2026-0605-001" ]] && ok || fail "期望 RQ-2026-0605-001 实得 '$RQ4'"
+RQ4="$("$COORD_BIN" --alloc 2026-06-07 2>/dev/null)"
+[[ "$RQ4" == "RQ-2026-0607-001" ]] && ok || fail "期望 RQ-2026-0607-001 实得 '$RQ4'"
 
 # ⑤ 核心 bug 复现：worktree 内的 .fleet 也算占用（跨 worktree 撞号 → 必须扫到并跳过）
 CASE="扫worktree内.fleet占用并跳过"
@@ -258,6 +261,107 @@ TOTALC="$(wc -l < "$PWD/.conc.out" | tr -d ' ')"
 DISTC="$(sort -u "$PWD/.conc.out" | wc -l | tr -d ' ')"
 { [[ "$TOTALC" == "20" ]] && [[ "$DISTC" == "20" ]]; } \
   && ok || fail "20 并发应得 20 个不同 RQ，实得 total=$TOTALC distinct=$DISTC"
+
+# ===== 跨仓库全局唯一（2026-08-20 事故：两个主 session 在不同仓库同日都发出 RQ-2026-0820-001）=====
+# 关键：序号池/注册表在 ~/.claude/fleet（本测试已重定向到临时 CC_FLEET_HOME），两个【互不相干的仓库】
+#       共享同一个高水位，所以第二个仓库必须拿到 -002 而不是又一个 -001。
+CASE="跨仓库alloc编号不重复"
+new_repo >/dev/null; RA_DIR="$PWD"
+RA="$("$COORD_BIN" --alloc RQ-XREPO 2>/dev/null)"
+new_repo >/dev/null; RB_DIR="$PWD"
+RB="$("$COORD_BIN" --alloc RQ-XREPO 2>/dev/null)"
+cd "$RA_DIR"; RA2="$("$COORD_BIN" --alloc RQ-XREPO 2>/dev/null)"
+{ [[ "$RA" == "RQ-XREPO-001" ]] && [[ "$RB" == "RQ-XREPO-002" ]] && [[ "$RA2" == "RQ-XREPO-003" ]]; } \
+  && ok || fail "跨仓库应单调递增 001/002/003，实得 A=$RA B=$RB A2=$RA2"
+
+# 全局注册表登记了 owner 协调目录（判定"这个号是谁的"的唯一依据）
+CASE="alloc写全局注册表owner"
+CMA="$(git -C "$RA_DIR" rev-parse --path-format=absolute --git-common-dir)"
+REG_COORD="$(grep -m1 '^coord=' "$CC_FLEET_HOME/registry/$RA" 2>/dev/null)"; REG_COORD="${REG_COORD#coord=}"
+EXP_COORD="$(cd "$CMA/fleet/$RA" 2>/dev/null && pwd -P)"      # /var → /private/var 归一
+[[ -n "$REG_COORD" ]] && [[ "$(cd "$REG_COORD" 2>/dev/null && pwd -P)" == "$EXP_COORD" ]] \
+  && ok || fail "注册表 owner coord 应=$EXP_COORD，实得 '$REG_COORD'"
+
+# --fresh：另一个仓库想用别人已注册的号 → exit 4
+CASE="fresh跨仓库同号拒绝exit4"
+cd "$RB_DIR"
+"$COORD_BIN" "$RA" --fresh >/dev/null 2>&1
+[[ $? -eq 4 ]] && ok || fail "B 仓库复用 A 仓库的 $RA 应 exit 4"
+
+# --fresh：owner 自己用自己的号 → 放行
+CASE="fresh本仓自己的号放行"
+cd "$RA_DIR"
+"$COORD_BIN" "$RA" --fresh >/dev/null 2>&1
+[[ $? -eq 0 ]] && ok || fail "owner 自己的号应 exit 0"
+
+# --check-join：派发侧兜底闸也拦跨仓库同号（协调目录是空的也拦——注册表说了它归别人）
+CASE="checkjoin跨仓库同号拦截exit6"
+cd "$RB_DIR"
+CMB="$(git rev-parse --path-format=absolute --git-common-dir)"
+"$COORD_BIN" --check-join "$CMB/fleet/$RA" mod >/dev/null 2>&1
+[[ $? -eq 6 ]] && ok || fail "跨仓库同号 check-join 应 exit 6"
+
+CASE="checkjoin跨仓库同号加join放行"
+"$COORD_BIN" --check-join "$CMB/fleet/$RA" mod --join >/dev/null 2>&1
+[[ $? -eq 0 ]] && ok || fail "跨仓库同号 + --join 应放行"
+
+# 全局池不可写 → 降级到"本仓唯一"，只告警不阻断（绝不能让 alloc 挂掉）
+CASE="全局池不可写降级仍能分配"
+UNWRITABLE="$(mktemp -d)"; REPOS+=("$UNWRITABLE"); chmod 500 "$UNWRITABLE"
+OUTD="$(CC_FLEET_HOME="$UNWRITABLE/nope" "$COORD_BIN" --alloc RQ-DEGRADE 2>/dev/null)"
+[[ "$OUTD" == "RQ-DEGRADE-001" ]] && ok || fail "全局池不可写时应仍能分配，实得 '$OUTD'"
+chmod 700 "$UNWRITABLE"
+
+# ===== --seed-global：老仓库升级时把已有 RQ 灌进全局池 =====
+CASE="seed-global灌种后别的仓库不再撞号"
+SEED_HOME="$(mktemp -d)"; REPOS+=("$SEED_HOME")
+new_repo >/dev/null; SR1="$PWD"        # 老仓库①：手工造出已用到 -003 的历史
+CMS1="$(git rev-parse --path-format=absolute --git-common-dir)"
+mkdir -p "$CMS1/fleet/RQ-SEED-001" "$CMS1/fleet/RQ-SEED-003"
+CC_FLEET_HOME="$SEED_HOME" "$COORD_BIN" --seed-global >/dev/null 2>&1
+new_repo >/dev/null; SR2="$PWD"        # 老仓库②：灌种后再分配必须跳过 001~003
+RS="$(CC_FLEET_HOME="$SEED_HOME" "$COORD_BIN" --alloc RQ-SEED 2>/dev/null)"
+[[ "$RS" == "RQ-SEED-004" ]] && ok || fail "灌种后应得 RQ-SEED-004，实得 '$RS'"
+
+CASE="seed-global幂等可重复跑"
+cd "$SR1"
+CC_FLEET_HOME="$SEED_HOME" "$COORD_BIN" --seed-global >/dev/null 2>&1
+RC_SEED=$?
+RS2="$(CC_FLEET_HOME="$SEED_HOME" "$COORD_BIN" --alloc RQ-SEED 2>/dev/null)"
+{ [[ $RC_SEED -eq 0 ]] && [[ "$RS2" == "RQ-SEED-005" ]]; } \
+  && ok || fail "重复灌种应幂等且高水位不回退，rc=$RC_SEED 实得 '$RS2'"
+
+CASE="seed-global报出历史撞号"
+new_repo >/dev/null; SR3="$PWD"        # 老仓库③：也有一个 RQ-SEED-001 → 正是历史撞号
+CMS3="$(git rev-parse --path-format=absolute --git-common-dir)"
+mkdir -p "$CMS3/fleet/RQ-SEED-001"
+ERRTXT="$(CC_FLEET_HOME="$SEED_HOME" "$COORD_BIN" --seed-global 2>&1 >/dev/null)"
+printf '%s' "$ERRTXT" | grep -q "历史撞号" && ok || fail "应报出 RQ-SEED-001 历史撞号，实得：$ERRTXT"
+
+# ===== 解析时补登记：手工建的协调目录（绕过 --alloc）也要被全局池看见 =====
+# 场景：有人手拼编号/旧脚本直接建了 <common-dir>/fleet/RQ-XXX-007。这个号对全局池是隐身的，
+#       别的仓库照样能再发一次 → 又一次跨仓库重号。解析是所有路径的必经之地，在那里补登记堵死它。
+CASE="解析补登记抬高全局高水位"
+REG_HOME="$(mktemp -d)"; REPOS+=("$REG_HOME")
+new_repo >/dev/null; RG1="$PWD"
+CC_FLEET_HOME="$REG_HOME" "$COORD_BIN" RQ-HAND-007 >/dev/null 2>&1     # 手工编号，走普通解析
+new_repo >/dev/null                                                     # 换一个仓库再取号
+RH="$(CC_FLEET_HOME="$REG_HOME" "$COORD_BIN" --alloc RQ-HAND 2>/dev/null)"
+[[ "$RH" == "RQ-HAND-008" ]] && ok || fail "手工编号 007 应被补登记并抬高水位（期望 008），实得 '$RH'"
+
+CASE="解析补登记不覆盖已有owner"
+cd "$RG1"
+OWNER_BEFORE="$(grep -m1 '^coord=' "$REG_HOME/registry/RQ-HAND-007")"
+cd "$(mktemp -d)" 2>/dev/null || true
+new_repo >/dev/null
+CC_FLEET_HOME="$REG_HOME" "$COORD_BIN" RQ-HAND-007 >/dev/null 2>&1     # 另一个仓库解析同号
+OWNER_AFTER="$(grep -m1 '^coord=' "$REG_HOME/registry/RQ-HAND-007")"
+[[ "$OWNER_BEFORE" == "$OWNER_AFTER" ]] && ok || fail "已有 owner 不该被后来者覆盖：'$OWNER_BEFORE' → '$OWNER_AFTER'"
+
+CASE="no-mkdir只读解析不写注册表"
+new_repo >/dev/null
+CC_FLEET_HOME="$REG_HOME" "$COORD_BIN" RQ-HAND-099 --no-mkdir >/dev/null 2>&1
+[[ ! -f "$REG_HOME/registry/RQ-HAND-099" ]] && ok || fail "--no-mkdir 是只读解析，不该写全局注册表"
 
 echo
 echo "==== cc-fleet-coord 测试：PASS=$PASS FAIL=$FAIL ===="

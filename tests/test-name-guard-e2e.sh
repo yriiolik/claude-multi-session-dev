@@ -17,6 +17,9 @@
 #   ③ 故障已经发生后 → cc-fleet-fix-display --all 能事后夺回（兜底链路）
 
 export CC_FLEET_PANEL=0
+# RQ 序号池/注册表现在是【跨仓库全局】的（~/.claude/fleet）。测试一律指到临时目录，
+# 否则会污染真实全局池、甚至抬高真实高水位。
+export CC_FLEET_HOME="${CC_FLEET_HOME_TEST_OVERRIDE:-$(mktemp -d)}"
 set -u
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

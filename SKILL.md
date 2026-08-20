@@ -297,6 +297,12 @@ worker 被分到质量很差的模型实例，硬纠偏（reply）往往无效�
 > 🚫 **RQ 编号只能由脚本现场分配，绝不凭「今天日期 + NNN」在脑内重构**（真实串台事故见 `reference/pitfalls.md`）。
 > 引用 RQ 的所有场合（派发 / arm Monitor / 回执路径 / 二次派发 / 跨 turn）一律从本轮 `$RQ` 变量或协调目录回读；
 > 同一 RQ 的后续批次**别重跑 init**（它会另发新号）。用法与各道防串台闸见 `reference/commands.md`。
+>
+> 🌐 **RQ 是全机唯一的，不是"每个仓库各一套"**：worker 的 session 名 `↳<模块>@<RQ>`、job 列表、fleet 面板、
+> watch/status/reply/kill 全按 RQ 认人——两个仓库同号，两个毫不相干的任务就在同一屏里重名。序号池与
+> 「RQ→owner 仓库」注册表因此放在**跨仓库共享的 `~/.claude/fleet`**（`CC_FLEET_HOME` 可改），`cc-fleet-init`
+> 取号时会跳过**任何仓库**发过的号。**你在哪个项目起任务都一样：老老实实跑 `cc-fleet-init`**——同事/你自己
+> 在另一个仓库的并行任务，你本地是看不见的，只有全局池看得见（2026-08-20 事故见 `reference/pitfalls.md` §二）。
 
 ### Step 2 — 派发（每个 prompt 必带回执契约）
 

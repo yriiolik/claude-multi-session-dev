@@ -391,10 +391,18 @@ Daemon 启动后会预热若干 spare 进程（参数 `--bg-spare <claim.sock>`�
 `SendMessage` 支持 `notify_when_idle: true`（可省 `message` 做零成本纯订阅），实测对
 `cc-dispatch` 派的独立 session **订阅成功**，对方下次 idle/退出时回一条 `[Cross-session idle notice]`。
 
-**但本技能不用它**，三条理由：
+**但本技能不用它**，四条理由（第 4 条最致命，是事后实测撞出来的）：
 1. **one-shot**——只通知一次，而 worker 的 idle 常常是**瞬时**的（等自己起的后台 e2e 时会短暂 idle 后
    重新活跃），会**早报**；`cc-fleet-watch` 的 `--stall-idle` 去抖 + resurrect 撤销才是对的解法。
 2. **要先寻址到 worker**——而 worker 名字不稳（§12.2），订阅本身就不可靠。
 3. 它只报"空闲了"这个**进程级**事实，不带任何语义；通道 ⓪ 直接带回执内容，信息量高得多。
+4. ⭐ **送达时机不可靠，可能严重滞后到信号完全失效。** 实测：对探针 session 下订阅后，它
+   **18:11** 结束 turn，而 `[Cross-session idle notice]` 直到**数十分钟后**才送达主 session——彼时
+   探针早已被 `kill`、整轮编排（e2e + 提交 + 合回 + 推送 + 清理）都已收口。通知里带的还是那个
+   历史时刻的状态（"finished a turn at 18:11"），**它反映的是过去、不是此刻**。
+   一个可能迟到几十分钟的"完成信号"，对编排等于没有：真按它调度，主 session 该等的没等到、
+   该收的早过期了。相比之下 `cc-fleet-watch` 的轮询上限是 `--interval`（默认 20s）、心跳上限
+   `--heartbeat`（默认 240s），**延迟有确定上界**——这才是能拿来做编排依据的东西。
 
-结论：**watch 管进程级兜底，通道 ⓪ 管语义级快报**，两者互补，`notify_when_idle` 在这套编排里没有位置。
+结论：**watch 管进程级兜底（延迟有上界），通道 ⓪ 管语义级快报（即时唤醒）**，两者互补且都可依赖；
+`notify_when_idle` 三项都不占，在这套编排里没有位置。

@@ -113,5 +113,10 @@ has "$PROTO" "记录了实测版本号" '2\.1\.252'
 CASE="proto/notify_when_idle 取舍留档"
 has "$PROTO" "记录了为何不采纳 notify_when_idle" 'notify_when_idle' 'one-shot|瞬时'
 
+# 「送达可能严重滞后」是四条理由里最致命的一条，且是事后才撞出来的实测——
+# 它正是「watch 的延迟有确定上界」这个取舍依据的反面，删掉就没人知道当初为什么不用它了。
+CASE="proto/notify_when_idle 滞后实证"
+has "$PROTO" "记录了送达严重滞后这条最致命的理由" '滞后' '18:11' '上界'
+
 echo "==== 回执通道 ⓪ 文档契约：PASS=$PASS FAIL=$FAIL ===="
 [[ $FAIL -eq 0 ]] || exit 1

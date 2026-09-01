@@ -313,3 +313,88 @@ Daemon 启动后会预热若干 spare 进程（参数 `--bg-spare <claim.sock>`�
 | `2.1.181` (2026-06-18) | 1 | 协议全兼容（`ping` 免 auth；`list`/`kill` 等 op 须带**顶层 `auth`=`~/.claude/daemon/control.key`** 控制密钥，2.1.169+ 起）。**CLAUDE.md 自动加载 bug 已修**：实测派发 14 个**关注入**（`--no-inject-claude-md`）探针 worker（factory/ 8 个 + followup/ 6 个，**全 `via=spare`**），**14/14** 均自动加载三层 `CLAUDE.md`（用户/项目/目录级），且目录级**精确跟随派发 cwd**（factory 批载 factory、followup 批载 followup，无错位）、**0 miss**——旧版"约 3/4 miss / spare 沿用预热 cwd"不复现。故 `cc-dispatch` 注入**默认翻为关**，`--inject-claude-md` 留作版本回归时的兜底逃生口。复测办法：派一批 `--no-inject-claude-md` worker 让其自检上下文有无 `# claudeMd` 块（见 `tests/test-cc-dispatch-inject.sh` 头注释）。 |
 
 发现新版本破坏兼容时，更新此表 + §4 schema + `cc-dispatch` 默认值。
+
+## 12. 跨 session 消息通道（`SendMessage` / `ListAgents`）——回执通道 ⓪ 的依据
+
+> 这一节记的**不是** daemon socket 协议，而是 Claude Code **harness 内建**的跨 session 消息工具的实测行为。
+> 回执通道 ⓪（worker 完成时主动推给主 session，见 SKILL.md 铁律 2）就建立在这些事实上。
+> **实测环境：claude code `2.1.252`（2026-09-01），派真实 background session 对打验证。**
+
+### 12.1 寻址规则：名字即地址，ref 不能单独用
+
+`ListAgents` 每行形如 `<名字> [ref]  ·  bg  ·  idle/busy  ·  started …`；首行 `This session is <名字> [ref]`
+是**自己**的地址。四种 `to` 写法实测：
+
+| `to` 写法 | 结果 | 备注 |
+|---|---|---|
+| 精确名字（裸） | ✅ 送达 | 最常用 |
+| 精确名字 + ` [ref]` | ✅ 送达 | 重名消歧时才需要 |
+| **错误名字 + 正确 ref** | ❌ `No agent named '…' is reachable.` | **ref 救不了错名字** |
+| **裸 ref**（如 `1f279d`） | ❌ 同上 | ref **不是**独立地址 |
+
+结论：**名字必须精确匹配，ref 只是消歧后缀。** 所以主 session 填 `{{MAIN_SESSION}}` 前必须
+`ListAgents` **现读**，不能凭记忆手敲。
+
+### 12.2 通道是单向可靠的：worker → 主 session ✅，主 session → worker ❌
+
+后台 session 的**名字会被 daemon 改写**：实测用 `cc-dispatch --name "↳probe-sendmsg@EXPERIMENT"` 派出的探针，
+几秒后在 `ListAgents` 里显示成 **「探针已发送完毕。」**——即它自己最后一条消息的内容（与 §8 的完成态
+`name` 退化是同一类现象；`cc-fleet-name-guard` 只覆盖走 fleet 流程的派发）。
+
+因此：
+- ✅ **worker 推给主 session**：主 session 是前台会话，名字在一轮任务内稳定 → 可靠，这就是通道 ⓪。
+- ❌ **主 session 靠名字找 worker**：名字随时被改写 → 不可靠。联络具体 worker 一律走
+  **`cc-fleet-reply <RQ> <module>`**（SID 名册，稳定键），**不要**用 `SendMessage` 猜名字——猜错会把消息
+  发进用户另一个无关的工作 session。
+
+### 12.3 送达形态与稳定回址
+
+主 session 收到的消息被包成：
+
+```
+<cross-session-message from="uds:/tmp/cc-socks/<pid>.sock" from-name="…" from-mode="bypass">
+[FLEET] <RQ>/<module> 已完成 — …
+</cross-session-message>
+```
+
+- `from` 是**进程级稳定回址**，不受名字改写影响。**直接把 `from` 的值当 `to` 就能回**（实测成功），
+  这是唯一可靠的"回复某个具体 worker"的方式——但它只在**对方先发过消息**之后才拿得到，所以不能替代
+  `cc-fleet-reply` 作为主动联络手段。
+- 接收方**只先看到 `message` 的第一行**作为预览 → preamble 要求 worker 第一行必须自解释。
+
+### 12.4 关键前提：消息会唤醒空闲的主 session
+
+**实测确认**：主 session 处于等待态时，worker 推来的消息会**当场把它唤醒**并投递进对话，无需任何轮询。
+这是通道 ⓪ 能成立的根本前提。
+
+同样实测确认：探针**故意不打 `result:`** 也照样推送成功 → 通道 ⓪ **完全不经过 daemon 的状态分类器**，
+铁律 1.5（`state` 停在 `working`）和铁律 1.6（respawn 擦掉 `done`）那两个坑它天然绕开。
+
+### 12.4.1 端到端实证：新 preamble 真能驱动 worker 正确推送
+
+光验证机制还不够——通道 ⓪ 的指令写在 prompt 里，还得 worker **读得懂、照着做**。故用改后的
+`dispatch-preamble.md` 回执段渲染出真实 prompt（占位符全替换、0 残留），`cc-dispatch` 派一个
+`↳probe@RQ-E2E-PUSH` 跑一个极小任务（数 `/etc/hosts` 行数），三条通道逐一核对：
+
+| 通道 | 预期 | 实测结果 |
+|---|---|---|
+| ① 落盘 | `<COORD>/probe.summary.md` 首行 `result:` | ✅ `result: /etc/hosts 共 12 行。` |
+| ⓪ 推送 | 第一行 `[FLEET] <RQ>/<module> 已完成 — …`，二行起带改动/自测/裁决项 | ✅ 格式完全符合，未做任何提示纠正 |
+| ③ 最后一条消息 | daemon 分类器把它翻成 `state=done` | ✅ `state=done tempo=idle` |
+
+结论：**三通道互不干扰、可同时满足**，通道 ⓪ 的措辞无需 worker 额外解释即可执行。
+（同时复证 §12.2：推送时刻 `from-name` 仍是派发名 `↳probe@RQ-E2E-PUSH`——名字改写发生在**之后**，
+所以 worker 主动推的这一刻地址链路是干净的，这也是通道 ⓪ 只能单向的另一面。）
+
+### 12.5 `notify_when_idle` 订阅：可用，但不采纳进 fleet 流程
+
+`SendMessage` 支持 `notify_when_idle: true`（可省 `message` 做零成本纯订阅），实测对
+`cc-dispatch` 派的独立 session **订阅成功**，对方下次 idle/退出时回一条 `[Cross-session idle notice]`。
+
+**但本技能不用它**，三条理由：
+1. **one-shot**——只通知一次，而 worker 的 idle 常常是**瞬时**的（等自己起的后台 e2e 时会短暂 idle 后
+   重新活跃），会**早报**；`cc-fleet-watch` 的 `--stall-idle` 去抖 + resurrect 撤销才是对的解法。
+2. **要先寻址到 worker**——而 worker 名字不稳（§12.2），订阅本身就不可靠。
+3. 它只报"空闲了"这个**进程级**事实，不带任何语义；通道 ⓪ 直接带回执内容，信息量高得多。
+
+结论：**watch 管进程级兜底，通道 ⓪ 管语义级快报**，两者互补，`notify_when_idle` 在这套编排里没有位置。

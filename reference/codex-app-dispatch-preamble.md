@@ -114,6 +114,10 @@ git -C "$(git rev-parse --show-toplevel)" reset --hard "{{INT_BRANCH}}"
 
 ## 完成回执
 
+> ⚠ **Codex 后端只有两条通道**：Claude 后端 preamble 里的通道 ⓪（worker 用 `SendMessage` 主动推给主
+> session）**在这里不适用**——codex worker 没有 Claude Code 的跨 session 消息工具。所以下面这两条
+> **一条都不能省**，主 session 侧也只能靠 `cc-fleet-watch-codex-app` 轮询兜底，响应比 Claude 后端慢一拍。
+
 完成后必须做两件事：
 
 1. 把回执写到 `{{COORD_DIR}}/{{MODULE}}.summary.md`。若该绝对路径不可写，写到当前 worktree 下

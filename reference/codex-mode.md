@@ -53,6 +53,12 @@
    thread 创建失败时脚本会自动回滚 worktree 与分支；要留现场加 `--keep-on-failure`。
 5. **派发是串行的**（脚本内部 mkdir 原子锁）。并发建 thread 实测会撞 `thread not found`，
    所以即使你在一条消息里连发多条 `cc-dispatch-codex-app`，它们也会排队执行——这是正确行为，不是卡住。
+6. **没有回执通道 ⓪（worker 主动推送）。** Claude 后端的 worker 完成时会用 `SendMessage` 把
+   `[FLEET] <RQ>/<module> 已完成 — …` **直接推醒主 session**（SKILL.md 铁律 2 通道 ⓪）；codex worker
+   没有这个工具，**只剩落盘回执 + 最后一条消息两条通道，全靠主 session 轮询来拉**。实际影响：
+   Codex 后端的完成/求救感知**比 Claude 后端慢一拍**（受 `--interval` 与 `--stall-idle` 制约），
+   `{{MAIN_SESSION}}` 占位符在 codex preamble 里留空不填。所以在 Codex 后端下，
+   `cc-fleet-watch-codex-app` 是**唯一**的完成信号来源，**更不能不挂**。
 
 ## 外部查看
 

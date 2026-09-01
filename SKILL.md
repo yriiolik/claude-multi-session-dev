@@ -72,7 +72,9 @@ running 条目）→ **你刚才误用了 `Agent`**，立刻改用 `cc-dispatch`
 
 ## 选后端：Claude（默认）还是 Codex
 
-**两套后端的场景、流程、RQ、协调目录、任务卡、回执、集成分支完全相同**，只是 worker 跑在哪、命令换个后缀。
+**两套后端的场景、流程、RQ、协调目录、任务卡、回执、集成分支基本相同**，只是 worker 跑在哪、命令换个后缀。
+唯一实质差别：**回执通道 ⓪（worker 主动推送，见铁律 2）只有 Claude 后端有**——codex worker 没有 `SendMessage`，
+只剩落盘 + 最后一条消息两条拉取通道，完成感知慢一拍，watch 更不能省。
 
 - 默认 **Claude 后端**。
 - 用户明确说「codex / codex-app / App 可见」→ **Codex 后端**：所有 fleet 命令换成 `-codex-app` 后缀，
@@ -221,6 +223,10 @@ ownership（完整模型、L2 模板、业界依据见 `reference/doc-traceabili
 主 session 的通知**；全部结束写一条总结并退出（退出码=完成信号）。于是「子 session 结束」被转成「主 session 原生
 推送」，全程零轮询、零 sleep——派完就去跟用户聊别的，done 事件自动找上门。内置 ≤4 分钟心跳，漏掉的完成事件被下条
 心跳补上，保证至少每 <5min 被唤醒一次。
+- ⭐ **你有两个互不依赖的推送来源，都要有**：①**watch**（本条，进程级、覆盖崩溃/blocked/异常，**永远必挂**）；
+  ② **worker 自己 `SendMessage` 推来的完成/求救**（铁律 2 通道 ⓪，语义级、更快、绕开状态分类器）。⓪ 先到就先
+  按它办（该收回执收回执、该裁决裁决），watch 随后那条 `✅`/`💤` 只是复核，**不必等它才动**；反过来 ⓪ 没来也
+  不代表没完成——worker 可能崩溃或没照做，watch 照样会兜住。**任何一条都不许当唯一依据。**
 - **`blocked`（等授权/输入）不算结束**：先按铁律 4 判「真需要输入」还是「模型降级空转」，再走三条路之一：
   **回复它**（`cc-fleet-reply`，确属该由人拍板才用）／**换新 session 重派**（`cc-fleet-respawn`，疑似灰度坏模型时）
   ／**取消它**（`cc-fleet-kill`，只终止进程、不删已落盘回执）。
@@ -246,11 +252,22 @@ done 的 session respawn（`state` 翻回 `running`、`tempo` 回 `active`、`na
 立即推 `✅ 已完成 — 回执在案` 并【单调】结案，respawn 之后翻回 running 也**不反悔**。文件持久，respawn 抹不掉。
 所以这条**强依赖 canonical 协调目录**——worker 必须把回执写到那里（preamble 已要求）。
 
-**铁律 2 ｜ 回执三通道兜底，任一拿到即可（永不把「文件出现」当门禁）。**
-① **canonical 绝对协调目录**（`cc-fleet-coord <RQ>` 给路径，主仓库和所有 worktree 解析成同一处、在 `.git/` 里不进
-版本库）——派发时作 `{{COORD_DIR}}`；② **`cc-fleet-summary` 自动遍历所有 git worktree** 收回执——worker 在自己
-worktree 里写的回执，主 session 照样读得到，兜底主力；③ **worker 的最后一条消息**：preamble 要求 worker 把回执作为
-最后一条消息发出，FleetView/通知里永远看得到，不依赖任何文件路径。前两条都没拿到时读这条。
+**铁律 2 ｜ 回执四通道兜底（一推三拉），任一拿到即可（永不把「文件出现」当门禁）。**
+⓪ 是 worker **推**给你的快通道，①②③ 是你**去拉**的兜底通道：
+- ⓪ ⭐ **worker 主动 `SendMessage` 推送**：preamble 要求 worker 落盘回执后直接把
+  `[FLEET] <RQ>/<module> 已完成 — …` 推给你，**即时唤醒主 session**。这条**不经过 daemon 状态分类器、
+  不受 respawn 影响**（铁律 1.5/1.6 那两个坑它天然绕开），也是 worker 卡住时「需要裁决」的最快求救通道。
+  但它**依赖 worker 听话照做 + 你的名字没填错**，所以**永远不能只靠它**——watch（铁律 0）照挂不误。
+- ① **canonical 绝对协调目录**（`cc-fleet-coord <RQ>` 给路径，主仓库和所有 worktree 解析成同一处、在 `.git/` 里不进
+  版本库）——派发时作 `{{COORD_DIR}}`；
+- ② **`cc-fleet-summary` 自动遍历所有 git worktree** 收回执——worker 在自己 worktree 里写的回执，主 session
+  照样读得到，兜底主力；
+- ③ **worker 的最后一条消息**：preamble 要求 worker 把回执作为最后一条消息发出，FleetView/通知里永远看得到，
+  不依赖任何文件路径。前面都没拿到时读这条。
+
+> ⚠ **通道 ⓪ 是单向的：worker → 主 session。** 反过来「主 session 靠名字去找 worker」**不可靠**——daemon 会把
+> 后台 session 的名字改写成它最后一条消息的内容（实测派发名 `↳probe@EXPERIMENT` 被改成「探针已发送完毕。」）。
+> 要联络具体 worker 一律用 `cc-fleet-reply <RQ> <module>`（走 SID 名册，稳定），不要用 `SendMessage` 猜名字。
 
 **铁律 3 ｜ 瞬时 failed 会自愈，绝不无限等。** `failed`/error 可能是瞬时 API 抖动（如
 `UNKNOWN_CERTIFICATE_VERIFICATION`），隔一会儿再查常自愈成 `done`。确认是**持续**异常再进 Step 5。任一 session 超
@@ -311,6 +328,12 @@ worker 被分到质量很差的模型实例，硬纠偏（reply）往往无效�
 代码 + 完成回填 `<COORD_DIR>/<module>.summary.md`（首行 `result:`）并把简短回执作为最后一条消息」。**不带前缀就派发
 = 拿不到回执 = 主 session 失明，禁止。**（Codex 后端由 `cc-dispatch-codex-app` 自动拼对应 preamble。）
 
+**⭐ 拼前缀前先拿到你自己的名字，填进 `{{MAIN_SESSION}}`**（Claude 后端专有，Codex worker 没有 `SendMessage`，
+该占位符留空即可）：调一次 **`ListAgents`**，取输出首行 `This session is <名字> [ref]` 里的 **`<名字>`** 原样填入
+（`[ref]` 可带可不带）。**必须现读、不许凭记忆手敲**——跨 session 寻址只认精确名字，实测「错名 + 对的 ref」和
+「裸 ref」都发不到（`reference/PROTOCOL.md` §12）。填错的后果是 worker 少一条快通道、降级走另外三条，**不丢回执**，
+所以别为此卡住派发；但填对了整轮编排的响应速度明显不一样。
+
 派发编排：
 - 互不冲突的模块**一次性全部派发**即并行；有依赖的等前序回执 done 再派后续。
 - **命中跨模块协同的分两批派**（详见 `reference/contract-first.md`）：模式 A 先单独派提供方做契约设计（`--name
@@ -330,6 +353,15 @@ worker 被分到质量很差的模型实例，硬纠偏（reply）往往无效�
 推送种类：`✅ done`／`✅ 已完成 — 回执在案`（抗 respawn，铁律 1.6）／`💤 静默已结束需核验`（铁律 1.5，别当 done
 盲信，要去收回执核验）／`❌ 持续异常`（已连续复查过，可直接进 Step 5）／`⏸ blocked`／≤4min 心跳。
 参数与 daemon 不可达时的处置见 `reference/commands.md`。
+
+**另一路推送会自己找上门**：worker 完成/卡住时按通道 ⓪ 直接 `SendMessage` 给你，形如
+`<cross-session-message from="uds:…">` 包着的 `[FLEET] <RQ>/<module> 已完成 — …`（或 `需要裁决` / `失败`）。
+它通常**比 watch 早**。处置：
+- `已完成` → 直接进 Step 4 收该模块回执，不必等 watch 的 `✅` 复核。
+- `需要裁决` / `失败` → 立刻裁决并用 **`cc-fleet-reply <RQ> <module>`** 回它（**别用 `SendMessage` 回**——
+  worker 名字会被 daemon 改写，靠名字寻址不稳；`cc-fleet-reply` 走 SID 名册才稳，见铁律 2 注）。
+- ⚠ 收到 ⓪ **不等于可以撤 watch**：还有别的模块在跑，且这个 worker 之后仍可能被 respawn。watch 一直挂到
+  它自己报「全部结束」为止。
 
 ### Step 4 — 收回执 + 整体验证
 

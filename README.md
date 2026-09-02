@@ -37,6 +37,7 @@ git clone git@github.com:yriiolik/claude-multi-session-dev.git ~/.claude/skills/
 - `scripts/` — fleet 编排命令（`cc-dispatch*` 派发、`cc-fleet-*` 初始化/监控/读取/回执/收尾/复活/回复/终止；`*-codex` / `*-codex-app` 为 Codex app-server 后端变体）。
 - `scripts/lib/` — 脚本共享库：`codex-config.js`（Codex CLI 发现 / config.toml 解析 / 路由目标校验）、`codex-daemon.js`（app-server 活性探测、陈旧 pid 自愈、配置漂移判定）。
 - `scripts/cc-codex-ensure` — **Codex 后端一站式就绪自愈**，由 `cc-dispatch-codex-app` 内部自动调用：拉起 app-server、收陈旧 pid、config.toml 变更后按需重启（有 worker 在跑则不打断）。正常情况零输出，所以派发前**不需要**先跑 doctor。
+- `scripts/cc-dispatch` 读 `~/.claude/multi-session-dev.json`（技能目录外、不入库）的 `worker.{model,effort}` 决定 Claude worker 的模型与思考深度（缺省 `claude-opus-5` + `high`），经 daemon 协议 `launch.args`/`respawnFlags` 下发，不走环境变量。
 - `scripts/cc-codex-session-config` — 统一管理 Codex worker 路由；默认读取 `~/.codex/multi-session-dev.json`，只保存 provider/model 与认证环境变量名，不保存 key。
 - `scripts/cc-codex-doctor` — Codex/DeepSeek worker 后端逐项体检报告（人看的）；派发报「后端未就绪」时再跑。
 - `reference/` — 命令手册与模板：`commands.md`（每个场景的完整参数/退出码）、`codex-mode.md`（Codex 后端差异）、`PROTOCOL.md`、`dispatch-preamble.md`、`task-card-template.md`、`contract-first.md`、`doc-traceability.md`、`pitfalls.md` 等。

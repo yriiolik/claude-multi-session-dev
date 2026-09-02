@@ -42,6 +42,10 @@ FleetView（`claude agents`）里根本看不见的 subagent，不是独立 sess
 | **内置 `Agent`**（`Explore`/`general-purpose`） | **只读探查**：拆解前摸字段/接口/数据流现状，拿结论回来。**绝不让它写/改/提交代码** | 主 session 名下的 subagent，**无 `↳` 名**、**不在 `claude agents` 列表**、无独立 worktree/合回/回执/监控 |
 | **`cc-dispatch`** 系列 | **开发交付**：某模块内真写代码 + 自测 + 合回 | 独立顶层 background session，带 `↳<模块>@<RQ>` 名、可见、走完整 sid 名册/watcher/回执 |
 
+> worker 的模型与思考深度**不跟 daemon 默认走**：`cc-dispatch` 固定按 `~/.claude/multi-session-dev.json`
+> 的 `worker.{model,effort}`（缺省 `claude-opus-5` + `high`）经协议 `launch.args`/`respawnFlags` 下发；
+> 临时改用 `--model/--effort`，详见 `reference/commands.md`。
+
 > ⚠ harness 那句「launch multiple agents in one message for parallel work」**不适用于派发开发 worker**：
 > 「并行开多个 worker」= 在一条消息里连发多条 `cc-dispatch`，**不是**连发多个 `Agent` 调用。
 

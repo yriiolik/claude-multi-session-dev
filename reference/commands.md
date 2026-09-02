@@ -93,6 +93,15 @@ cc-dispatch \
 - prompt 第一行必须是 `⟦FLEET-WORKER⟧ rq=<RQ> module=<module>`（preamble 模板已含）。
 - **默认不加 `--isolation worktree`**：preamble 已要求 worker 自开隔离 worktree，加了会叠两层。
 - `--join`：同一任务的后续批次；撞到 `exit 6`（复用别任务 RQ 的兜底闸）时才用。
+- **worker 模型 / 思考深度**：默认**不**继承 daemon 默认，而是固定用配置——取值链 `--model/--effort` >
+  `~/.claude/multi-session-dev.json` 的 `worker.{model,effort}` > 内置默认 `claude-opus-5` + `high`。
+  走 daemon 协议本身：flag 拼进 `launch.args`（claude argv）并同步写入 `respawnFlags`（daemon 自动重拉不丢）；
+  ⛔ 不用 `ANTHROPIC_MODEL` / `CLAUDE_CODE_EFFORT_LEVEL` 环境变量（会锁死 worker 的 `/model` `/effort`，且不稳定）。
+  effort 合法值 `low|medium|high|xhigh|max`，非法值或坏配置文件 → `exit 5` 不派发。`--no-worker-defaults`
+  回到旧行为（不带 flag）。派发成功行会回显 `model=… effort=…`。配置文件格式：
+  ```json
+  {"version": 1, "worker": {"model": "claude-opus-5", "effort": "high"}}
+  ```
 - `--dry-run` 只打印将发的 JSON。
 - 退出码：`2`=daemon 不可达（先 `claude agents --json` 拉起）/ `3`=协议不兼容（见 `PROTOCOL.md`）/ `6`=疑似复用别任务 RQ。
 

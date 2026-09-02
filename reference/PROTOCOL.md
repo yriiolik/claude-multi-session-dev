@@ -138,6 +138,13 @@ l06 = () => y.object({
 
 99% 场景用 `prompt`，相当于 `claude "prompt 内容"`。
 
+`args` 就是 claude 的 argv，**可以带 flag**：`["prompt 内容", "--model", "claude-opus-5", "--effort", "high"]`
+等价 `claude "prompt 内容" --model claude-opus-5 --effort high`（2.1.258 反查：daemon 首次拉起走
+`O6(q_e(launch.args))` 原样透传；`claude agents --model/--effort` 自己也是这么拼的）。
+`respawnFlags` 是 daemon **自动重拉**（attach 卡死 / 崩溃续跑）时补回的 flag：重拉 argv =
+`["--resume"|"--session-id", <id>, ...respawnFlags]`，**不含**原 `launch.args`——所以模型/深度这类 flag
+必须两处都写，否则重拉出来的 worker 会退回默认模型。`cc-dispatch` 已按此处理。
+
 ## 5. 其他 op 速查
 
 ### `list` —— 列出所有活跃 session

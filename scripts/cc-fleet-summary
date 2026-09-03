@@ -91,6 +91,58 @@ if [[ -n "$RQ" ]]; then
   fi
 fi
 
+# ---- 回执机械核验（主 session 不读 diff 的替代物）----
+# ① 落地核验：从回执「关键 commit / 集成分支落地」行抓 sha，检查它是否真在 fleet/<RQ> 的祖先链上。
+#    worker 自述「已 land」不可信（实测有回执说 land 了、集成分支 log 里却没有它的 commit，worktree 清掉后不可恢复）。
+# ② 改动统计：对核验通过的 sha 打印 --shortstat（文件数 / 增删行），主 session 据此判「打样 worker 有没有偷写业务
+#    逻辑」「改动面是否与任务卡相称」，而不必读 diff 全文（省的是主 session 那份最贵的 token）。
+# ③ 结果文件核验：回执「测试结果文件」列的落盘路径是否存在——主 session 只读结果文件，不解析控制台输出。
+INT_BRANCH="fleet/${RQ:-}"
+verify_receipt() {
+  local mod="$1" f="$2"
+  local shas sha ok_sha=0 bad_sha=0
+  shas="$(command grep -iE '关键 ?commit|落地后 ?sha|集成分支落地' "$f" 2>/dev/null \
+    | command grep -oE '\b[0-9a-f]{7,40}\b' | awk '!s[$0]++' | head -3)"
+  if [[ -z "$TOP" ]]; then
+    echo "   ⚠ 不在 git 仓库内，跳过落地核验"
+  elif ! git -C "$TOP" rev-parse --verify -q "refs/heads/$INT_BRANCH" >/dev/null 2>&1; then
+    echo "   ⚠ 集成分支 $INT_BRANCH 不存在，跳过落地核验（RQ 未 --init-base？或已合回并删除）"
+  elif [[ -z "$shas" ]]; then
+    echo "   ⚠ 回执没写「关键 commit」sha，无法机械核验落地——开发型模块必须补 sha；只读角色（scout/integ/verify）可忽略"
+  else
+    while IFS= read -r sha; do
+      [[ -z "$sha" ]] && continue
+      if git -C "$TOP" cat-file -e "$sha^{commit}" 2>/dev/null \
+         && git -C "$TOP" merge-base --is-ancestor "$sha" "$INT_BRANCH" 2>/dev/null; then
+        ok_sha=$((ok_sha + 1))
+        local stat
+        stat="$(git -C "$TOP" show --shortstat --format= "$sha" 2>/dev/null | sed -e '/^$/d' | tail -1)"
+        [[ -z "$stat" ]] && stat="$(git -C "$TOP" diff --shortstat "$sha^" "$sha" 2>/dev/null | tail -1)"
+        echo "   🧷 落地核验 ✓ ${sha:0:12} ∈ $INT_BRANCH   改动统计:${stat:- (空提交/合并提交)}"
+      else
+        bad_sha=$((bad_sha + 1))
+        echo "   ⛔ 落地核验 ✗ ${sha:0:12} 不在 $INT_BRANCH 上（worker 自述 land 不可信；worktree 若已清理则改动可能已丢，进 Step 5 派 fix 重做）"
+      fi
+    done <<< "$shas"
+  fi
+  local files p miss=0 hit=0
+  files="$(command grep -iE '测试结果文件' "$f" 2>/dev/null | sed -E 's/^[^:：]*[:：]//' \
+    | tr ',，、 ' '\n' | sed -E 's/[`<>()（）]//g' | command grep -E '/|\.(json|xml|txt|md|log|html)$' || true)"
+  if [[ -n "$files" ]]; then
+    while IFS= read -r p; do
+      [[ -z "$p" ]] && continue
+      if [[ -e "$p" ]] || { [[ -n "$TOP" ]] && [[ -e "$TOP/$p" ]]; }; then
+        hit=$((hit + 1)); echo "   📄 结果文件 ✓ $p"
+      else
+        miss=$((miss + 1)); echo "   📄 结果文件 ✗ 不存在: ${p}（自测结论无落盘依据，按未自测处理）"
+      fi
+    done <<< "$files"
+  else
+    echo "   ⚠ 回执没列「测试结果文件」——开发型模块须写落盘结果文件路径（reporter 输出 / 结果 json），不接受控制台截图式描述"
+  fi
+  return 0
+}
+
 # ---- 收集回执（跨所有候选目录，按 module 去重，先命中者优先）----
 SEEN_RCPT=" "
 RCPT_MODS=()
@@ -133,9 +185,13 @@ if [[ "$N" -gt 0 ]]; then
     echo "════════════════════════════════════════════════════════════════════"
     cat "$f"
     echo
+    verify_receipt "$mod" "$f"
     echo
     idx=$((idx + 1))
   done
+  echo "⛔ 主 session 验收只读：上面的回执 + 「测试结果文件」+ verify/integ 回执。不 git diff、不 git show、不读源码——"
+  echo "   改动内容的核验靠「落地核验 ✓ + 改动统计」与验收 session 的场景报告，不靠主 session 亲眼看 diff。"
+  echo
 fi
 
 # ---- 派了却没回执的模块（醒目，避免误判"没完成"）----

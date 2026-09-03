@@ -66,14 +66,22 @@ my $opt_join = 0;     # 确认是【同一任务后续批次】，放行复用�
 my $opt_inject_cmd = 0;
 my $opt_cmd_maxbytes = 131072;
 # worker 模型 / 思考深度（走 daemon 协议：拼进 launch.args 作 claude argv，并写入 respawnFlags 让自动重拉不丢）。
-# 优先级：--model/--effort > ~/.claude/multi-session-dev.json 的 worker.{model,effort} > 内置默认。
+# 优先级：--model/--effort > ~/.claude/multi-session-dev.json 的 <profile>.{model,effort} > 该 profile 的内置默认。
+# --profile 选配置档（默认 worker）：同一个 JSON 文件里按用途各放一块——
+#   worker : 普通模块 worker（内置 opus5 + high）
+#   spike  : 「打样先行」段① 的骨架 worker（内置 opus5 + xhigh；跨模块落契约 + 接口骨架 + 一条真集成 e2e）
+# ⛔ 模型/深度不按任务卡动态判断，只按配置档；要换就改 JSON，不改脚本。
 # --no-worker-defaults = 不带这两个 flag，让子 session 继承 daemon 默认（等价旧行为）。
 # ⛔ 故意不用 ANTHROPIC_MODEL / CLAUDE_CODE_EFFORT_LEVEL 环境变量：env 覆盖会锁死 /model /effort，且不稳定。
 my $opt_model;
 my $opt_effort;
+my $opt_profile = 'worker';
 my $opt_no_worker_defaults = 0;
 my $opt_worker_config;    # 显式指定 worker 配置文件（默认 $HOME/.claude/multi-session-dev.json）
-my %WORKER_BUILTIN = (model => 'claude-opus-5', effort => 'high');
+my %PROFILE_BUILTIN = (
+  worker => { model => 'claude-opus-5', effort => 'high'  },
+  spike  => { model => 'claude-opus-5', effort => 'xhigh' },
+);
 my @EFFORT_LEVELS  = qw(low medium high xhigh max);   # claude --effort 合法值（2.1.258）   # 单个 CLAUDE.md 注入上限（防异常大文件撑爆 prompt）
 # daemon 控制密钥（Claude Code 2.1.169+ 给 control socket 加了鉴权：请求顶层须带 auth=控制密钥，
 # daemon 用 crypto.timingSafeEqual 与 ~/.claude/daemon/control.key 直接比对，不等即 EAUTH 拒绝）。
@@ -91,6 +99,7 @@ GetOptions(
   'cmd-maxbytes=i'   => \$opt_cmd_maxbytes,
   'model=s'          => \$opt_model,         # worker 模型（覆盖配置文件与内置默认）
   'effort=s'         => \$opt_effort,        # worker 思考深度 low|medium|high|xhigh|max
+  'profile=s'        => \$opt_profile,       # 配置档 worker|spike（决定读配置文件哪一块 + 内置默认）
   'no-worker-defaults' => \$opt_no_worker_defaults,  # 不带 --model/--effort，继承 daemon 默认
   'worker-config=s'  => \$opt_worker_config,
   'proto-version=i'  => \$opt_proto,
@@ -268,13 +277,18 @@ exit 4;
 
 # resolve_worker_settings —— 定 worker 的 (model, effort)。
 #   --no-worker-defaults → (undef, undef)，不带 flag、继承 daemon 默认
-#   否则逐项取 CLI > 配置文件 worker.{model,effort} > 内置默认；effort 校验合法值，不合法 exit 5（宁可派不出去，
-#   也不让 worker 悄悄跑在错的深度上）。配置文件缺失 = 正常（用内置默认）；存在但解析失败 = exit 5。
+#   否则逐项取 CLI > 配置文件 <profile>.{model,effort} > 该 profile 内置默认；effort 校验合法值，不合法 exit 5
+#   （宁可派不出去，也不让 worker 悄悄跑在错的深度上）。配置文件缺失 = 正常（用内置默认）；存在但解析失败 = exit 5。
+#   未知 profile（既无内置默认、配置文件里也没有这一块）= exit 5。
 sub resolve_worker_settings {
   return (undef, undef) if $opt_no_worker_defaults;
-  my $cfg = load_worker_config();
-  my $model  = first_defined($opt_model,  $cfg->{model},  $WORKER_BUILTIN{model});
-  my $effort = first_defined($opt_effort, $cfg->{effort}, $WORKER_BUILTIN{effort});
+  my $builtin = $PROFILE_BUILTIN{$opt_profile};
+  my $cfg = load_worker_config($opt_profile);
+  die_usage("--profile 未知: $opt_profile（内置有 " . join('|', sort keys %PROFILE_BUILTIN) . "，或在配置文件里加同名块）")
+    unless $builtin || %$cfg;
+  $builtin //= {};
+  my $model  = first_defined($opt_model,  $cfg->{model},  $builtin->{model});
+  my $effort = first_defined($opt_effort, $cfg->{effort}, $builtin->{effort});
   $model  = undef if defined $model  && $model  eq '';    # 空串 = 显式"不指定"
   $effort = undef if defined $effort && $effort eq '';
   if (defined $effort) {
@@ -297,10 +311,14 @@ sub is_json_string {
 
 sub first_defined { for (@_) { return $_ if defined $_ } return undef }
 
-# load_worker_config —— 读 worker 配置文件，返回 {model=>..., effort=>...}（可能为空 hash）。
-# 路径：--worker-config > $HOME/.claude/multi-session-dev.json。格式：
-#   {"version":1, "worker": {"model": "claude-opus-5", "effort": "high"}}
+# load_worker_config —— 读配置文件里 <profile> 那一块，返回 {model=>..., effort=>...}（可能为空 hash）。
+# 路径：--worker-config > $HOME/.claude/multi-session-dev.json。格式（各块可缺，缺则用该 profile 内置默认）：
+#   {"version":1, "worker": {"model": "claude-opus-5", "effort": "high"},
+#                 "spike":  {"model": "claude-opus-5", "effort": "xhigh"}}
 sub load_worker_config {
+  my ($profile) = @_;
+  $profile //= 'worker';
+  die_usage("--profile 只能是字母/数字/-/_: $profile") unless $profile =~ /^[A-Za-z0-9_-]+$/;
   my $path = $opt_worker_config // (($ENV{HOME} // '') . '/.claude/multi-session-dev.json');
   return {} unless length $path && -f $path;
   my $raw = read_raw_bytes($path);
@@ -310,19 +328,19 @@ sub load_worker_config {
     $j = eval { JSON::PP->new->decode($raw) };
     die_usage("worker 配置不是合法 JSON: $path（$@）") unless ref $j eq 'HASH';
   } else {
-    # 退化解析：只抓 worker 块里的 model / effort
-    my ($blk) = $raw =~ /"worker"\s*:\s*\{([^}]*)\}/s;
-    $j = { worker => {} };
+    # 退化解析：只抓 <profile> 块里的 model / effort
+    my ($blk) = $raw =~ /"\Q$profile\E"\s*:\s*\{([^}]*)\}/s;
+    $j = { $profile => {} };
     if (defined $blk) {
-      $j->{worker}{model}  = $1 if $blk =~ /"model"\s*:\s*"([^"]*)"/;
-      $j->{worker}{effort} = $1 if $blk =~ /"effort"\s*:\s*"([^"]*)"/;
+      $j->{$profile}{model}  = $1 if $blk =~ /"model"\s*:\s*"([^"]*)"/;
+      $j->{$profile}{effort} = $1 if $blk =~ /"effort"\s*:\s*"([^"]*)"/;
     }
   }
-  my $w = $j->{worker};
+  my $w = $j->{$profile};
   return {} unless ref $w eq 'HASH';
   for my $k (qw(model effort)) {
     next unless exists $w->{$k};
-    die_usage("worker 配置 worker.$k 必须是字符串: $path") unless is_json_string($w->{$k});
+    die_usage("worker 配置 $profile.$k 必须是字符串: $path") unless is_json_string($w->{$k});
   }
   return { model => $w->{model}, effort => $w->{effort} };
 }
@@ -580,8 +598,13 @@ cc-dispatch — 直接通过 daemon socket 派发 background session（等效 Fl
                            内置默认 claude-opus-5。走 daemon 协议：拼进 launch.args 作 claude argv，
                            并同步写入 respawnFlags（daemon 自动重拉不丢）。⛔ 不用环境变量。
   --effort <LEVEL>         worker 思考深度 low|medium|high|xhigh|max（同上取值链，内置默认 high）
-  --worker-config <PATH>   worker 配置文件（默认 ~/.claude/multi-session-dev.json）：
-                           {"version":1,"worker":{"model":"claude-opus-5","effort":"high"}}
+  --profile <NAME>         配置档（默认 worker）：决定读配置文件哪一块 + 用哪组内置默认。
+                           worker = 普通模块 worker（内置 opus5+high）；
+                           spike  = 「打样先行」段① 骨架 worker（内置 opus5+xhigh）。
+                           ⛔ 模型/深度只按配置档，不按任务卡动态判断；未知 profile exit 5。
+  --worker-config <PATH>   配置文件（默认 ~/.claude/multi-session-dev.json），各块可缺：
+                           {"version":1,"worker":{"model":"claude-opus-5","effort":"high"},
+                                        "spike":{"model":"claude-opus-5","effort":"xhigh"}}
   --no-worker-defaults     不带 --model/--effort，让 worker 继承 daemon 默认（旧行为）
   --env KEY=VAL            注入被派发 session 的环境变量（可重复）
                            子 session 编排里约定: --env FLEET_ROLE=worker

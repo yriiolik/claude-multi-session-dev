@@ -108,6 +108,27 @@ C9="$(new_coord)"; put_sid "$C9" m1 b2ddddbb
 run_status "$C9" '{"jobs":[{"short":"b2ddddbb","state":"blocked","tempo":"-"}]}' 1
 assert_has "等输入"
 
+# ⑫ 长任务心跳文件：协调目录里 <module>.alive 新鲜 → --json 带 aliveAge（秒）；没有该文件不带字段
+CASE="alive心跳文件报aliveAge"
+C12="$(new_coord)"; put_sid "$C12" deploy eeee5555; put_sid "$C12" m2 ffff6666
+touch "$C12/deploy.alive"
+run_status "$C12" '{"jobs":[{"short":"eeee5555","state":"working","tempo":"idle"},{"short":"ffff6666","state":"working","tempo":"idle"}]}' 1 --json
+assert_has '"aliveAge":'
+python3 - "$OUT" <<'PY2' && PASS=$((PASS+1)) || { echo "✗ [$CASE] aliveAge 语义不对"; echo "$OUT"; FAIL=$((FAIL+1)); }
+import sys,json
+d=json.loads(sys.argv[1]); jobs={j['_module']:j for j in d['jobs']}
+assert 'aliveAge' in jobs['deploy'] and 0 <= jobs['deploy']['aliveAge'] < 60, jobs['deploy']
+assert 'aliveAge' not in jobs['m2'], jobs['m2']
+PY2
+# 心跳文件很旧（mtime 回拨 1 小时）→ aliveAge ≥ 3600
+touch -t "$(date -v-1H +%Y%m%d%H%M.%S 2>/dev/null || date -d '-1 hour' +%Y%m%d%H%M.%S)" "$C12/deploy.alive"
+run_status "$C12" '{"jobs":[{"short":"eeee5555","state":"working","tempo":"idle"},{"short":"ffff6666","state":"working","tempo":"idle"}]}' 1 --json
+python3 - "$OUT" <<'PY2' && PASS=$((PASS+1)) || { echo "✗ [$CASE] 旧心跳 aliveAge 不对"; echo "$OUT"; FAIL=$((FAIL+1)); }
+import sys,json
+d=json.loads(sys.argv[1]); jobs={j['_module']:j for j in d['jobs']}
+assert jobs['deploy']['aliveAge'] >= 3590, jobs['deploy']
+PY2
+
 echo
 echo "==== cc-fleet-status 测试：PASS=$PASS FAIL=$FAIL ===="
 [ "$FAIL" -eq 0 ] && echo "✅ 全绿" || { echo "❌ 有失败"; exit 1; }

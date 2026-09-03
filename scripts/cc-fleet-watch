@@ -228,13 +228,24 @@ while (1) {
     }
     else {                                       # running/working/starting —— 再按 tempo 细分
       $fail_count{$mod} = 0;
-      if ($tempo ne 'idle') {
-        # 真在跑（active；或 tempo 缺失/未知，保守按"在跑"，绝不凭缺字段误判静默）
+      # ⭐ 长任务心跳：worker 等自己起的 nohup 长任务（全量 e2e / 发布，可长达 70 分钟）时 agent 循环 idle，
+      #   但它按 preamble 定期 touch <coord>/<module>.alive；cc-fleet-status 把该文件年龄报成 aliveAge。
+      #   心跳比 --stall-idle 新鲜 = 它还活着，按在跑处理，绝不判 💤 静默——否则 watch 会以「全部结束」退出，
+      #   主 session 从此失明（2026-09-02 实测）。心跳过期则回到常规 idle 去抖路径。
+      my $alive = $j->{aliveAge};
+      my $heartbeat_fresh = defined $alive && $alive =~ /^\d+(\.\d+)?$/ && $alive < $opt{'stall-idle'};
+      if ($tempo ne 'idle' || $heartbeat_fresh) {
+        # 真在跑（active；或 tempo 缺失/未知，保守按"在跑"，绝不凭缺字段误判静默；或长任务心跳新鲜）
         delete $idle_since{$mod}; $idle_polls{$mod} = 0;
         if (($notified_state{$mod} // '') eq 'blocked') {
           emit("▶ $mod 已恢复运行") unless $wait;
         }
-        $notified_state{$mod} = '';
+        if ($tempo eq 'idle' && ($notified_state{$mod} // '') ne 'longtask') {
+          $notified_state{$mod} = 'longtask';
+          emit(sprintf("⏱ %s idle 但长任务心跳新鲜（%ds 前）— 视为在跑，继续等", $mod, int($alive))) unless $wait;
+        } elsif ($tempo ne 'idle') {
+          $notified_state{$mod} = '';
+        }
       } else {
         # tempo=idle：循环已停。去抖后判"静默已结束"——多半是做完没打 result:，也可能卡住。
         $idle_since{$mod} //= mono_now();
@@ -410,7 +421,9 @@ cc-fleet-watch — 阻塞监视一个 RQ 下所有被派发 session，把"完成
 选项:
   --coord DIR     透传给 cc-fleet-status（显式协调目录）
   --interval SEC  轮询间隔（默认 20）
-  --stall-idle SEC run-class 持续 tempo=idle 多久判"静默已结束"（默认 240；0=连续2轮idle即判）。复活会撤销
+  --stall-idle SEC run-class 持续 tempo=idle 多久判"静默已结束"（默认 240；0=连续2轮idle即判）。复活会撤销。
+                  ⭐ idle 但 <coord>/<module>.alive 心跳文件比它新鲜（status 报 aliveAge）→ 视为在跑不判静默
+                  （worker 等 nohup 长任务时按 preamble 定期 touch 它，防 watch 误退主 session 失明）
   --heartbeat SEC 多久无事件发一条心跳（默认 240，<5min 兜底；0=每轮都心跳）
   --wait          wait 模式（静默，仅末尾一行）
   --fail-checks N failed/error 连续 N 轮才判持续异常（默认 2，吸收瞬时抖动）

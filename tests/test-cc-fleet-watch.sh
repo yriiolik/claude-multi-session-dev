@@ -212,6 +212,33 @@ assert_has "✅ m2 done"
 assert_no "▶ m1 又活跃了"
 assert_has "🎉 RQ-TEST 全部结束：2/2（异常 0）"
 
+# ⑳ 长任务心跳：working+idle 但 aliveAge 新鲜（< stall-idle）→ 视为在跑（⏱ 只报一次），不判 💤，未完成 exit 1
+#    （2026-09-02 实测：发布 worker 用 nohup 跑 70 分钟全量 e2e，agent 循环 idle，旧 watch 240s 后判 💤 并以
+#     「全部结束」退出，主 session 从此失明）
+run_case "长任务心跳新鲜不判静默" '{"jobs":[{"_module":"deploy","state":"working","tempo":"idle","aliveAge":30}]}
+@@@
+{"jobs":[{"_module":"deploy","state":"working","tempo":"idle","aliveAge":45}]}
+@@@
+{"jobs":[{"_module":"deploy","state":"working","tempo":"idle","aliveAge":60}]}' 1 --stall-idle 100 --max-loops 3
+assert_count "⏱ deploy idle 但长任务心跳新鲜" 1
+assert_no "💤"
+assert_has "监视结束（未全部完成）"
+
+# ㉑ 心跳过期（aliveAge ≥ stall-idle）→ 回到常规 idle 去抖路径，连续 2 轮 idle 判 💤 静默、全部结束 exit 0
+run_case "长任务心跳过期回落静默判定" '{"jobs":[{"_module":"deploy","state":"working","tempo":"idle","aliveAge":900}]}
+@@@
+{"jobs":[{"_module":"deploy","state":"working","tempo":"idle","aliveAge":920}]}' 0 --stall-idle 0
+assert_no "⏱"
+assert_has "💤 deploy working+idle 已静默"
+assert_has "全部结束：1/1"
+
+# ㉒ 没有 aliveAge 字段的 idle worker 行为不变（不因新字段缺失而误判在跑）
+run_case "无心跳字段idle照旧判静默" '{"jobs":[{"_module":"m1","state":"working","tempo":"idle"}]}
+@@@
+{"jobs":[{"_module":"m1","state":"working","tempo":"idle"}]}' 0 --stall-idle 0
+assert_no "⏱"
+assert_has "💤 m1 working+idle 已静默"
+
 echo
 echo "==== cc-fleet-watch 测试：PASS=$PASS FAIL=$FAIL ===="
 [ "$FAIL" -eq 0 ] && echo "✅ 全绿" || { echo "❌ 有失败"; exit 1; }

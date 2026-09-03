@@ -137,6 +137,11 @@ unless ($all) {
     my $mod = $j->{_module};
     next unless defined $mod && length $mod;
     $j->{receipt} = receipt_done($mod, \@dirs) ? 1 : 0;
+    # 长任务心跳：worker 在等自己起的后台长任务（nohup 全量 e2e / 发布）时 agent 循环 idle，
+    # 但它会按 preamble 每隔几分钟 touch <coord>/<module>.alive。这里报该文件距今多少秒（没有则不带字段），
+    # 让 watch 把「idle 但心跳新鲜」当在跑，别判成 💤 静默然后以「全部结束」退出（2026-09-02 失明事故）。
+    my $age = alive_age($mod, \@dirs);
+    $j->{aliveAge} = $age if defined $age;
   }
 }
 
@@ -279,6 +284,22 @@ sub coord_dir_list {
   push @dirs, $explicit if defined $explicit && length $explicit;
   push @dirs, candidate_coord_dirs($rq);
   return @dirs;
+}
+
+# 长任务心跳文件 <module>.alive 的年龄（秒）：取所有候选协调目录里最新的一份；一份都没有 → undef。
+sub alive_age {
+  my ($mod, $dirs) = @_;
+  my $newest;
+  for my $d (@$dirs) {
+    next unless defined $d && length $d;
+    my $path = "$d/$mod.alive";
+    next unless -f $path;
+    my $m = (stat $path)[9] // next;
+    $newest = $m if !defined $newest || $m > $newest;
+  }
+  return undef unless defined $newest;
+  my $age = time() - $newest;
+  return $age < 0 ? 0 : $age;
 }
 
 # 持久回执完成判定：协调目录里 <module>.summary.md 存在、且【首个非空行以 result: 开头】→ 已完成（抗 respawn）。

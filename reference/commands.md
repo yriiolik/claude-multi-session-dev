@@ -100,8 +100,11 @@ cc-dispatch \
   effort 合法值 `low|medium|high|xhigh|max`，非法值或坏配置文件 → `exit 5` 不派发。`--no-worker-defaults`
   回到旧行为（不带 flag）。派发成功行会回显 `model=… effort=…`。配置文件格式：
   ```json
-  {"version": 1, "worker": {"model": "claude-opus-5", "effort": "high"}}
+  {"version": 1, "worker": {"model": "claude-opus-5", "effort": "high"},
+                 "spike":  {"model": "claude-opus-5", "effort": "xhigh"}}
   ```
+- **`--profile spike`**（模式 C 打样先行段① 的骨架 worker）：改读配置文件 `spike` 块（内置默认 `claude-opus-5` +
+  `xhigh`）。⛔ 模型/深度只按配置档，不按任务卡逐张判断；要换模型改 JSON 不改命令。未知 profile `exit 5`。
 - `--dry-run` 只打印将发的 JSON。
 - 退出码：`2`=daemon 不可达（先 `claude agents --json` 拉起）/ `3`=协议不兼容（见 `PROTOCOL.md`）/ `6`=疑似复用别任务 RQ。
 
@@ -223,6 +226,22 @@ cc-fleet-summary <RQ>
 ```
 **多通道兜底**：canonical 协调目录 + 主树 + 所有 git worktree 一起扫，worker 在自己 worktree 里写的
 回执也收得到。某模块 done/gone 但收不到回执 → 直接读它最后一条消息，**别回头死等文件**。
+
+每份回执下面自动附三行**机械核验**（主 session 不读 diff 的替代物）：
+- `🧷 落地核验 ✓ <sha> ∈ fleet/<RQ>   改动统计: N files changed, +a/-b` —— 回执「关键 commit」的 sha 真在集成分支祖先链上；
+  `⛔ 落地核验 ✗` = worker 自述 land 不可信，改动不在 `fleet/<RQ>`（worktree 若已清理则可能已丢），进 Step 5 派 fix 重做。
+- `📄 结果文件 ✓/✗ <path>` —— 回执「测试结果文件」列的落盘路径是否存在；✗ 按未自测处理。
+- 缺 sha / 缺结果文件各有 ⚠ 提示：开发型模块必须补，只读角色可忽略。
+
+## e2e 串行锁 / 长任务心跳（worker 侧，preamble 已要求）
+
+```bash
+cc-fleet-e2e-lock acquire "$COORD" <module> [--wait 7200] [--stale 5400]   # 跑 e2e 前抢锁；持有超 stale 秒视为死锁强制回收
+cc-fleet-e2e-lock release "$COORD" <module>                                 # 跑完立刻放（只放自己的）
+cc-fleet-e2e-lock status  "$COORD"
+touch "$COORD/<module>.alive"      # 等 nohup 长任务期间每 ≤3 分钟一次；status 报 aliveAge、watch 视为在跑不判 💤
+```
+退出码：0 成功 / 1 等锁超时（写「需主 session 裁决」，别硬跑）/ 3 release 时锁不是自己的。
 
 ## worker 落地（worker 自己跑，不是主 session）
 

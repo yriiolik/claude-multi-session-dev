@@ -127,3 +127,23 @@ prompt** 兜底；现已改为**默认关**注入，不再与自动加载重复�
 同一轮实测还确认了两条（详见 `codex-mode.md`）：Codex worker **没有 `FLEET_*` 环境变量**（身份靠 preamble +
 `<COORD>/<module>.codex-app.env`）；worker **自述模型永远是「Codex，基于 GPT-5」**，那是内置 base_instructions
 写死的，判模型只能看元数据文件或 rollout 记录。
+
+## 六、watch 把「等 nohup 长任务的 worker」当静默结束，主 session 失明（2026-09-02 实测）
+
+发布 worker 用 nohup 跑全量 e2e（约 70 分钟），期间 agent 循环空闲（tempo=idle），`cc-fleet-watch` 240s 后判 💤 并以
+「全部结束」退出——主 session 从此收不到任何推送，只能靠人来问。根因：静默判定只看 tempo，分不清「做完没打 result:」
+与「在等自己起的后台进程」。
+
+修复已落在脚本里：worker 等长任务期间按 preamble 每 ≤3 分钟 `touch <COORD>/<module>.alive`；`cc-fleet-status --json`
+报该文件年龄 `aliveAge`；watch 在 idle 但 `aliveAge < --stall-idle` 时视为在跑（推一次 `⏱`），心跳过期才回落到常规
+静默判定。**编排侧要记住**：派长任务 worker 前确认 preamble 带了心跳条款；看到 `⏱` 就别去核验。
+
+## 七、契约先行的固有盲区 → 模式 C 打样先行（2026-08-24 事故）
+
+RQ-2026-0824-001（发货单统一上报派生）走模式 A：提供方按契约实现、消费方按契约打桩，两边自测全绿，接线后炸出两类：
+①契约自相矛盾（§一「按 requestUid 命中即整批回放」vs §二示例逐行调用 → 多行只成功第一行）；②可选字段一方 optional、
+另一方不提供，用户填的必填字段永远进不了报文。**文档评审看不出来，两边各自的 mock 测试更看不出来。**
+
+对策：耦合强 / 接口牵涉 3 个以上模块 / 该组模块出过契约事故 → 走**模式 C 打样先行**（`contract-first.md` §二·五）：
+段① 一个 `--profile spike` worker 把契约、各模块接口骨架、默认关的接线开关、一条真跨模块集成 e2e 一起落到 `fleet/<RQ>`，
+矛盾在同一个脑子里、同一条 e2e 里炸出来；段② 才分头填实。模式 A 仍是默认，但段① 定稿前必须过 §五·五 字段级核对表。

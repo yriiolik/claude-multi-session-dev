@@ -101,9 +101,9 @@ cc-dispatch \
   回到旧行为（不带 flag）。派发成功行会回显 `model=… effort=…`。配置文件格式：
   ```json
   {"version": 1, "worker": {"model": "claude-opus-5", "effort": "high"},
-                 "spike":  {"model": "claude-opus-5", "effort": "xhigh"}}
+                 "spike":  {"model": "claude-fable-5-1", "effort": "xhigh"}}
   ```
-- **`--profile spike`**（模式 C 打样先行段① 的骨架 worker）：改读配置文件 `spike` 块（内置默认 `claude-opus-5` +
+- **`--profile spike`**（模式 C 打样先行段① 的骨架 worker）：改读配置文件 `spike` 块（内置默认 `claude-fable-5-1` +
   `xhigh`）。⛔ 模型/深度只按配置档，不按任务卡逐张判断；要换模型改 JSON 不改命令。未知 profile `exit 5`。
 - `--dry-run` 只打印将发的 JSON。
 - 退出码：`2`=daemon 不可达（先 `claude agents --json` 拉起）/ `3`=协议不兼容（见 `PROTOCOL.md`）/ `6`=疑似复用别任务 RQ。

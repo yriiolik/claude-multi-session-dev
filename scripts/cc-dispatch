@@ -69,7 +69,7 @@ my $opt_cmd_maxbytes = 131072;
 # 优先级：--model/--effort > ~/.claude/multi-session-dev.json 的 <profile>.{model,effort} > 该 profile 的内置默认。
 # --profile 选配置档（默认 worker）：同一个 JSON 文件里按用途各放一块——
 #   worker : 普通模块 worker（内置 opus5 + high）
-#   spike  : 「打样先行」段① 的骨架 worker（内置 opus5 + xhigh；跨模块落契约 + 接口骨架 + 一条真集成 e2e）
+#   spike  : 「打样先行」段① 的骨架 worker（内置 fable5.1 + xhigh；跨模块落契约 + 接口骨架 + 一条真集成 e2e）
 # ⛔ 模型/深度不按任务卡动态判断，只按配置档；要换就改 JSON，不改脚本。
 # --no-worker-defaults = 不带这两个 flag，让子 session 继承 daemon 默认（等价旧行为）。
 # ⛔ 故意不用 ANTHROPIC_MODEL / CLAUDE_CODE_EFFORT_LEVEL 环境变量：env 覆盖会锁死 /model /effort，且不稳定。
@@ -80,7 +80,7 @@ my $opt_no_worker_defaults = 0;
 my $opt_worker_config;    # 显式指定 worker 配置文件（默认 $HOME/.claude/multi-session-dev.json）
 my %PROFILE_BUILTIN = (
   worker => { model => 'claude-opus-5', effort => 'high'  },
-  spike  => { model => 'claude-opus-5', effort => 'xhigh' },
+  spike  => { model => 'claude-fable-5-1', effort => 'xhigh' },
 );
 my @EFFORT_LEVELS  = qw(low medium high xhigh max);   # claude --effort 合法值（2.1.258）   # 单个 CLAUDE.md 注入上限（防异常大文件撑爆 prompt）
 # daemon 控制密钥（Claude Code 2.1.169+ 给 control socket 加了鉴权：请求顶层须带 auth=控制密钥，
@@ -314,7 +314,7 @@ sub first_defined { for (@_) { return $_ if defined $_ } return undef }
 # load_worker_config —— 读配置文件里 <profile> 那一块，返回 {model=>..., effort=>...}（可能为空 hash）。
 # 路径：--worker-config > $HOME/.claude/multi-session-dev.json。格式（各块可缺，缺则用该 profile 内置默认）：
 #   {"version":1, "worker": {"model": "claude-opus-5", "effort": "high"},
-#                 "spike":  {"model": "claude-opus-5", "effort": "xhigh"}}
+#                 "spike":  {"model": "claude-fable-5-1", "effort": "xhigh"}}
 sub load_worker_config {
   my ($profile) = @_;
   $profile //= 'worker';
@@ -600,11 +600,11 @@ cc-dispatch — 直接通过 daemon socket 派发 background session（等效 Fl
   --effort <LEVEL>         worker 思考深度 low|medium|high|xhigh|max（同上取值链，内置默认 high）
   --profile <NAME>         配置档（默认 worker）：决定读配置文件哪一块 + 用哪组内置默认。
                            worker = 普通模块 worker（内置 opus5+high）；
-                           spike  = 「打样先行」段① 骨架 worker（内置 opus5+xhigh）。
+                           spike  = 「打样先行」段① 骨架 worker（内置 fable5.1+xhigh）。
                            ⛔ 模型/深度只按配置档，不按任务卡动态判断；未知 profile exit 5。
   --worker-config <PATH>   配置文件（默认 ~/.claude/multi-session-dev.json），各块可缺：
                            {"version":1,"worker":{"model":"claude-opus-5","effort":"high"},
-                                        "spike":{"model":"claude-opus-5","effort":"xhigh"}}
+                                        "spike":{"model":"claude-fable-5-1","effort":"xhigh"}}
   --no-worker-defaults     不带 --model/--effort，让 worker 继承 daemon 默认（旧行为）
   --env KEY=VAL            注入被派发 session 的环境变量（可重复）
                            子 session 编排里约定: --env FLEET_ROLE=worker

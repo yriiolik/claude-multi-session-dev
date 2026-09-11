@@ -63,10 +63,15 @@ function onMessage(payload) {
       process.stdout.write(serverFrame({ id: 2, error: { code: -32600, message: "thread not found: x" } }));
       return;
     }
+    if (process.env.FAKE_DROP_AFTER_REQUEST === "1") { process.exit(1); }
     process.stdout.write(serverFrame({
       id: 2,
       result: { method: msg.method, paramBytes: Buffer.byteLength(JSON.stringify(msg.params)) },
     }));
+    if (process.env.FAKE_EVENTS === "1") {
+      process.stdout.write(serverFrame({method:"thread/status/changed",params:{threadId:msg.params.threadId,status:{type:"active"}}}));
+      process.stdout.write(serverFrame({method:"turn/completed",params:{threadId:msg.params.threadId,turn:{id:"turn-1",status:"completed"}}}));
+    }
   }
 }
 function parseFrames() {
@@ -153,6 +158,23 @@ RC=$?
 [ "$RC" -eq 9 ] && ok || fail "业务错误应 rc=9，实得 $RC: $OUT"
 printf '%s' "$OUT" | grep -q "thread not found" && ok || fail "应原样透出业务错误: $OUT"
 [ ! -f "$MARKER" ] && ok || fail "业务错误不该触发 app-server 启动/自愈"
+
+CASE="event_subscription_emits_completion"
+OUT="$(FAKE_EVENTS=1 FAKE_LOG="$LOG" FAKE_MARKER="$MARKER" "$CALL" --codex-bin "$FAKE" --watch-ms 1000 thread/resume - <<<'{"threadId":"worker-1"}' 2>&1)"
+RC=$?
+[ "$RC" -eq 0 ] && ok || fail "events rc=$RC: $OUT"
+printf '%s' "$OUT" | grep -q '"method":"turn/completed"' && ok || fail "missing completion"
+printf '%s' "$OUT" | grep -q '"reason":"turn-completed"' && ok || fail "missing terminal reason"
+
+CASE="uncertain_mutation_must_not_retry"
+: > "$LOG"
+rm -f "$MARKER"
+OUT="$(FAKE_DROP_AFTER_REQUEST=1 FAKE_LOG="$LOG" FAKE_MARKER="$MARKER" "$CALL" --codex-bin "$FAKE" --start-app-server thread/start - <<<'{}' 2>&1)"
+RC=$?
+[ "$RC" -ne 0 ] && ok || fail "dropped connection must fail"
+[ ! -f "$MARKER" ] && ok || fail "must not restart after uncertain mutation"
+COUNT="$(grep -c '"method":"thread/start"' "$LOG")"
+[ "$COUNT" -eq 1 ] && ok || fail "mutation replayed $COUNT times"
 
 echo
 echo "==== cc-codex-app-call 测试：PASS=$PASS FAIL=$FAIL ===="

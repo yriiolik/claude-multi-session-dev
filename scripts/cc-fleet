@@ -1,0 +1,447 @@
+#!/usr/bin/env python3
+"""Cross-client fleet controller. Python stdlib; public CLIs, persistent receipts.
+Native Codex App operations are performed by the host, then registered here.
+"""
+import argparse, concurrent.futures, contextlib, datetime, fcntl, json, os
+from pathlib import Path
+import re, shlex, subprocess, sys, tempfile, time, uuid
+
+ROOT = Path(__file__).resolve().parent
+HOSTS = ('codex-app', 'codex-cli', 'claude-code')
+TERMINAL = {'done', 'failed', 'blocked', 'stopped', 'needs-review', 'unknown', 'launch-uncertain'}
+
+def run(argv, cwd=None, timeout=45, check=True, input=None, env=None):
+    p = subprocess.run([str(x) for x in argv], cwd=cwd, input=input, text=True, env=env,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+    if check and p.returncode:
+        # CLI errors may contain authentication configuration; don't dump raw logs.
+        raise RuntimeError(f'{Path(str(argv[0])).name} {argv[1] if len(argv)>1 else ""} failed (exit {p.returncode})')
+    return p
+
+def git(cwd, *args):
+    return run(['git', '-C', str(cwd), *args]).stdout.strip()
+
+def emit(obj):
+    print(json.dumps(obj, ensure_ascii=False, indent=2), flush=True)
+
+def atomic(path, obj):
+    path = Path(path); path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix='.' + path.name, dir=path.parent)
+    try:
+        with os.fdopen(fd, 'w') as f:
+            json.dump(obj, f, ensure_ascii=False, indent=2); f.write('\n')
+            f.flush(); os.fsync(f.fileno())
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp): os.unlink(tmp)
+
+def name(value):
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,95}', value):
+        raise ValueError('RQ/module must use letters, digits, dot, underscore or hyphen (max 96)')
+    return value
+
+def coord(value):
+    p = Path(value).expanduser().resolve()
+    if not (p/'fleet.json').is_file(): raise ValueError('not a v2 coordination directory')
+    return p
+
+def inbox(c,d):
+    f=meta(c)
+    root=Path(f.get('inboxRoot',str(Path(tempfile.gettempdir())/'fleet-v2-inbox'/f['rq'])))
+    return root/(d['module']+'-'+d['attempt']+'.receipt.json')
+
+def meta(c): return json.loads((c/'fleet.json').read_text())
+def record(c, m): return c/'v2'/f'{name(m)}.json'
+def load(c, m): return json.loads(record(c,m).read_text())
+
+@contextlib.contextmanager
+def lock(c, m):
+    p = c/'v2'; p.mkdir(exist_ok=True)
+    with (p/f'.{name(m)}.lock').open('a') as f:
+        fcntl.flock(f, fcntl.LOCK_EX); yield
+
+def update(c, m, **fields):
+    with lock(c,m):
+        d=load(c,m); d.update(fields); atomic(record(c,m),d); return d
+
+def call(method, params, start=False, timeout=35):
+    argv=[os.environ.get('CODEX_APP_CALL_BIN', str(ROOT/'cc-codex-app-call'))]
+    if start: argv+=['--start-app-server']
+    argv+=['--timeout-ms', str(max(1000, (timeout-2)*1000)), method, '-']
+    return json.loads(run(argv, input=json.dumps(params), timeout=timeout).stdout)
+
+def permission_params(d, turn=False):
+    # Explicit user preference for fleet workers; legacy records adopt the new default.
+    if d.get('permissions', 'full') == 'inherit': return {}
+    return dict(approvalPolicy='never', **({'sandboxPolicy': {'type': 'dangerFullAccess'}}
+                                         if turn else {'sandbox': 'danger-full-access'}))
+
+def route(fleet):
+    # User's host-specific default; never send an OpenAI model to a third-party provider.
+    if fleet['owner']['host']=='claude-code':
+        return dict(active='claude-main-gpt6-low',mode='fixed',model='gpt-6-astra',
+                    modelProvider='openai',reasoningEffort='low',providerType='openai')
+    return json.loads(run([ROOT/'cc-codex-session-config','resolve','--json']).stdout)
+
+def init(a):
+    repo=Path(git(a.cwd,'rev-parse','--show-toplevel')).resolve()
+    common=Path(git(repo,'rev-parse','--path-format=absolute','--git-common-dir')).resolve()
+    base=a.base or git(repo,'symbolic-ref','--short','HEAD')
+    sha=git(repo,'rev-parse','--verify',base+'^{commit}')
+    rq=name(a.rq or ('RQ-'+datetime.datetime.now().strftime('%Y%m%d-%H%M%S')+'-'+uuid.uuid4().hex[:8]))
+    c=common/'fleet'/rq
+    c.mkdir(parents=True,exist_ok=False)
+    try: git(repo,'branch','fleet/'+rq,sha)
+    except Exception:
+        c.rmdir(); raise
+    owner_id=a.owner_id or os.environ.get('CODEX_THREAD_ID' if a.host.startswith('codex') else 'CLAUDE_SESSION_ID')
+    identity_source='session' if owner_id else 'generated-controller'
+    owner_id=owner_id or ('controller-'+uuid.uuid4().hex)
+    d=dict(version=2,rq=rq,repo=str(repo),commonDir=str(common),base=base,baseCommit=sha,
+           integrationBranch='fleet/'+rq,inboxRoot=str((Path(tempfile.gettempdir())/'fleet-v2-inbox'/rq).resolve()),owner={'host':a.host,'id':owner_id,'identitySource':identity_source},createdAt=time.time())
+    atomic(c/'fleet.json',d); (c/'base.ref').write_text(base+'\n')
+    emit(dict(d,coord=str(c),uncommittedChangesExcluded=bool(git(repo,'status','--porcelain'))))
+
+def preamble(c,d):
+    fleet=meta(c)
+    return f'''⟦FLEET-WORKER⟧ rq={fleet['rq']} module={d['module']} role={d['role']} backend={d['backend']}
+你是独立 worker，不加载 multi-session-dev / multi-thread-dev 编排技能，不继续派发 worker。
+主 session: {json.dumps(fleet['owner'],ensure_ascii=False)}。只完成下面任务卡授权的范围。
+协调目录: {c}
+任务身份: {d['attempt']}（回执 attempt 必须完全一致）
+集成分支: {fleet['integrationBranch']}
+工作目录: {d.get('worktree') or 'Codex App 为本任务创建的全新隔离 worktree'}
+开始时核验自己在本仓库的独立 worktree，不能在主 checkout 修改文件。
+若 App worktree 尚未从集成分支开始，先确认工作树干净，再 git switch --detach {fleet['integrationBranch']}。
+禁止 reset --hard、清理别人的 worktree 或覆盖未提交修改。然后调用：
+{shlex.quote(str(ROOT/'cc-fleet'))} bind --coord {shlex.quote(str(c))} --module {d['module']} --worktree "$PWD"
+若 bind 因共享协调目录只读而失败，不阻断业务任务；在回执 worktree 中写真实工作目录，主端会验证后绑定。
+若修改本工作树 Git 元数据确需审批，使用宿主审批工具申请本任务必要权限；无可用审批通道则报告 blocked。
+遵守工作目录适用的 AGENTS.md / CLAUDE.md；不要假定对端工具存在，不需要 SendMessage/Monitor。
+角色 {d['role']}：developer 在范围内开发、自测、提交后运行 {shlex.quote(str(ROOT/'cc-fleet-land'))} {fleet['rq']}；
+scout/verify/integ 不修改业务代码、不提交合回，只执行任务卡要求的探查或验收。
+不要推远端、合回共享分支或删除 worktree。遇到范围/权限问题写 blocked 回执，说明所需输入。
+完成时优先把以下 JSON 原子写到 {c/(d['module']+'.receipt.json')}（临时文件+rename）。
+若协调目录不可写，则 mkdir -p 创建临时回执父目录，改写 {inbox(c,d)}；两者任一写成功即完成回执步骤，
+不因协调目录只读而将已成功的任务标 blocked。主端会核验临时回执并收存；最后回复相同 JSON（含真实 worktree）。
+{{"version":2,"rq":"{fleet['rq']}","module":"{d['module']}","attempt":"{d['attempt']}",
+ "worktree":"实际 worktree 的绝对路径","result":"done|failed|blocked","summary":"真实完成内容/问题","commit":"开发提交的完整 SHA，非开发可空",
+ "tests":[{{"command":"实际执行的检查","result":"passed|failed|not-run","evidence":"结果文件路径或简短输出"}}],
+ "risks":[],"needsInput":[]}}
+也可附加 {c/(d['module']+'.summary.md')} 方便人工查看。只做了计划不能报 done。
+\n任务卡：\n'''
+
+def prepare(a):
+    c=coord(a.coord); fleet=meta(c); m=name(a.module)
+    a.backend=a.backend or 'codex'
+    transport=a.transport
+    if transport=='auto': transport='native' if fleet['owner']['host']=='codex-app' and a.backend=='codex' and a.permissions=='inherit' else ('app-server' if a.backend=='codex' else 'claude-bg')
+    if (a.backend=='claude' and transport!='claude-bg') or (a.backend=='codex' and transport not in ('native','app-server')):
+        raise ValueError('backend/transport mismatch')
+    if transport=='native' and fleet['owner']['host']!='codex-app': raise ValueError('native requires a Codex App main session')
+    if transport=='native' and a.permissions=='full': raise ValueError('native cannot set full permissions; use app-server or --permissions inherit')
+    task=Path(a.task).resolve().read_text()
+    if not task.strip(): raise ValueError('empty task card')
+    with lock(c,m):
+        if record(c,m).exists(): raise ValueError('module already registered; use reply, or a new fix module')
+        d=dict(version=2,module=m,backend=a.backend,transport=transport,role=a.role,permissions=a.permissions,
+               attempt=uuid.uuid4().hex,state='prepared',name=f'↳{m}@{fleet["rq"]}',createdAt=time.time(),
+               sessionId=None,shortId=None,worktree=None,branch=None,baselineCommit=git(fleet['repo'],'rev-parse',fleet['integrationBranch']))
+        if transport!='native':
+            wt=Path(fleet['commonDir'])/'fleet-worktrees'/fleet['rq']/m
+            branch=f'fleet-worker/{fleet["rq"]}/{m}'
+            git(fleet['repo'],'worktree','add','-b',branch,str(wt),fleet['integrationBranch'])
+            d.update(worktree=str(wt),branch=branch)
+        atomic(record(c,m),d)
+        prompt=preamble(c,d)+task
+        (c/f'{m}.prompt.md').write_text(prompt)
+    emit(dict(d,coord=str(c),promptFile=str(c/f'{m}.prompt.md'),integrationBranch=fleet['integrationBranch']))
+
+def bind(a):
+    c=coord(a.coord); f=meta(c); wt=Path(a.worktree).resolve()
+    if wt==Path(f['repo']).resolve(): raise ValueError('worker must not use primary checkout')
+    if Path(git(wt,'rev-parse','--path-format=absolute','--git-common-dir')).resolve()!=Path(f['commonDir']): raise ValueError('wrong repository')
+    # Require the full current integration baseline, not simply a branch with a familiar name.
+    d=load(c,a.module)
+    if run(['git','-C',wt,'merge-base','--is-ancestor',d['baselineCommit'],'HEAD'],check=False).returncode:
+        raise ValueError('worker does not contain integration baseline')
+    if d.get('worktree') and Path(d['worktree']).resolve()!=wt: raise ValueError('worktree already bound elsewhere')
+    branch=git(wt,'rev-parse','--abbrev-ref','HEAD')
+    if d.get('worktree')==str(wt) and d.get('branch')==branch:
+        emit(d); return
+    emit(update(c,a.module,worktree=str(wt),branch=branch))
+
+def register(a):
+    c=coord(a.coord); d=load(c,a.module)
+    if d['transport']!='native': raise ValueError('register is for native App tasks')
+    # clientThreadId represents pending setup, never a callable threadId.
+    if a.client_thread_id:
+        emit(update(c,a.module,clientThreadId=a.client_thread_id,state='setting-up')); return
+    if d.get('sessionId') and d['sessionId']!=a.session_id: raise ValueError('task already has a different threadId')
+    emit(update(c,a.module,sessionId=a.session_id,hostId=a.host_id,state='running',clientThreadId=None))
+
+def claude_bin(): return os.environ.get('CLAUDE_CLI_PATH','claude')
+def claude_jobs():
+    obj=json.loads(run([claude_bin(),'agents','--json','--all']).stdout)
+    if not isinstance(obj,list): raise ValueError('unsupported Claude agents JSON schema')
+    return obj
+
+def panel_attach(c, d):
+    """Codex app-server worker 派发成功后：登记面板注册表 + 在当前 Ghostty 窗口分屏拉起只读面板。
+    Codex worker 进不了 `claude agents`（它是 app-server 里的 thread），这块分屏是用户唯一能看到子 session 的地方。
+    尽力而为：面板脚本自己处理 Ghostty 没开/没授权/不是 macOS 的情况，绝不因面板让派发失败。
+    CC_FLEET_PANEL=0 全局关掉；native（Codex App 主端）与 Claude 后端不走这里。"""
+    if d.get('backend')!='codex' or d.get('transport')!='app-server' or os.environ.get('CC_FLEET_PANEL')=='0':
+        return None
+    fleet=meta(c); out={}
+    steps=(('registered',os.environ.get('CC_FLEET_PANEL_REGISTER_BIN',str(ROOT/'cc-fleet-panel-register')),[str(c),fleet['rq']],None),
+           ('panelOpened',os.environ.get('CC_FLEET_PANEL_OPEN_BIN',str(ROOT/'cc-fleet-panel-open')),['--quiet'],dict(os.environ,CC_FLEET_PANEL_CWD=fleet['repo'])))
+    for key,bin_,args,env in steps:
+        try: out[key]=run([bin_,*args],timeout=30,check=False,env=env).returncode==0
+        except Exception: out[key]=False
+    return out
+
+def dispatch(a):
+    c=coord(a.coord); m=a.module
+    with lock(c,m):
+        d=load(c,m)
+        if d['state']!='prepared': raise ValueError('already attempted; inspect/reconcile before retrying')
+        if d['transport']=='native':
+            emit(dict(d,nextAction='Use list_projects + create_thread, then register the returned threadId (or clientThreadId while pending).',promptFile=str(c/f'{m}.prompt.md'))); return
+        d['state']='launching'; atomic(record(c,m),d)
+    prompt=(c/f'{m}.prompt.md').read_text()
+    try:
+        if d['transport']=='claude-bg':
+            args=[claude_bin(),'--bg','--name',d['name']]
+            if d.get('permissions','full')=='full': args+=['--dangerously-skip-permissions']
+            # Existing backend config remains authoritative; no model-name substitution.
+            conf=Path(os.environ.get('CLAUDE_FLEET_CONFIG',str(Path.home()/'.claude/multi-session-dev.json')))
+            if conf.exists():
+                profile=json.loads(conf.read_text()).get(a.profile,{})
+                for field in ('model','effort'):
+                    if profile.get(field): args+=['--'+field,str(profile[field])]
+            args += [prompt]
+            p=run(args,cwd=d['worktree'],timeout=55,check=False)
+            # Reconcile through public JSON, not localized launch output or session-name prefixes.
+            hits=[j for j in claude_jobs() if j.get('name')==d['name'] and Path(j.get('cwd','/')).resolve()==Path(d['worktree']).resolve()]
+            if len(hits)!=1 or not hits[0].get('id'):
+                raise RuntimeError('launch outcome uncertain; inspect claude agents --json --all; do not redispatch')
+            j=hits[0]; d.update(shortId=j['id'],sessionId=j.get('sessionId'),state='running')
+        else:
+            routing=route(meta(c)); d['routing']=routing
+            # Apply fleet permission preference explicitly at thread and turn boundaries.
+            params=dict(cwd=d['worktree'],ephemeral=False,serviceName='multi-session-dev-v2',threadSource='user')
+            if routing.get('model'): params['model']=routing['model']
+            if routing.get('modelProvider'): params['modelProvider']=routing['modelProvider']
+            if routing.get('providerType')=='deepseek': params['serviceTier']=None
+            params.update(permission_params(d))
+            res=call('thread/start',params,start=True)
+            d['sessionId']=res['thread']['id']
+            # Persist ID before any subsequent RPC; a failed reply must never duplicate this thread.
+            update(c,m,sessionId=d['sessionId'],routing=routing)
+            call('thread/name/set',dict(threadId=d['sessionId'],name=d['name']))
+            turn=dict(threadId=d['sessionId'],cwd=d['worktree'],input=[dict(type='text',text=prompt)])
+            if routing.get('reasoningEffort'): turn['effort']=routing['reasoningEffort']
+            if routing.get('providerType')=='deepseek': turn.update(serviceTier=None,summary='none')
+            turn.update(permission_params(d, turn=True))
+            res=call('turn/start',turn); d.update(state='running',turnId=res['turn']['id'],startedAt=time.time())
+        # Preserve a concurrently written bind/worktree update.
+        d=update(c,m,**{k:v for k,v in d.items() if k not in ('module','worktree','branch')})
+        # 记录先落盘再开面板：面板第一次扫描就能看到这个 worker。
+        emit(dict(d,panel=panel_attach(c,d)))
+    except Exception:
+        update(c,m,state='launch-uncertain')
+        raise
+
+def receipt(c,d):
+    p=c/(d['module']+'.receipt.json')
+    if not p.exists(): p=inbox(c,d)
+    if not p.exists(): return None
+    r=json.loads(p.read_text())
+    if any(r.get(k)!=v for k,v in [('version',2),('rq',meta(c)['rq']),('module',d['module']),('attempt',d['attempt'])]):
+        return dict(result='needs-review',summary='stale or mismatched receipt')
+    if r.get('result') not in ('done','failed','blocked') or not r.get('summary'):
+        return dict(result='needs-review',summary='invalid receipt')
+    if r['result']=='done':
+        wt=r.get('worktree') or d.get('worktree')
+        f=meta(c)
+        if not wt or Path(wt).resolve()==Path(f['repo']).resolve():
+            return dict(result='needs-review',summary='missing independent worktree')
+        if d.get('worktree') and Path(wt).resolve()!=Path(d['worktree']).resolve():
+            return dict(result='needs-review',summary='receipt worktree does not match registry')
+        if Path(git(wt,'rev-parse','--path-format=absolute','--git-common-dir')).resolve()!=Path(f['commonDir']):
+            return dict(result='needs-review',summary='receipt belongs to another repository')
+        if run(['git','-C',wt,'merge-base','--is-ancestor',d['baselineCommit'],'HEAD'],check=False).returncode:
+            return dict(result='needs-review',summary='worktree lacks prepared integration baseline')
+        if not isinstance(r.get('tests'),list) or not r['tests']:
+            return dict(result='needs-review',summary='missing verification evidence')
+        if any(not isinstance(t,dict) or t.get('result') not in ('passed','not-run') or not t.get('evidence') for t in r['tests']):
+            return dict(result='needs-review',summary='invalid or failed verification evidence')
+        if d['role']=='developer':
+            if not any(t.get('result')=='passed' for t in r['tests']):
+                return dict(result='needs-review',summary='developer has no passing verification')
+            sha=r.get('commit','')
+            if not re.fullmatch('[a-f0-9]{40,64}',sha): return dict(result='needs-review',summary='missing commit')
+            f=meta(c)
+            if run(['git','-C',f['repo'],'merge-base','--is-ancestor',sha,f['integrationBranch']],check=False).returncode:
+                return dict(result='needs-review',summary='commit not landed on integration branch')
+    return r
+
+def status_one(c,d,jobs=None):
+    out={k:d.get(k) for k in ('module','backend','transport','sessionId','shortId','state','worktree')}
+    try:
+        r=receipt(c,d)
+        if r: out.update(state=r['result'],receipt=r); return out
+        if d['state'] in ('prepared','setting-up','launching','launch-uncertain','stopped'): return out
+        if d['backend']=='claude':
+            j=next((x for x in jobs if x.get('id')==d['shortId']),None)
+            if j is None: out['state']='unknown'; return out
+            st=j.get('state'); out['backendState']=st; out['waitingFor']=j.get('waitingFor')
+            out['state']={'done':'needs-review','failed':'failed','blocked':'blocked','stopped':'stopped','working':'running'}.get(st,'unknown')
+        else:
+            t=call('thread/read',dict(threadId=d['sessionId'],includeTurns=True))['thread']
+            st=t.get('status',{}); st=st if isinstance(st,dict) else {'type':st}
+            flags=str(st.get('activeFlags',[])).lower()
+            out['state']='blocked' if any(x in flags for x in ('waiting','approval','input')) else {'active':'running','idle':'needs-review','notLoaded':'needs-review','systemError':'failed'}.get(st.get('type'),'unknown')
+            turns=t.get('turns',[])
+            if turns and turns[-1].get('status') in ('failed','interrupted'):
+                out['state']='failed' if turns[-1]['status']=='failed' else 'stopped'
+    except Exception as e:
+        out.update(state='unknown',error=type(e).__name__)
+    return out
+
+def statuses(c):
+    ds=[json.loads(p.read_text()) for p in sorted((c/'v2').glob('*.json'))]
+    jobs=[]
+    if any(d['backend']=='claude' for d in ds):
+        try: jobs=claude_jobs()
+        except Exception: jobs=[]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        return list(pool.map(lambda d:status_one(c,d,jobs),ds))
+
+def status(a): emit({'jobs':statuses(coord(a.coord))})
+
+def read(a):
+    c=coord(a.coord); d=load(c,a.module); r=receipt(c,d)
+    if r: emit(r); return
+    if d['backend']=='claude': print(run([claude_bin(),'logs',d['shortId']]).stdout)
+    else: emit(call('thread/read',dict(threadId=d['sessionId'],includeTurns=True)))
+
+def reply(a):
+    c=coord(a.coord); d=load(c,a.module); text=Path(a.text_file).read_text()
+    if not text.strip(): raise ValueError('empty reply')
+    if not d.get('sessionId') and not d.get('shortId'): raise ValueError('session not registered')
+    # Archive old receipts before a new attempt so stale done cannot win over resumed work.
+    with lock(c,a.module):
+        d=load(c,a.module); old=c/(a.module+'.receipt.json')
+        if old.exists(): old.rename(c/'v2'/(a.module+'.receipt-'+d['attempt']+'.json.bak'))
+        d['attempt']=uuid.uuid4().hex; d['state']='replying'; atomic(record(c,a.module),d)
+    text=f"本轮 attempt={d['attempt']}；回执 attempt 更新为此值。协调目录不可写时，改写临时回执 {inbox(c,d)}，不要复用上一轮临时回执路径。\n"+text
+    if d['transport']=='native':
+        emit(dict(d,nextAction='send_message_to_thread, then register the same threadId after acceptance',prompt=text)); return
+    try:
+        if d['backend']=='claude':
+            # Public CLI has no live steer command. Narrow, existing compatibility path only.
+            with tempfile.NamedTemporaryFile(mode='w',dir=c,suffix='.reply.txt') as f:
+                f.write(text); f.flush()
+                run([ROOT/'cc-fleet-reply','--short',d['shortId'],'--text-file',f.name])
+        else:
+            t=call('thread/read',dict(threadId=d['sessionId'],includeTurns=True))['thread']
+            turns=t.get('turns',[]); latest=turns[-1] if turns else {}
+            params=dict(threadId=d['sessionId'],input=[dict(type='text',text=text)])
+            if latest.get('status')=='inProgress':
+                params['expectedTurnId']=latest['id']; call('turn/steer',params)
+            else:
+                call('thread/resume',dict(threadId=d['sessionId'], **permission_params(d)))
+                if d.get('worktree'): params['cwd']=d['worktree']
+                routing=d.get('routing',{})
+                if routing.get('reasoningEffort'): params['effort']=routing['reasoningEffort']
+                if routing.get('providerType')=='deepseek': params.update(serviceTier=None,summary='none')
+                params.update(permission_params(d, turn=True))
+                call('turn/start',params)
+        emit(update(c,a.module,state='running'))
+    except Exception:
+        update(c,a.module,state='launch-uncertain'); raise
+
+def stop(a):
+    c=coord(a.coord); d=load(c,a.module)
+    if d['backend']=='claude': run([claude_bin(),'stop',d['shortId']])
+    else:
+        t=call('thread/read',dict(threadId=d['sessionId'],includeTurns=True))['thread']
+        for turn in reversed(t.get('turns',[])):
+            if turn.get('status')=='inProgress':
+                call('turn/interrupt',dict(threadId=d['sessionId'],turnId=turn['id'])); break
+    emit(update(c,a.module,state='stopped'))
+
+def wait(a):
+    c=coord(a.coord); end=time.monotonic()+a.timeout
+    while True:
+        rows=statuses(c)
+        if not rows or all(r['state'] in TERMINAL for r in rows) or any(r['state'] in TERMINAL-{'done'} for r in rows):
+            emit({'reason':'attention-or-complete','jobs':rows}); return
+        remaining=end-time.monotonic()
+        if remaining<=0: emit({'reason':'timeout','jobs':rows}); return
+        time.sleep(min(a.interval,remaining))
+
+def collect(a):
+    c=coord(a.coord); d=load(c,a.module); r=receipt(c,d)
+    if not r or r['result']=='needs-review': raise ValueError('no verified receipt to collect')
+    if r.get('worktree') and not d.get('worktree'):
+        # receipt() has verified repository identity and prepared baseline for done.
+        if r['result']=='done':
+            update(c,a.module,worktree=str(Path(r['worktree']).resolve()),branch=git(r['worktree'],'rev-parse','--abbrev-ref','HEAD'))
+    atomic(c/(d['module']+'.receipt.json'),r)
+    emit(dict(result=r['result'],receiptFile=str(c/(d['module']+'.receipt.json'))))
+
+
+def reconcile(a):
+    c=coord(a.coord); d=load(c,a.module)
+    if d['backend']=='claude':
+        hits=[j for j in claude_jobs() if j.get('name')==d['name'] and Path(j.get('cwd','/')).resolve()==Path(d['worktree']).resolve()]
+        if len(hits)!=1: raise ValueError('cannot uniquely reconcile worker; inspect public session list')
+        j=hits[0]; emit(update(c,a.module,shortId=j['id'],sessionId=j.get('sessionId'),state='running'))
+    else:
+        sid=a.session_id or d.get('sessionId')
+        if not sid: raise ValueError('supply --session-id from the verified Codex task list')
+        t=call('thread/read',dict(threadId=sid,includeTurns=False))['thread']
+        if d['transport']!='native' and Path(t.get('cwd','/')).resolve()!=Path(d['worktree']).resolve():
+            raise ValueError('thread cwd does not match prepared worktree')
+        emit(update(c,a.module,sessionId=sid,state='running'))
+
+def events(a):
+    c=coord(a.coord); d=load(c,a.module)
+    if d['backend']!='codex' or not d.get('sessionId'): raise ValueError('events requires a registered Codex worker')
+    # This is an active controller subscription, never used by a read-only UI panel.
+    argv=[os.environ.get('CODEX_APP_CALL_BIN',str(ROOT/'cc-codex-app-call')),
+          '--watch-ms',str(a.timeout*1000),'thread/resume','-']
+    p=subprocess.run(argv,input=json.dumps(dict(threadId=d['sessionId'])),text=True,timeout=a.timeout+40)
+    if p.returncode: raise RuntimeError('event connection interrupted; reconcile through status')
+
+
+def parser():
+    p=argparse.ArgumentParser(description=__doc__); s=p.add_subparsers(dest='cmd',required=True)
+    q=s.add_parser('init'); q.add_argument('--cwd',required=True); q.add_argument('--host',choices=HOSTS,required=True)
+    q.add_argument('--owner-id'); q.add_argument('--base'); q.add_argument('--rq'); q.set_defaults(fn=init)
+    for cmd,fn in [('prepare',prepare),('dispatch',dispatch),('register',register),('bind',bind),('status',status),('read',read),('reply',reply),('stop',stop),('wait',wait),('reconcile',reconcile),('events',events),('collect',collect)]:
+        q=s.add_parser(cmd); q.add_argument('--coord',required=True); q.set_defaults(fn=fn)
+        if cmd not in ('status','wait'): q.add_argument('--module',required=True,type=name)
+        if cmd=='prepare':
+            q.add_argument('--permissions',choices=('full','inherit'),default='full',help='worker permissions (default: full); inherit preserves backend configuration')
+            q.add_argument('--backend',choices=('codex','claude')); q.add_argument('--transport',default='auto',choices=('auto','native','app-server','claude-bg'))
+            q.add_argument('--task',required=True); q.add_argument('--role',default='developer',choices=('developer','scout','verify','integ'))
+        if cmd=='dispatch': q.add_argument('--profile',default='worker')
+        if cmd=='register':
+            g=q.add_mutually_exclusive_group(required=True); g.add_argument('--session-id'); g.add_argument('--client-thread-id'); q.add_argument('--host-id',default='local')
+        if cmd=='reconcile': q.add_argument('--session-id')
+        if cmd=='events': q.add_argument('--timeout',type=int,choices=range(1,56),default=50,metavar='1..55')
+        if cmd=='bind': q.add_argument('--worktree',required=True)
+        if cmd=='reply': q.add_argument('--text-file',required=True)
+        if cmd=='wait':
+            q.add_argument('--timeout',type=int,choices=range(0,56),default=50,metavar='0..55'); q.add_argument('--interval',type=int,choices=range(2,31),default=5,metavar='2..30')
+    return p
+
+if __name__=='__main__':
+    try:
+        args=parser().parse_args(); args.fn(args)
+    except (RuntimeError, ValueError, OSError, KeyError, subprocess.TimeoutExpired) as e:
+        print(json.dumps({'error':str(e)},ensure_ascii=False),file=sys.stderr); sys.exit(2)

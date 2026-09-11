@@ -1,512 +1,86 @@
 ---
 name: multi-session-dev
 description: >-
-  多 session 协作开发编排（仅供**发起需求的主 session**用）。用户一旦说「用多 session / 多个 session /
-  fleet 编排 来完成某开发任务」，**动手前第一件事就是加载本技能并按它编排，绝不自己直接读/改/跑代码**。
-  主 session 只做：把业务需求归属到项目既有模块（只映射不自创，一个模块一个子 session、绝不合并）、为接口
-  交互安排契约先行、设计 e2e 验收场景、派发/监控/验收/回修。⚠ 派发开发 worker 只用 `cc-dispatch`
-  脚本（codex/App 可见模式 `cc-dispatch-codex-app`），**绝不用内置 `Agent`/Task 工具**（`Agent` 仅限只读
-  探查）——这是本技能最高频错误。触发词：用多 session 完成任务、多 session 开发、模块拆分派发、fleet 编排、
-  契约先行、cc-dispatch、codex-app 模式。⚠ 被派发的**子 session（worker：名字带 ↳ / `FLEET_ROLE=worker` /
-  首条消息带 ⟦FLEET-WORKER⟧）不要用本技能**——你是干活的 worker，按任务卡写代码+自测+回执即可。
+  在 Codex 或 Claude Code 主 session 中，按既有模块编排独立 Codex / Claude Code 子 session，
+  支持混合后端、契约先行、worktree 隔离、回执和集成验收。用于用户要求多 session、独立任务并行开发、
+  fleet 编排或跨客户端调度；不用于普通单任务开发，不在 FLEET-WORKER 子 session 内再次编排。
 ---
 
-# Multi-Session 协作开发（主 session 编排）
+# 跨客户端多 session 编排 · v2
 
-把一个开发需求**按项目既有模块边界归属**到各模块，派发给多个**独立后台 session**并行开发，主 session 全程
-**不碰代码**，只做：拆解 → 派发 → 监控 → 收回执 → 整体验收 → 定位回修。
+本技能共享一套流程，通过主端能力和 worker 后端选择执行方式。不要把 Claude 工具名、模型名或目录
+替换成 Codex 字样来移植技能。`multi-thread-dev` 是旧入口，统一使用这里的流程。
 
-## ⛔ 先自检：你是主 session 还是被派发的 worker？
+## 身份与职责
 
-**如果你是被派发的子 session（worker），立刻停用本技能。** 满足任一即为 worker：
-- 会话名以 `↳` 开头；
-- 环境变量 `FLEET_ROLE=worker`（Codex 后端没有这个变量，见下）；
-- 首条消息以 `⟦FLEET-WORKER⟧` 哨兵行开头、或写着「你是一个模块 session」。
+首条任务带 `⟦FLEET-WORKER⟧` / `⟦CODEX-THREAD-WORKER⟧` 或 `FLEET_ROLE=worker` 时，你是 worker：
+按任务卡开发、自测、回执，不加载编排流程或再开 worker。标题 `↳` 只是展示，寻址用真实 ID。
 
-worker 该做的：**按任务卡在自己范围内写代码 + 自测 + 回填回执**（见首条消息里的回执契约），**不要**再往下
-派发、**不要**拒绝写代码、**不要**把活又拆给别人。下面所有「编排」动作只属于主 session。
+主 session 拆解、定契约、派发、监控和裁定。模块业务代码交给独立 session；主端可以维护技能、
+协调文档、检查 Git 状态、审阅必要的 diff 和运行验收。纯探查优先使用可用的只读 subagent；
+没有相应工具时自行只读检查，不臆造 `Agent`、`ListAgents`、`Monitor` 或 `SendMessage`。
+开发 worker 是独立 session，不用内部 subagent 替代。
 
-## ⛔ 两条硬边界（动手前先记牢）
+## 路由：主端和执行后端分别选择
 
-### 边界 A：派发开发 worker = 跑 `cc-dispatch`，永远不是 `Agent`/Task 工具 ⭐
-
-**这是本技能最高频、最致命的错误。** 你被要求「用多 session 完成任务」后，会本能地伸手调内置 `Agent`（Task）
-工具并行——因为它是你平时做并行工作的默认工具。**在本技能里这个本能是错的**：`Agent` 起的是挂在你名下、
-FleetView（`claude agents`）里根本看不见的 subagent，不是独立 session，无法独立合回、收不到回执、watcher 监控
-不到——整套 fleet 编排全部失效。「用多 session」从字面就要求真正的独立 session。
-
-**唯一判据 = worker 要不要改代码：**
-
-| 通道 | 用途 | 机制与可见性 |
-|------|------|------|
-| **内置 `Agent`**（`Explore`/`general-purpose`） | **只读探查**：拆解前摸字段/接口/数据流现状，拿结论回来。**绝不让它写/改/提交代码** | 主 session 名下的 subagent，**无 `↳` 名**、**不在 `claude agents` 列表**、无独立 worktree/合回/回执/监控 |
-| **`cc-dispatch`** 系列 | **开发交付**：某模块内真写代码 + 自测 + 合回 | 独立顶层 background session，带 `↳<模块>@<RQ>` 名、可见、走完整 sid 名册/watcher/回执 |
-
-> worker 的模型与思考深度**不跟 daemon 默认走**：`cc-dispatch` 固定按 `~/.claude/multi-session-dev.json`
-> 的 `worker.{model,effort}`（缺省 `claude-opus-5` + `high`）经协议 `launch.args`/`respawnFlags` 下发；
-> 临时改用 `--model/--effort`，详见 `reference/commands.md`。
-
-> ⚠ harness 那句「launch multiple agents in one message for parallel work」**不适用于派发开发 worker**：
-> 「并行开多个 worker」= 在一条消息里连发多条 `cc-dispatch`，**不是**连发多个 `Agent` 调用。
-
-**派发后立刻机械验证**：确认每个模块都能看到 `↳<module>@<RQ>` 条目。看不到（或只有一个无名 `source=spare` 的
-running 条目）→ **你刚才误用了 `Agent`**，立刻改用 `cc-dispatch` 重派。
-
-### 边界 B：主 session 绝不写/调/测/读业务代码 ⭐
-
-你是**编排者**，脑力全花在「业务需求 → 模块需求」的拆解、契约编排、验收场景设计与裁定上。
-
-- 影响面、数据流、模块边界**靠业务知识 + L1 业务需求文档 + 项目模块地图**判断，**不靠读源码**。
-- 确需探查代码现状才能拆准 → **用 subagent（`Agent` 工具、`Explore` 类型）只读探查**拿结论。
-  **是 subagent 在读、主 session 拿结论，主 session 仍不亲自 grep/Read。**
-- **开子 session 的唯一门槛 = 要在某领域模块内部真正开发/改代码**。凡**只读**的活（确认/了解某功能、摸字段·
-  接口·数据流现状）一律走 subagent，**别为此开子 session**。
-- 仅当探查量**极大** / 需独立完整上下文 / 要跑长命令链时，才退回派只读 scout 子 session
-  （`--name "↳scout@<RQ>"`，preamble 写明「只读不改、只回报结论」）——这是例外，不是默认。
-- 一旦发现自己在读/改模块源码，就是越界——退回去，交给 subagent 探查或写成任务卡派出去。
-
-## 何时激活本技能
-
-- **自动判断**：当前是主 session，且用户表达「把需求拆成模块、派发多个 session 并行开发、我只统筹验收不亲自
-  写代码」这类**编排意图**时自动加载。
-- **显式调用**：用户输入 `/multi-session-dev`。
-- **不激活**：普通单 session 开发、被派发的 worker（见上自检）、纯运维/查询、需求小到一个 session 能利落做完时。
-- **只读理解类不开子 session**：用户只让你「根据代码确认 / 了解某功能 / 摸现状」这种纯只读请求 → 用 subagent
-  拿结论即可（见边界 B）。
-
-## 选后端：Claude（默认）还是 Codex
-
-**两套后端的场景、流程、RQ、协调目录、任务卡、回执、集成分支基本相同**，只是 worker 跑在哪、命令换个后缀。
-唯一实质差别：**回执通道 ⓪（worker 主动推送，见铁律 2）只有 Claude 后端有**——codex worker 没有 `SendMessage`，
-只剩落盘 + 最后一条消息两条拉取通道，完成感知慢一拍，watch 更不能省。
-
-- 默认 **Claude 后端**。
-- 用户明确说「codex / codex-app / App 可见」→ **Codex 后端**：所有 fleet 命令换成 `-codex-app` 后缀，
-  **动手前加载 `reference/codex-mode.md`**（那里有它与 Claude 后端的几条真实行为差异）。
-- 后端就绪（server 起没起、模型路由对不对、配置改了要不要重启）**全部由脚本内部自愈**——
-  派发前不需要额外体检、不需要确认、不需要手动拉服务。
-- Codex worker 进不了 `claude agents`（它是 app-server 里的 thread，不是进程）。派发脚本会自动在
-  Ghostty 分屏拉起只读面板 `cc-fleet-panel-codex-app` 给用户看，**你不需要为此做任何事**，
-  编排判断照旧只看 `cc-fleet-status-codex-app` 与回执。
-
-## 主 session 的六步职责
-
-1. **拆解（归属，非发明）**：把业务需求**归属到项目既有模块**——识别受影响模块、数据流/数据来源、实现策略
-   （见「业务需求拆解」）。模块划分是项目自带的，只映射、禁止自创；默认**一模块=一卡=一 session**。
-2. **派发**：给每个模块派一个独立后台 session，让 worker 在自己范围内开发 + **自测**。
-3. **监控**：派完**立刻 arm watcher**（交给 Monitor 跑）让完成/异常**推送**给你——零轮询、不傻等。
-4. **收回执**：收齐每个 session 的会话回执。
-5. **验收**：从验收口径**设计 e2e 场景**（测哪些由你定），但执行**派给独立 session**（联调/验收 session）；
-   你只读它的报告 + 各模块回执来**裁定**。
-6. **回修**：不达标 → 定位问题模块 → 派**新 session**去修，回到第 3 步。
-
-模块内部的开发/调试/单测/e2e 全由各模块 session 自己负责，你不替它写、不替它调、不替它测。
-
-## 业务需求拆解（主 session 唯一的核心脑力活）⭐
-
-拿到需求先做**四问拆解**，把「业务需求」翻译成若干互不冲突、可并行（或契约先行后并行）的模块需求。只用业务
-知识 + L1 文档，**不读源码**（要查现状用 subagent 探查）。
-
-> 🚫 **模块/领域划分是项目既有的，你只做「归属映射」，禁止发明或重新划分。** 先查项目的模块地图/清单（如
-> factory `CLAUDE.md` §8「模块地图」、`docs/requirements/<NN>/` 编号目录），据此把需求归属到既有模块。**确实找
-> 不到对应既有模块** → 按项目规则判断是否新建（通常独立 commit + 告知/请用户裁定），**不擅自新建**。
-
-**① 落到哪些既有模块？（受影响模块）** 一个字段/能力常牵涉多端、多单据、多读取方——对照模块清单把展示方、
-写入方、读取方都定位全，漏一个就出现「前台加了字段、后台没传」的断层。
-
-**② 数据从哪来、谁负责弄进来？（数据流/数据来源）** 新数据的源头在哪、通过什么时机和通道进入系统。两类常见
-落点：运维任务批量同步 / 业务动作触发时主动抓取。找出「谁是这条数据的生产者」——它就是一条独立模块需求。
-
-**③ 实现策略选型（根因优先）**：能判断哪条更优 → 直接自决，把依据写进 L1 文档/任务卡；两条各有取舍无法确定
-→ 用 `AskUserQuestion` 确认后再派，别拍脑袋也别两条都做。选型默认偏向**根因修复**（数据在正确时机以正确方式
-进入系统），而非绕过/兜底/加开关。
-
-**④ 哪些是跨模块接口交互？（引出协同编排）** 识别「提供方—消费方」关系：某模块要调另一模块新接口 / 多模块共享
-新数据结构 → 命中**跨模块协同**（走「协同三模式」）；纯展示型、各改各的、互不调用 → 直接并行派发。**若发现多个
-模块会重复实现同一段逻辑/数据结构/校验 → 就地收敛成一个「公共模块」先行产出，其余作消费方依赖它**（公共模块=
-提供方，同走三模式）。**不论命中与否，每个模块都是独立 session，依赖靠编排不靠合并。**
-
-> **范例（「大货样字段」需求）**：发货计划要加「大货样」字段，数据来源是 ××× 系统。
-> - ① 受影响模块：采购后台「发货计划」、工厂前台「发货计划/生产计划」都要展示（≥3 个展示点，分属采购端与工厂端）。
-> - ② 数据来源：来自 ×××，两条候选——(a) 加运维任务批量同步；(b) 生成采购单/发货计划时主动抓取一次。
-> - ③ 选型：若判断「生成时抓取」更优（随单据即时落地、无需额外调度）→ 自决派给生成模块；拿不准 → `AskUserQuestion`。
-> - ④ 接口交互：展示方读的是生产方写入的同一数据结构 → 生产方先定字段/接口契约，各展示端按契约并行接入。
->
-> 产物：1 条数据生产模块需求 + N 条展示模块需求，必要时一份共享字段契约，每条进 L1 文档 + 一张任务卡。
-
-## 派发粒度铁律：默认一模块一 session，可更细，绝不合并多模块 ⭐🚫
-
-**唯一判据**：这块内容在代码上是否相对独立、一个 worker 能否聚焦地把它交付掉 + 自测。据此两个方向都要防——切太
-粗（改动面失控、耦合、合回冲突）也别切太细到无意义。项目既有模块边界是最稳的切分线，故**默认一模块一 session**；
-下列维度按需组合、都服从上面判据：
-
-- **①按角色切**：开发/联调/验收本就是不同 session；契约设计、代码 review 也各自独立 session。别让一个开发 session
-  顺手把设计、验收、review 也做了。
-- **②按业务流程切**：一次需求含多条相对独立的业务流程时，不同流程尽量分到不同 session（哪怕落在同一模块）。
-- **③按模块切（默认粒度）**：需求落到 N 个既有模块 → 默认 N 卡 N session。**禁止**因「改动都小/业务相关/顺手」把
-  多模块合进一张卡——那等于在执行层打散项目模块边界，改动面失控、回执无法按模块归因、合回冲突。
-- **④模块内大改动再切**：一个模块本次改动量很大、且能拆成**代码上彼此独立的几块**（不同文件/子流程、不互改同一处）
-  → 拆成多 session 分头做。**前提是拆出的块代码独立**：若必然改同一批文件别硬拆（`cc-fleet-land` 必冲突），要么合成
-  一个 session，要么先抽公共模块（维度⑤）。拆出的每个 session 给不同子模块标签（`FLEET_MODULE=<m>-<flowA>` 等）。
-- **⑤抽公共模块，从设计上消重**：多个 session 会重复实现同一段逻辑/数据结构/校验/工具 → 主 session 在设计阶段收敛
-  成一个「公共模块」session 先行产出，其余依赖它接入（公共模块=提供方，走协同三模式）。
-
-**依赖关系靠编排、不靠合并**：命中接口交互（含公共模块）走「协同三模式」；纯先后依赖排派发顺序（前序回执 done
-再派后续）；互不冲突直接并行。
-
-**自检信号（每张卡派发前必查）**：
-- 任务卡「业务需求锚点」出现**两个及以上不同模块**的需求文档编号 = 切太粗，按模块拆开重写（维度③）。
-- 一张卡要改的文件横跨多条明显不相干的业务流程 → 按流程再切（维度②）。
-- 多张卡都在实现「看起来一样」的逻辑 → 该抽公共模块（维度⑤）。
-
-**三个例外（不破坏「专注+代码独立」）**：
-1. **同模块内、代码耦合紧的多条子需求**合一张卡——本就该同一 session 交付，不算合并（与维度④相反：耦合紧别硬拆）。
-2. **登记类散点**：新页面/新接口必须同步的注册点（前端菜单 `menu-config.ts`、路由注册、rbac 门禁）——这类一两行
-   登记**随功能模块卡一并改**，但必须在任务卡「上下游协作」段**显式授权**；若多个并行 session 要碰**同一个**登记
-   文件，主 session 排定合回顺序，后合者负责 rebase。
-3. **打样 worker（模式 C 段①）**：唯一允许一个 session 跨多模块改代码的场景，但**只许改接口层**（签名 / 类型 / 空实现 /
-   默认关闭的开关 / 一条集成 e2e），⛔ 不写任何业务逻辑；段② 仍按一模块一 session 派。越线与否主 session 看
-   `cc-fleet-summary` 的改动统计判，不读 diff。
-
-## 跨模块协同三模式（多模块接口交互必读）⭐
-
-拆解第④问命中「提供方—消费方」时，**不要一上来把提供方和消费方一起并行派**（契约没定，消费方按猜的接口写必
-返工），**也不许因此把两模块合给一个 session**。由主 session 选一种模式（判据与契约模板见 `reference/contract-first.md`）：
-
-- **模式 A · 契约先行（默认，并行抢墙钟）**——三段式：
-  - **段① 契约设计（串行卡点，只派 1 个 session）**：先派 API 提供方做接口/契约层设计（签名、请求/响应 schema、
-    字段语义与单位、错误码、事件结构），产物落 `<COORD>/contracts/`。**主 session 评审契约**（业务面：字段齐不齐、
-    口径对不对、错误码覆盖没），定稿后进段②。
-  - **段② 分头开发（契约定稿后并行）**：提供方按契约实现真逻辑；消费方按契约接入、对端用 mock/桩自测。双方代码
-    互不冲突、真正并行，各跑自己的单测/模块 e2e。
-  - **段③ 联调（独立 session）**：段②都 done 后派一个独立联调 session（`↳integ@<RQ>`）把相关模块真实拼起来（去
-    mock、真接口）跑通，回报集成是否通。联调属「测试」不属「开发」。
-- **模式 B · 提供方先行（串行，等真实接口）**：先派提供方**完整设计+开发+自测**一张卡，done 后主 session 从其回执/
-  契约提取**实际接口形态**作消费方任务卡的依赖锚点，**再派**消费方按真实接口接入（无需 mock）。适用：接口形状强
-  依赖实现探索，预先定稿大概率被推翻；或消费方接入量很小。
-- **模式 C · 打样先行（耦合强 / 接口模糊时用；仍是多 session 编排，主 session 照旧不碰代码）**——段① 不只出契约文档，
-  而是派**一个「打样 worker」**（`cc-dispatch --profile spike`，模型/深度读配置文件 `spike` 块，默认 fable5.1 + xhigh）出一副
-  **能走通的骨架**：契约 + **所有相关模块**里的接口签名 / 类型 / 空实现 / 默认关闭的接线开关 + **一条真跨模块的集成
-  e2e**（最小假数据打到底），`cc-fleet-land` 到 `fleet/<RQ>`。⛔ 不写业务逻辑（函数体只许抛「未实现」或返回固定值）；
-  主 session 凭 `cc-fleet-summary` 附带的**改动统计**（文件数 / 增删行）核它有没有越线，**不读 diff**。段② 各模块 worker
-  按一模块一 session 在骨架上填实现——契约自相矛盾、可选字段谁提供谁消费，已在段① 被同一个脑子撞过一遍并写死在代码里，
-  模式 A 的「两边各自绿、合起来炸」盲区在这里不存在。段③ 联调 session 变轻：跑段① 留下的集成 e2e + 验收场景。
-  **判据（命中任一默认走 C）**：接口牵涉 **3 个以上模块**；字段口径主 session 自己都拿不准；这几个模块之间**历史上出过
-  契约事故**。跨 2 个模块且接口简单仍走 A，别一刀切。
-- 三种模式下提供方/消费方**都各是独立 session、绝不合并**（模式 C 段① 的打样 worker 是唯一豁免，且只许改接口层，见粒度
-  铁律例外 3）；拿不准默认模式 A。纯展示型互不调用则跳过本节直接并行。
-
-## 分支隔离铁律：每 RQ 一条集成分支，共享分支只在验收后动一次 ⭐🚫
-
-防「半成品过早污染共享分支、串台其它并发任务」的根本机制。**两级分支隔离：**
-
-- **每个 RQ 一条专属集成分支 `fleet/<RQ>`**，主 session 在 Step 1 用**发起任务时的当前分支**（`$FLEET_BASE`，如
-  `dev/langyi`）创建（`cc-fleet-init` 自动做，base 名记进 `<COORD>/base.ref`）。它是本 RQ 的隔离单元：并发的多个
-  RQ 各自一条，互不污染。
-- **worker 的 base = `fleet/<RQ>`，改动也只合回 `fleet/<RQ>`**（派发时 `--env FLEET_BASE_BRANCH="$INT"` 注入）。
-  worker 隔离后**第一件事 `git reset --hard "$FLEET_BASE_BRANCH"`** 强制锚定（防 bg 隔离从 origin/main 生的 worktree
-  没有项目代码），自测绿后跑 **`cc-fleet-land <RQ>`** 把改动安全合入 `fleet/<RQ>`（内部 CAS 重试、多 worker 并发落地
-  零丢更新），**绝不 merge/push 共享分支**。
-- **共享分支只在主 session 整体验收通过后动一次**：把 `fleet/<RQ>` 合回 `$FLEET_BASE`（读 `base.ref`）+ push + 删
-  集成分支（Step 6）。**验收完成前 `dev/<name>` 一行不动** → 其它并发任务、用户本人完全不受干扰。
-
-> 为什么 worker 能「自己合进一条没被 checkout 的分支」且抗并发：`fleet/<RQ>` 只是 `.git` 里一条共享 ref，没在任何
-> worktree 被 checkout。`cc-fleet-land` 用 compare-and-swap——先把 `fleet/<RQ>` 现 tip 合进 worker 自己分支、再
-> 原子推进 ref，被抢先就重读重试。零丢更新；冲突（RQ 内按模块粒度本就罕见）留给 worker 解决后重跑。
-
-## 文档分层与承上启下（防子模块跑偏）⭐
-
-让子模块知道整体业务需求、知道改动针对哪些业务需求文档及其变化，并在模块内形成承上启下的文档。三层 + 严格
-ownership（完整模型、L2 模板、业界依据见 `reference/doc-traceability.md`）：
-
-| 层 | 内容 | 谁写 |
+| 主端 host | worker backend | 路径 |
 |---|---|---|
-| **L1 业务需求文档** | 整体业务目标、跨模块场景、业务级验收（业务语言，单一事实源） | **主 session** |
-| **L1.5 模块委托（任务卡）** | ①整体业务上下文 ②针对哪些业务需求文档/章节+变化 ③本模块验收清单 | **主 session** |
-| **L2 模块需求+设计** | 本模块需求（↑挂 L1）+ 功能/技术设计（↓到代码/测试） | **子 session（主 session 绝不代写）** |
+| codex-app | codex | 默认 app-server（开放权限）；显式继承权限时可用原生任务工具 |
+| codex-app / codex-cli | claude | `cc-fleet` → Claude 公开后台 CLI |
+| claude-code | codex | `cc-fleet` → Codex app-server |
+| claude-code | claude | `cc-fleet` → Claude 公开后台 CLI |
 
-- **承上启下 = 双向追溯链**：L2 每条模块需求向上挂 L1 具体条目/锚点、向下挂模块设计与测试。验收即查链。
-- 🚫 **主 session 从不代写 L2**（它不读模块源码，写出的「向下链」必然 stale，且违反 ownership、制造瓶颈）。L2 由
-  最接近实现的子 session 写，与代码同仓同 commit（docs-as-code）。主 session 只定标准 + 画桥（委托/锚点）+ 评审链一致性。
+用户明确指定 worker 后端时服从；未指定时默认使用 Codex worker。同一 RQ 可以混用两个 backend。
+**用户偏好（2026-09-11）：Claude Code 主端调用本技能时，默认派 Codex 子 session，模型 `gpt-6-astra`、
+思考档 `low`、provider `openai`。** 由脚本在新派发时执行，后续 reply 沿用登记的 routing；不要改 Claude
+主 session 自己的模型，也不要将 GPT-6 名称传给 Claude 后端。用户明确指定 Claude worker 时仍可使用 Claude 后端。
+Codex CLI 没有 App 原生任务工具时自动走 app-server；不要把工具名称当作所有客户端都提供的能力。
+使用前读取 [v2-commands.md](reference/v2-commands.md)。Codex App 原生路径另读
+[native-codex.md](reference/native-codex.md)，跨客户端路径读 [backends-v2.md](reference/backends-v2.md)。
+技能脚本相对于本 SKILL.md 的 `scripts/` 定位，不能假设已加入 PATH。
 
-## ⛔ 完成判定与回执获取（防主 session 死等）
+## 一轮开发
 
-> 本技能最容易踩的坑：主 session 无限等一个早已完成的子 session。四个根因（把「回执文件出现」当完成 / 拿不到完成
-> 推送而轮询死等 / 把 `state=working` 当在跑 / daemon respawn 擦掉 `done`）与两次真实踩坑的复盘见
-> **`reference/pitfalls.md`**。对策是下面五条铁律，日常照做即可。
+1. 读项目指导和模块地图，将需求归属到既有模块，默认一模块一卡一独立 session；耦合紧的同模块内容
+   不必硬拆。列出数据生产方、消费方和验收场景。
+2. 跨模块接口未稳定时，按 [contract-first.md](reference/contract-first.md) 先定契约，再并行实现，
+   最后独立联调/验收。该文档里的旧派发命令以 v2 路由替代，业务分层原则继续保留。
+3. `cc-fleet init` 创建唯一 RQ、协调目录、`fleet/<RQ>` 集成分支，并记录主端及可用的真实会话 ID；不可取得时使用明确标识的 controller ID，不能冒充真实会话 ID。
+   只包含 base 的已提交内容；若用户要求包含未提交改动，先做受控快照，不擅自丢弃或提交用户改动。
+4. 任务卡写清范围、依赖契约、自测、L1/L2 追溯（项目需要时）、验收口径。`prepare` 生成统一
+   worker prompt 和身份，CLI 路径还会预建独立 worktree；原生路径让 App 创建 worktree。
+5. 按路由派发。即时记录真实 thread/session ID；原生创建返回 `clientThreadId` 时仅记为 setup pending，
+   等到真实 `threadId` 后再监控。不能把 client ID 当真实 ID，也不能因等待久而重复创建。
+   当前主端能调用 Codex 侧栏工具时，每个新建的 Codex worker（含 app-server 路径）都按
+   [sidebar-placement.md](reference/sidebar-placement.md) 自动移入用户的“子 session”分区。
+   Claude Code / Codex CLI 主端跑在 Ghostty 里时，app-server 路径派发成功即自动在右侧分屏拉起只读面板
+   `cc-fleet-panel-codex-app` 展示子 session（`CC_FLEET_PANEL=0` 关闭）；编排判断仍只看 `status` 与回执。
+6. Codex App 原生 worker 用 `wait_threads` + cursor 等待；跨客户端可订阅 Codex events，或使用
+   有界 `cc-fleet wait`。Claude 主端存在 Monitor 才用它挂有界等待；没有推醒机制时继续主端工具等待，
+   不结束响应后声称后台会自动通知。用户明确要求稍后跟进时才按宿主能力设置自动跟进。
+7. `status` 从协调目录或本轮临时 inbox 读取回执，`collect` 核验后收存到持久协调目录。`status` 验证回执身份和开发 commit 是否在集成分支；空闲/turn 完成只是运行状态，**不等于任务交付**。
+   无回执、未知状态、审批等待均返回需关注，不能死等或擅自判 done。`read` 查看最后回复/日志后纠偏。
+8. 用 `reply` 生成新 attempt，避免上一轮 done 回执冒充新一轮完成；原生路径按输出调用宿主消息工具。
+   接口超时显示 launch-uncertain 时先 `reconcile`，不直接再派。换后端/重新实现用新 fix 模块卡。
+9. 模块完成后独立安排 integ/verify worker；验收必须在含全部已合入改动的集成基线上。
+   主端核对场景、回执、测试证据、必要的 diff，未达标定位回修。
+10. 验收通过后，按用户授权处理集成分支合回。不要从“多 session”推导出自动 push、发布、删除 worktree
+    或删除分支的授权。默认保留本地成果和会话历史，明确报告未完成事项。
 
-**铁律 0 ｜ 不轮询，arm 一个 watcher 让 harness【推】给你。** ⭐ 派发完**立刻**把 watch 命令交给 Claude Code 原生
-**Monitor 工具**（`persistent:true`）跑。它阻塞监视该 RQ，**每个模块一结束就往 stdout 写一行 → harness 变成推回
-主 session 的通知**；全部结束写一条总结并退出（退出码=完成信号）。于是「子 session 结束」被转成「主 session 原生
-推送」，全程零轮询、零 sleep——派完就去跟用户聊别的，done 事件自动找上门。内置 ≤4 分钟心跳，漏掉的完成事件被下条
-心跳补上，保证至少每 <5min 被唤醒一次。
-- ⭐ **你有两个互不依赖的推送来源，都要有**：①**watch**（本条，进程级、覆盖崩溃/blocked/异常，**永远必挂**）；
-  ② **worker 自己 `SendMessage` 推来的完成/求救**（铁律 2 通道 ⓪，语义级、更快、绕开状态分类器）。⓪ 先到就先
-  按它办（该收回执收回执、该裁决裁决），watch 随后那条 `✅`/`💤` 只是复核，**不必等它才动**；反过来 ⓪ 没来也
-  不代表没完成——worker 可能崩溃或没照做，watch 照样会兜住。**任何一条都不许当唯一依据。**
-- **`blocked`（等授权/输入）不算结束**：先按铁律 4 判「真需要输入」还是「模型降级空转」，再走三条路之一：
-  **回复它**（`cc-fleet-reply`，确属该由人拍板才用）／**换新 session 重派**（`cc-fleet-respawn`，疑似灰度坏模型时）
-  ／**取消它**（`cc-fleet-kill`，只终止进程、不删已落盘回执）。
+## 不变条件
 
-**铁律 1 ｜ 完成 = daemon `done`/`gone`（按 SID 名册关联）** 或 **canonical 回执带 `result:`——二者任一即完成。**
-- 权威完成信号 = status 命令。它读协调目录 `*.sid` 名册，用 **sessionId** 关联 daemon 状态。**别靠 session 名关联**
-  ——完成后 daemon 里 name 会变空，靠 name 过滤会漏掉已完成的 session 而死等。SID 是稳定键。
-- ⭐ 它**同时**把 canonical 目录里带 `result:` 的回执作为第二条权威完成信号（`receipt=1` / 🧾）：只要
-  `<COORD>/<module>.summary.md` 首个非空行是 `result:`，该模块即判**已完成**，**不管此刻报什么 state**——这是抗
-  respawn 的关键（铁律 1.6）。看到 🧾 = 已完成，**别再当进度参考继续等**。
-- `gone`（名册有、daemon 列表无）= 已结束去收回执，不是「还在跑」。
+- `cc-fleet` v2 名册包含 host/owner、backend/transport、真实 ID、worktree、attempt，不能混用旧 `.sid` 名册。
+- 每个开发 worker 使用独立 worktree；从集成基线开始，提交后用现有 `cc-fleet-land` 的 CAS 合回机制。
+  不在已有目录执行 `reset --hard`，不让 worker 清理自己的 worktree；完成前先保证 commit 可追溯。
+- 模型/provider 除上述 Claude 主端 GPT-6 low 偏好外沿用各后端配置。其他主端的 Codex app-server 复用现有 session 路由；原生 App 沿用保存项目默认，
+  若用户要求独立 provider 路由则选择 app-server。不把后端 A 的模型名/effort 强塞给后端 B。
+- 用户偏好（2026-09-11）：worker 默认开放权限。Codex app-server 在启动、恢复及新 turn 显式设置完整访问和无需审批；Claude 新 worker 使用 `--dangerously-skip-permissions`。`prepare --permissions inherit` 可改为继承后端配置。开放权限不扩大任务授权，不代表允许推送、发布或删除成果；宿主若仍拒绝执行，应报告 blocked。
+- 不把整份用户级 CLAUDE.md 强行提升为 Codex developer instructions。两端读取各自适用的项目规则，
+  需要共享的业务规则由任务卡/契约显式引用。
+- CLI watch 超时是“本次等待结束”，不是 worker 失败。工具不可用则明确降级和限制。
 
-**铁律 1.5 ｜「还在跑」看 `tempo`，不看 `state`。** ⭐ daemon 报两个维度：`state`（分类器读最后一条消息文本推出，
-打了 `result:` 才翻 `done`）和 `tempo`（agent 循环此刻是否在产出）。**判「要不要继续等」看 `tempo`**：`active` 才是
-真在跑；`working`/`running` 但 `tempo=idle` = 循环已停（多半做完没打 `result:`，也可能卡住）→ 去收回执 / 读最后一条
-消息核验，别死等。watch 已自动兜底：持续 idle 够久判【静默已结束】（推 `💤 …需核验`），一旦又活跃自动撤销。**长任务例外**：worker 等自己起的 nohup 长任务
-（全量 e2e / 发布，可达 70 分钟）时循环也 idle，但它按 preamble 定期 `touch <COORD>/<module>.alive`，status 报 `aliveAge`、
-watch 视为在跑（推 `⏱`）不判静默——此前 watch 会在这里误判「全部结束」退出，主 session 失明（`reference/pitfalls.md` §六）。
-（**Codex 后端**：thread 空闲同理不等于完成，判据同样是回执——见 `reference/codex-mode.md`。）
+## 维护与旧入口
 
-**铁律 1.6 ｜ 持久回执闩锁：daemon 会 respawn 已完成的后台 session，唯有持久回执抹不掉。** ⭐ spare 池会把一个早已
-done 的 session respawn（`state` 翻回 `running`、`tempo` 回 `active`、`name` 变空），把易失的 `done` 完全擦掉，连铁律
-1.5 的静默兜底都失效。**根治 = 用持久信号做单调闩锁**：worker 完成时把回执写进 canonical
-`<COORD>/<module>.summary.md` 且**首行 `result:`**。status 标 `receipt=1`、完成判定以回执为准；watch 见 `receipt=1`
-立即推 `✅ 已完成 — 回执在案` 并【单调】结案，respawn 之后翻回 running 也**不反悔**。文件持久，respawn 抹不掉。
-所以这条**强依赖 canonical 协调目录**——worker 必须把回执写到那里（preamble 已要求）。
-
-**铁律 2 ｜ 回执四通道兜底（一推三拉），任一拿到即可（永不把「文件出现」当门禁）。**
-⓪ 是 worker **推**给你的快通道，①②③ 是你**去拉**的兜底通道：
-- ⓪ ⭐ **worker 主动 `SendMessage` 推送**：preamble 要求 worker 落盘回执后直接把
-  `[FLEET] <RQ>/<module> 已完成 — …` 推给你，**即时唤醒主 session**。这条**不经过 daemon 状态分类器、
-  不受 respawn 影响**（铁律 1.5/1.6 那两个坑它天然绕开），也是 worker 卡住时「需要裁决」的最快求救通道。
-  但它**依赖 worker 听话照做 + 你的名字没填错**，所以**永远不能只靠它**——watch（铁律 0）照挂不误。
-- ① **canonical 绝对协调目录**（`cc-fleet-coord <RQ>` 给路径，主仓库和所有 worktree 解析成同一处、在 `.git/` 里不进
-  版本库）——派发时作 `{{COORD_DIR}}`；
-- ② **`cc-fleet-summary` 自动遍历所有 git worktree** 收回执——worker 在自己 worktree 里写的回执，主 session
-  照样读得到，兜底主力；
-- ③ **worker 的最后一条消息**：preamble 要求 worker 把回执作为最后一条消息发出，FleetView/通知里永远看得到，
-  不依赖任何文件路径。前面都没拿到时读这条。
-
-> ⚠ **通道 ⓪ 是单向的：worker → 主 session。** 反过来「主 session 靠名字去找 worker」**不可靠**——daemon 会把
-> 后台 session 的名字改写成它最后一条消息的内容（实测派发名 `↳probe@EXPERIMENT` 被改成「探针已发送完毕。」）。
-> 要联络具体 worker 一律用 `cc-fleet-reply <RQ> <module>`（走 SID 名册，稳定），不要用 `SendMessage` 猜名字。
-
-**铁律 3 ｜ 瞬时 failed 会自愈，绝不无限等。** `failed`/error 可能是瞬时 API 抖动（如
-`UNKNOWN_CERTIFICATE_VERIFICATION`），隔一会儿再查常自愈成 `done`。确认是**持续**异常再进 Step 5。任一 session 超
-合理时长仍无 `done`/`gone` → 读最后一条消息 / daemon `detail` 排查，**绝不无限 sleep 等一个可能永远不出现在你所盯
-路径的文件**。
-
-**铁律 4 ｜ worker 质量降级（灰度坏模型）→ 别硬纠偏，kill 掉换【新 session】重派。** ⭐ 当前大模型灰度分流，偶尔某
-worker 被分到质量很差的模型实例，硬纠偏（reply）往往无效——换个新 session 通常就分到好模型、自愈。识别信号、与
-「真 blocked」的区分、别滥用的边界见 **`reference/pitfalls.md`**；对策一条命令 `cc-fleet-respawn`（用同一张任务卡
-另起全新 worker，旧 worker 半成品从未落地、集成分支始终干净；**无需重挂 watch**）。
-
-## 标准流程
-
-### 协调目录约定
-
-每个需求建一个协调目录存任务卡、sid、回执。**优先用 worktree 无关的 canonical 绝对路径**
-`<git-common-dir>/fleet/<RQ>`（`cc-fleet-coord <RQ>` 解析）：主仓库与所有 worktree 解析一致、在 `.git/` 内不进版本库，
-从根上消除「worker 写自己 worktree、主 session 读不到」和「回执误入版本库」两个坑。派发时作 `{{COORD_DIR}}`。
-
-兼容布局：仓库根 `.fleet/<RQ>/`（用它**务必把 `.fleet/` 加进 `.gitignore`**）；结构化 `tasks/<RQ>/{modules,sessions}/`
-（配合 `cc-dispatch-batch` 批派）。三种布局 summary/status 都会扫，派发侧统一用 canonical 最省心。
-
-⚠ **主 session 作为后台 job 时，`Write`/`Edit` 对一切仓库内路径都会被隔离闸拦**（canonical 协调目录在 `.git/` 里，
-同样算仓库内），而主 session 是编排者、故意不开 worktree。固定套路：用 **`Write` 工具**写到仓库外的
-`$CLAUDE_JOB_DIR/tmp/<file>`，再 `cc-fleet-coord <RQ> --put <rel> "$CLAUDE_JOB_DIR/tmp/<file>"` 拷进协调目录；
-`--prompt-file` 可直接吃 tmp 里的文件。这只约束主 session；worker 在自己 worktree 里正常用 `Write`/`Edit`。
-
-### Step 1 — 拆解（主 session，只写 L1 业务需求文档 + L1.5 任务卡）
-
-1. 用业务语言理清整体效果（验收口径），跑「业务需求拆解」四问（要查现状用 subagent 探查，别自己读源码）。
-2. **维护 L1 业务需求文档（先于派发，独立 commit）**：缺失/过时先补齐到与需求一致——它是子模块向上比对的锚。
-   适配项目既有约定（如 `docs/requirements/<NN>/README.md` + `procurement-flow/`）。
-3. 按**项目既有模块边界**归属出 N 个子任务（模块划分用项目自带的，不自创；找不到时按项目规则判断是否新建、告知
-   用户）。**一模块一卡一 session，有依赖/接口交互也不合并**：互不冲突并行派；纯先后依赖排派发顺序；命中接口交互
-   按「协同三模式」。
-4. 每个模块写一张任务卡（`reference/task-card-template.md`），**必填**：整体业务目标（看到全局不跑偏）、业务需求锚点
-   （针对哪些 L1 条目/anchor + 变化）、验收清单（R 条目，建议 EARS 句式 `WHEN…THE SYSTEM SHALL…`，可直接转测试）。
-   任务卡是**业务面委托**，不写模块内部设计（那是 L2）。
-5. **设计验收场景（你的活，Step 4 交独立 session 执行）**：从「如何验证需求做完」反推一份**业务级 e2e 场景清单**
-   （跨模块端到端口径），写进 L1 文档/留作验收 session 输入。
-
-**派发前一律先跑 `cc-fleet-init`** 拿到 `$RQ` / `$COORD` / `$INT`。
-
-> 🚫 **RQ 编号只能由脚本现场分配，绝不凭「今天日期 + NNN」在脑内重构**（真实串台事故见 `reference/pitfalls.md`）。
-> 引用 RQ 的所有场合（派发 / arm Monitor / 回执路径 / 二次派发 / 跨 turn）一律从本轮 `$RQ` 变量或协调目录回读；
-> 同一 RQ 的后续批次**别重跑 init**（它会另发新号）。用法与各道防串台闸见 `reference/commands.md`。
->
-> 🌐 **RQ 是全机唯一的，不是"每个仓库各一套"**：worker 的 session 名 `↳<模块>@<RQ>`、job 列表、fleet 面板、
-> watch/status/reply/kill 全按 RQ 认人——两个仓库同号，两个毫不相干的任务就在同一屏里重名。序号池与
-> 「RQ→owner 仓库」注册表因此放在**跨仓库共享的 `~/.claude/fleet`**（`CC_FLEET_HOME` 可改），`cc-fleet-init`
-> 取号时会跳过**任何仓库**发过的号。**你在哪个项目起任务都一样：老老实实跑 `cc-fleet-init`**——同事/你自己
-> 在另一个仓库的并行任务，你本地是看不见的，只有全局池看得见（2026-08-20 事故见 `reference/pitfalls.md` §二）。
-
-### Step 2 — 派发（每个 prompt 必带回执契约）
-
-**每个派发 prompt = `reference/dispatch-preamble.md` 前缀（替换占位符）+ 该模块任务卡正文。** 前缀锁死「简体中文 +
-写代码前先开 worktree 隔离（禁止改主工作树）+ 只在范围内改 + 自测自负责 + 先建/更新 L2 模块需求文档（承上启下）再写
-代码 + 完成回填 `<COORD_DIR>/<module>.summary.md`（首行 `result:`）并把简短回执作为最后一条消息」。**不带前缀就派发
-= 拿不到回执 = 主 session 失明，禁止。**（Codex 后端由 `cc-dispatch-codex-app` 自动拼对应 preamble。）
-
-**⭐ 拼前缀前先拿到你自己的名字，填进 `{{MAIN_SESSION}}`**（Claude 后端专有，Codex worker 没有 `SendMessage`，
-该占位符留空即可）：调一次 **`ListAgents`**，取输出首行 `This session is <名字> [ref]` 里的 **`<名字>`** 原样填入
-（`[ref]` 可带可不带）。**必须现读、不许凭记忆手敲**——跨 session 寻址只认精确名字，实测「错名 + 对的 ref」和
-「裸 ref」都发不到（`reference/PROTOCOL.md` §12）。填错的后果是 worker 少一条快通道、降级走另外三条，**不丢回执**，
-所以别为此卡住派发；但填对了整轮编排的响应速度明显不一样。
-
-派发编排：
-- 互不冲突的模块**一次性全部派发**即并行；有依赖的等前序回执 done 再派后续。
-- **命中跨模块协同的分两批派**（详见 `reference/contract-first.md`）：模式 A 先单独派提供方做契约设计（`--name
-  "↳<provider>-contract@$RQ"`，任务卡注明「本轮只产出 `<COORD>/contracts/` 契约、不实现业务逻辑」），主 session 评审
-  定稿后**再并行派**提供方实现 + 各消费方接入（消费方任务卡把契约作依赖锚点、注明「对端按契约 mock 自测」）；模式 B
-  先派提供方完整开发，done 后把真实接口形态写进消费方任务卡再派。⚠ 第二批打到**同一个 `$RQ`/COORD**——复用本轮
-  `$RQ` 变量，超新鲜窗口就加 `--join` 放行。
-- **模式 C 打样先行**：段① 只派**一个**打样 worker：`cc-dispatch --profile spike --name "↳spike@$RQ" …`（模型/深度读
-  配置文件 `spike` 块，默认 fable5.1 + xhigh；⛔ 不按任务卡逐张挑模型，任务卡里也不写模型字段）。任务卡写死「契约 + 各相关
-  模块接口骨架 + 默认关的接线开关 + 一条真集成 e2e，⛔ 不写业务逻辑」。它 land 后收回执、看 `cc-fleet-summary` 的改动
-  统计确认没越线，再按一模块一 session 并行派段② 填实卡（同 `$RQ`，`--join`）。
-
-**派发命令的完整参数、必带项与退出码见 `reference/commands.md`**（`--sid-file` 与 `--env FLEET_BASE_BRANCH` 是两个
-最容易漏、漏了就出事的必带项）。
-
-### Step 3 — 监控（arm watcher 拿推送，零轮询；见铁律 0/1）
-
-派发完**立刻**用 **Monitor 工具**（`persistent:true`）跑对应后端的 watch 命令。⚠ 其中 `<RQ>` 必须是**本轮派发用的
-同一个 `$RQ`**，别在 Monitor 的 command/description 里凭日期手敲（2026-06-09 事故就是盯错 RQ）。
-
-推送种类：`✅ done`／`✅ 已完成 — 回执在案`（抗 respawn，铁律 1.6）／`💤 静默已结束需核验`（铁律 1.5，别当 done
-盲信，要去收回执核验）／`❌ 持续异常`（已连续复查过，可直接进 Step 5）／`⏸ blocked`／`⏱ idle 但长任务心跳新鲜`（worker 在等自己起的 nohup 长任务并定期 touch
-`<COORD>/<module>.alive`，视为在跑，不必去核验）／≤4min 心跳。
-参数与 daemon 不可达时的处置见 `reference/commands.md`。
-
-**另一路推送会自己找上门**：worker 完成/卡住时按通道 ⓪ 直接 `SendMessage` 给你，形如
-`<cross-session-message from="uds:…">` 包着的 `[FLEET] <RQ>/<module> 已完成 — …`（或 `需要裁决` / `失败`）。
-它通常**比 watch 早**。处置：
-- `已完成` → 直接进 Step 4 收该模块回执，不必等 watch 的 `✅` 复核。
-- `需要裁决` / `失败` → 立刻裁决并用 **`cc-fleet-reply <RQ> <module>`** 回它（**别用 `SendMessage` 回**——
-  worker 名字会被 daemon 改写，靠名字寻址不稳；`cc-fleet-reply` 走 SID 名册才稳，见铁律 2 注）。
-- ⚠ 收到 ⓪ **不等于可以撤 watch**：还有别的模块在跑，且这个 worker 之后仍可能被 respawn。watch 一直挂到
-  它自己报「全部结束」为止。
-
-### Step 4 — 收回执 + 整体验证
-
-> ⛔ **主 session 验收只读三样：`cc-fleet-summary` 打印的回执（含它附带的落地核验 / 改动统计 / 结果文件核验）、回执里列的
-> 「测试结果文件」、verify/integ session 的回执。不 `git diff`、不 `git show`、不 `Read` 源码、不解析测试控制台输出。**
-> 理由：主 session 跑的是最贵的模型，读 diff 全文是整轮编排里最大的一笔 token，而且读了 diff 就会忍不住下场改。改动
-> 内容对不对由验收 session 的场景报告说话；改动面合不合理由「改动统计」（文件数 / 增删行）说话；落没落地由「落地核验 ✓」
-> 说话（worker 自述 land 不可信——实测有回执说 land 了、集成分支上却没它的 commit，worktree 清掉后不可恢复）。回执缺
-> 「关键 commit」或缺「测试结果文件」→ 当未完成，`cc-fleet-reply` 让它补，不要自己去仓库里找。
-
-1. status 报 0 后用 `cc-fleet-summary` 收回执（多通道兜底）。逐模块读「真实改动 / 预期变化 / 影响面 / 已知缺陷 /
-   自测结果 / L2 文档与双向 trace / 需裁决」。**先看每个回执下面那几行机械核验**：`🧷 落地核验 ✓`（`⛔ ✗` = 改动不在
-   `fleet/<RQ>` 上，进 Step 5 派 fix 重做）、`改动统计`（打样 worker 越线写业务逻辑会在这里露馅）、`📄 结果文件 ✓`
-   （✗ = 自测无落盘依据，按未自测处理）。有「需主 session 裁决」的先处理（裁定范围/口径，必要时改任务卡再补派）。
-   - 某模块 done/gone 但收不到回执 → 该 session 没把回执落盘，**直接读它最后一条消息**（铁律 2③）。**绝不因此判它
-     「没完成」而回头死等文件**——完成与否已由 Step 3 定论。
-   - **查追溯链一致性**：每条 L1 业务需求是否都有模块 L2 承接（向下覆盖无遗漏）、各模块 L2 是否都能回溯到 L1 条目
-     （向上有据无越权）。链断/越权即回 Step 5。
-2. **整体业务效果验证（测试三层：你设计场景，独立 session 执行，你不亲自跑测试）**：
-   - **自测**（已在各模块内完成）：每个 worker 跑自己改动相关的单测/模块 e2e，对端按契约 mock。
-   - **联调**（走过契约先行才需要）：派一个联调 session（`↳integ@<RQ>`）把相关模块真实拼起来（去 mock、真接口）跑通。
-   - **验收**：派一个验收 session（`↳verify@<RQ>`），拿你在 Step 1 设计的**验收场景清单**做端到端验证——测哪些场景是
-     你定的，验收 session 只执行并逐条回报过/不过、不过时现象指向哪个模块。
-   联调/验收 session 都是被派发的子 session（带 `↳` + preamble），范围=只读各模块 + 跑 e2e/集成，**不改业务代码**，
-   回执写 `<COORD_DIR>/<verify|integ>.summary.md`，并同样注入 `--env FLEET_BASE_BRANCH="$INT"`。
-   > ⚠ 验收/联调必须在**集成分支 `fleet/<RQ>`** 上测——主检出停在共享分支、没有各 worker 落地的改动。preamble 已要求
-   > 它们隔离后 `reset --hard "$FLEET_BASE_BRANCH"` 对齐后**只读**跑测，不落地、不碰分支。
-3. 你读联调 + 验收 + 各模块回执，**对照 Step 1 的整体效果口径与验收场景清单裁定**是否达成业务需求。
-
-### Step 5 — 定位回修循环
-
-任一验收项不过：
-1. 从验收回执的「现象指向」+ 各模块「影响面/缺陷」定位**问题模块**。
-2. 写一张聚焦修复的任务卡（含复现/期望），带 preamble，派发**新 session**（`--name "↳<module>-fix@$RQ"`，同样注入
-   `FLEET_BASE_BRANCH="$INT"`）。fix session 同样 base 锚定 `fleet/<RQ>`（已含本 RQ 各模块的落地）、改完
-   `cc-fleet-land` 回 `fleet/<RQ>`。
-   ⚠ **要跑 e2e 的 fix session 一次只派一个**：多个并行会撞共享 dev DB + `shared/dist`，假失败从 6 条炸到 44 条再各自
-   回修一轮纯烧 token。preamble 已要求 worker 跑 e2e 前 `cc-fleet-e2e-lock acquire` 抢锁，那是机械兜底，编排侧仍要串行派。
-3. 回 Step 3 监控 → Step 4 重新验收。直到整体效果达标，进 Step 6。**主 session 不下场改代码。**
-
-### Step 6 — 验收通过后：合集成分支回共享分支 + 收尾（共享分支唯一一次合入）⭐
-
-**只有整体验收通过后**，主 session 才把本 RQ 集成分支合回共享开发分支——这是整条流程里**共享分支唯一一次被改动**
-（之前全程 `dev/<name>` 一行没动，并发任务/用户零干扰）。顺序：读 `<COORD>/base.ref` 拿回 base 分支 → 切回去
-`git pull --ff-only` → `git merge --no-ff "fleet/$RQ"` → 跑改动相关回归 → `git push` → 清理本地/远端集成分支与
-`--push-backup` 留下的远端备份。**完整命令序列见 `reference/commands.md`。**
-
-- worker 的隔离 worktree 由它们自己清掉了；这里只收集成分支与远端备份。
-- 合回出冲突 = 共享分支在 RQ 期间被推进过（用户/别的已合 RQ）→ 正常解决冲突补提交，不丢码、不跳校验；冲突很重需懂
-  业务才能解时，可派一个 fix/integrate session 处理。
-- **本步是主 session 的 git 编排动作**（合并/推送/清分支），不是写业务代码——与「主 session 不碰代码」不冲突。
-
-## 子 session 场景命令速查
-
-**这里只列「有哪些场景可用」；参数、退出码、坑一律去 `reference/commands.md` 按需加载。**
-Codex 后端把命令换成 `-codex-app` 后缀（见 `reference/codex-mode.md`），场景与流程完全相同。
-
-| 场景 | 命令 |
-|---|---|
-| 开工：取 RQ + 协调目录 + 集成分支 | `cc-fleet-init` |
-| 解析协调目录 / 往里落文件 | `cc-fleet-coord` |
-| 派发一个 worker | `cc-dispatch` |
-| 批派整个 RQ（结构化布局） | `cc-dispatch-batch` |
-| 阻塞监视 → 推送（交给 Monitor 跑） | `cc-fleet-watch` |
-| 点查状态 | `cc-fleet-status` |
-| 读 worker 最新快照 | `cc-fleet-read-codex-app`（Codex 专有） |
-| 给在跑的 worker 回话 / 纠偏 | `cc-fleet-reply` |
-| 终止 worker | `cc-fleet-kill` |
-| 换新 session 重跑同一张卡（灰度坏模型自救） | `cc-fleet-respawn` |
-| 收齐各模块回执 | `cc-fleet-summary` |
-| **worker 自己**把改动落进集成分支 | `cc-fleet-land` |
-| **worker 自己**跑 e2e 前抢串行锁 / 等长任务时心跳 | `cc-fleet-e2e-lock` / `touch <COORD>/<module>.alive` |
-| 修 FleetView 显示退化（`bg` / `0s`） | `cc-fleet-fix-display` |
-| Codex 后端体检 / 切模型路由 | `cc-codex-doctor` / `cc-codex-session-config` |
-
-## 命名与身份约定（与取名 hook 联动）
-
-| 信号 | 主 session | 子 session（worker） |
-|---|---|---|
-| 会话名 (`--name`) | 普通中文标题，无前缀 | `↳<module>@<RQ>`（`↳` 前缀） |
-| 环境变量 `FLEET_ROLE` | 无 | `worker`（**Codex 后端没有此变量**，身份靠另两个信号） |
-| 首条消息哨兵 | 无 | `⟦FLEET-WORKER⟧ rq=… module=…` |
-
-取名 hook（`~/.claude/hooks/auto-cn-title.sh`）检测到任一信号即判定 worker，把标题设成 `↳…`；主 session 走正常中文
-标题。三重信号是冗余设计：`--name`/`--env` 由派发脚本自动带，哨兵由 preamble 首行带，任一在身份就成立。
-worker 显示名/时长会自愈（完整根因与修复分层、回归用例见 **`reference/fleet-display.md`**），无需人工。
-
-> ⚠ **FleetView 列表显示的不是会话标题，而是 `~/.claude/jobs/<short>/state.json` 的 `.name`**。CC 2.1.231 起
-> 内建了 LLM 自动取名器会去抢这个字段（把 `↳<module>@<RQ>` 换成英文小写短语），`cc-dispatch` 因此在派发后
-> 自动拉起 `cc-fleet-name-guard` 抢占该字段。**新写任何派发路径时别忘了这一步**，否则子 session 会丢 `↳` 标识。
-
-## 失效降级
-
-`cc-dispatch` 用的是非公开 daemon 协议，Claude Code 升级可能让它变动。信号 = 退出码 `2`（daemon 不可达：先跑一次
-`claude agents --json` 拉起再重试）或 `3`（schema/proto 不兼容）。退出 3 时 `cc-dispatch-batch` 会自动打印**可手动
-派发的清单**（MODULE/CWD/NAME/PROMPT FILE）——新开 terminal 跑 `claude agents`，照清单在 FleetView 手动「New agent」
-派发，**方法论流程不变**；要修脚本照 `reference/PROTOCOL.md` §9「协议升级应对剧本」更新字段构造（通常 3-5 行）。
-Codex 后端的问题见 `reference/codex-mode.md` 排障段——它不影响 Claude 后端。
-
-## 参考文件（reference/，按需展开）
-
-| 文件 | 内容 |
-|---|---|
-| `commands.md` | ⭐**命令手册**：每个场景的完整参数、必带项、退出码、坑。要敲命令前加载 |
-| `codex-mode.md` | ⭐**Codex 后端**：命令后缀、后端自愈、模型路由、与 Claude 后端的行为差异。用户说 codex 时加载 |
-| `dispatch-preamble.md` | ⭐派发 prompt 必带前缀（锁范围 + 自测 + L2 承上启下文档 + 回执契约）。Codex 版 `codex-app-dispatch-preamble.md` |
-| `task-card-template.md` | 模块任务卡模板 |
-| `contract-first.md` | ⭐跨模块协同三模式（契约先行/提供方先行/打样先行）+ 判据 + 契约文件模板 + 字段级核对表 + 与三层测试关系 |
-| `doc-traceability.md` | ⭐文档三层模型 + L2 模块需求文档模板 + 业界依据（RTM/ISO 29148/ASPICE 等） |
-| `pitfalls.md` | ⭐死等四根因复盘 + RQ 编号串台事故 + 灰度坏模型识别细节 + CLAUDE.md 自动加载历史 |
-| `fleet-display.md` | FleetView `bg`/`0s` 显示自愈的根因与三层修复、回归用例 |
-| `PROTOCOL.md` | daemon 协议参考（cc-dispatch 失效时照它修） |
-| `codex-integration.md` | Codex 版本基线、DeepSeek Responses API 配置约束、app-server 调用契约与升级检查 |
-
-## 注意事项
-
-- 主 session 一旦发现自己在读/改模块源码，就是越界——退回去，写成任务卡派给模块 session。
-- 验收只读回执 + 结果文件（Step 4 顶部的 ⛔）。想看 diff 的冲动 = 越界信号，把疑问写成场景交给 verify session。
-- 模型/深度只按配置档（`worker` / `spike`），不按任务卡逐张挑；任务卡里不写模型字段。
-- 派发 prompt **永远**带前缀。回执是主 session 唯一可靠的「改动雷达」。
-- **一个子 session 只承担一块代码上独立的内容——默认一个模块，可按需更细，任何情况下不许把多个模块合给一个
-  session**（粒度铁律）。接口两端本就该是两个 session；会碰同一文件的（登记散点等）由主 session 排定合回顺序串行消化。
-- 模块 session 报「需裁决/要扩大范围」时由主 session 裁定，别让它自行蔓延改动面。整体效果不达标只许**派新 session
-  修**，主 session 不下场改代码。
+两端安装使用同一份技能源，避免正文复制漂移。旧 `cc-dispatch*`、面板和测试保留用于历史 RQ，
+新 RQ 默认只走 `cc-fleet`。旧参考文件中的 Monitor、强制模型、权限、清理和自动 push 约定不适用于 v2。
+新命令与行为以三个 v2 reference 为准。协议基线按实际 CLI help/schema 探测，不按模型自述或历史版本号判断。

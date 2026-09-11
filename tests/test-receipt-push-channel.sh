@@ -9,14 +9,13 @@
 #   · 删掉「禁止发给其它 worker」→ worker 之间私下串联，绕过主 session 的模块边界编排；
 #   · 删掉「推送失败就降级」→ 新通道从"加速器"退化成新的单点故障，worker 卡在重试上；
 #   · 删掉「watch 照挂不误」→ 主 session 误以为有推送就不用 watch，worker 一崩溃就永远等不到。
-# 所以这里逐条钉死。测试铁律：断言只增强不削弱；失败一律是文档被改坏了，改文档不改断言。
+# 所以这里逐条钉死。旧协议断言只覆盖保留的 v1 prompt；v2 使用独立行为测试。
 set -u
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PRE="$ROOT/reference/dispatch-preamble.md"
 CODEX_PRE="$ROOT/reference/codex-app-dispatch-preamble.md"
 CODEX_MODE="$ROOT/reference/codex-mode.md"
-SKILL="$ROOT/SKILL.md"
 PROTO="$ROOT/reference/PROTOCOL.md"
 
 PASS=0; FAIL=0; CASE=""
@@ -28,7 +27,7 @@ has(){ local f="$1" d="$2"; shift 2; local p
 hasnt(){ local f="$1" d="$2" p="$3"
   grep -qE -- "$p" "$f" && fail "${d}：不该出现 /$p/ @ $(basename "$f")" || ok; }
 
-for f in "$PRE" "$CODEX_PRE" "$CODEX_MODE" "$SKILL" "$PROTO"; do
+for f in "$PRE" "$CODEX_PRE" "$CODEX_MODE" "$PROTO"; do
   [[ -r "$f" ]] || { echo "✗ 读不到 $f"; exit 2; }
 done
 
@@ -80,22 +79,8 @@ has "$CODEX_PRE" "落盘 + 最后一条消息仍在" 'summary\.md' 'result:'
 CASE="codex/差异清单登记"
 has "$CODEX_MODE" "行为差异里登记了没有通道 ⓪" '通道 ⓪' 'SendMessage'
 
-# ── C. SKILL.md：主 session 侧的编排契约 ──────────────────────────────────────
-CASE="skill/四通道"
-has "$SKILL" "铁律 2 升级为四通道" '四通道' '⓪'
-
-CASE="skill/护栏-单向性"
-has "$SKILL" "禁止主 session 靠名字反向找 worker" 'cc-fleet-reply' '名字.*改写|改写.*名字'
-
-CASE="skill/护栏-watch 仍必挂"
-has "$SKILL" "有推送也不许撤 watch" '不等于可以撤 watch|永远必挂|照挂不误'
-
-CASE="skill/派发前现读名字"
-has "$SKILL" "Step 2 要求 ListAgents 现读自己的名字" \
-  'ListAgents' '现读' '\{\{MAIN_SESSION\}\}'
-
-CASE="skill/填错不阻塞"
-has "$SKILL" "名字填错只降级不丢回执" '不丢回执|不会丢'
+# v2 不使用按显示名寻址/原生 Monitor 假设；主端契约改由 test_fleet_v2.py 的真实 ID、
+# pending 登记、新 attempt 和持久回执行为测试覆盖。旧 worker/preamble 协议继续回归。
 
 # ── D. PROTOCOL.md §12：实测依据必须留档 ─────────────────────────────────────
 CASE="proto/§12 存在"

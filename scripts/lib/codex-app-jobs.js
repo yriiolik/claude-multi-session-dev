@@ -56,17 +56,31 @@ function parseEnv(file) {
 
 // 回执契约：summary 文件第一行必须以 `result:` 开头才算 worker 真正交付。
 // 「thread 空闲」不等于完成——Codex 的 turn 跑完就 idle，可能只是在等追加指令。
+// v2 名册（scripts/cc-fleet）的回执是 JSON：`<module>.receipt.json` 里 `result` ∈ done|failed|blocked。
 function receiptDone(file) {
-  if (!file) return false;
+  return !!receiptLine(file);
+}
+
+// 回执首行的人读形式：md 回执取第一个非空行（去掉 `result:` 前缀），JSON 回执拼成 `<result>: <summary>`。
+// 不是回执（文件不存在 / 首行不是 result: / JSON 缺 result）返回 ""。
+function receiptLine(file) {
+  if (!file) return "";
   let text;
   try {
     text = fs.readFileSync(file, "utf8");
   } catch {
-    return false;
+    return "";
   }
-  const lines = text.replace(/^﻿/, "").split(/\r?\n/);
-  const first = lines.find((line) => line.trim());
-  return !!first && /^result:/i.test(first.trim());
+  text = text.replace(/^\uFEFF/, "");
+  if (/\.json$/i.test(file)) {
+    let r;
+    try { r = JSON.parse(text); } catch { return ""; }
+    if (!r || !["done", "failed", "blocked"].includes(r.result)) return "";
+    return `${r.result}${r.summary ? `: ${String(r.summary).split(/\r?\n/)[0]}` : ""}`;
+  }
+  const first = text.split(/\r?\n/).find((line) => line.trim());
+  if (!first || !/^result:/i.test(first.trim())) return "";
+  return first.trim().replace(/^result:\s*/i, "");
 }
 
 function appendDetail(job, text) {
@@ -135,6 +149,55 @@ function listJobs(coord) {
   });
 }
 
+// v2 名册（scripts/cc-fleet）：`<coord>/v2/<module>.json` 一个 JSON 一个 worker。翻译成与 `.codex-app.env`
+// 同一套字段给面板用；只收 Codex 后端（app-server / native），Claude 后端的 worker 在 `claude agents` 里看。
+//
+// ⚠ 只给只读面板（readOnlySnapshot）用，**不并进 listJobs**：cc-fleet-status-codex-app 会把 detail 以 env
+// 行回写到 job.meta，v2 记录是 JSON，混进去会被写坏。
+function listV2Jobs(coord) {
+  const dir = path.join(coord, "v2");
+  let files;
+  try {
+    files = fs.readdirSync(dir).filter((f) => f.endsWith(".json") && !f.startsWith(".")).sort();
+  } catch {
+    return [];
+  }
+  let rq = "";
+  try { rq = JSON.parse(fs.readFileSync(path.join(coord, "fleet.json"), "utf8")).rq || ""; } catch {}
+  const out = [];
+  for (const f of files) {
+    const full = path.join(dir, f);
+    let rec;
+    try { rec = JSON.parse(fs.readFileSync(full, "utf8")); } catch { continue; }
+    // 还没拿到真实 thread id 的（prepared / native setting-up）不是 worker，不上面板。
+    if (!rec || rec.backend !== "codex" || !rec.sessionId) continue;
+    const routing = rec.routing || {};
+    const module = rec.module || f.replace(/\.json$/, "");
+    out.push({
+      id: rec.sessionId,
+      thread_id: rec.sessionId,
+      turn_id: rec.turnId || "",
+      rq,
+      module,
+      name: rec.name || `↳${module}`,
+      started_at: String(Math.floor(Number(rec.startedAt || rec.createdAt) || 0)),
+      model_provider: routing.modelProvider || "inherit",
+      model: routing.model || "inherit",
+      reasoning_effort: routing.reasoningEffort || "inherit",
+      worktree_cwd: rec.worktree || "",
+      branch: rec.branch || "",
+      terminated: rec.state === "stopped" ? "1" : "0",
+      mode: `v2-${rec.transport || "codex"}`,
+      v2_state: rec.state || "",
+      // v2 的回执契约是 JSON 文件；summary.md 只是给人看的附件，不当交付凭证。
+      summary_file: path.join(coord, `${module}.receipt.json`),
+      meta: full,
+      coord,
+    });
+  }
+  return out;
+}
+
 function makeAppCaller({ coord, codexBin = "", startAppServer = true, callBin = "" } = {}) {
   const bin = callBin || process.env.CODEX_APP_CALL_BIN || path.join(__dirname, "..", "cc-codex-app-call");
   return function callApp(method, params) {
@@ -167,7 +230,7 @@ function readOnlySnapshot(coord, opts = {}) {
   // filter 在**发起 app 调用之前**生效：注册表里躺着的历史 RQ 可能有几十个早已收工的
   // worker，逐个 thread/read 会让面板每一次刷新都 spawn 一堆进程。
   const keep = typeof opts.filter === "function" ? opts.filter : () => true;
-  const jobs = listJobs(coord).filter(keep);
+  const jobs = [...listJobs(coord), ...listV2Jobs(coord)].filter(keep);
   let appUnavailable = false;
   for (const job of jobs) {
     if (receiptDone(job.summary_file)) {
@@ -534,9 +597,11 @@ module.exports = {
   defaultCoord,
   parseEnv,
   receiptDone,
+  receiptLine,
   appendDetail,
   classifyFromThread,
   listJobs,
+  listV2Jobs,
   makeAppCaller,
   readOnlySnapshot,
   registryPath,

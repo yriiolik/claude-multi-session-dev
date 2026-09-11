@@ -1,3 +1,6 @@
+> **v2 已上线**：新 RQ 使用统一 `scripts/cc-fleet`，支持 Codex / Claude Code 双主端和双后端。
+> 请先读 [SKILL.md](SKILL.md) 与 [v2 命令](reference/v2-commands.md)。以下内容保留为旧命令/历史 RQ 的参考。
+
 # claude-multi-session-dev
 
 Claude Code 的 **multi-session-dev** 技能：主 session 把一个开发需求按模块拆开、派发给多个独立后台 session 并行开发，最后由主 session 做整体业务效果验收的编排框架（Claude Code / Codex App 两种 worker 后端）。

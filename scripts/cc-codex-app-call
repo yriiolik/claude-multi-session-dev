@@ -9,14 +9,17 @@ const { spawn, spawnSync } = require("child_process");
 let codexBin = process.env.CODEX_CLI_PATH || "";
 let shouldStart = false;
 let timeoutMs = 30000;
+let watchMs = 0;
 let method = "";
 let paramsPath = "";
 let lastStartError = "";
 
 function usage() {
-  console.error(`cc-codex-app-call [--codex-bin PATH] [--start-app-server|--no-start-app-server] [--timeout-ms N] <method> [params.json|-]
+  console.error(`cc-codex-app-call [--codex-bin PATH] [--start-app-server|--no-start-app-server] [--timeout-ms N] [--watch-ms 1000..55000] <method> [params.json|-]
 
 Reads one JSON params object and prints the JSON-RPC result object.
+--watch-ms keeps thread/resume subscribed and prints JSONL events until a turn finishes or the deadline.
+Use only from the active controller; read-only panels must keep using thread/read.
 Uses the official \`codex app-server proxy\` for socket discovery/connection,
 then performs the control socket's WebSocket and JSON-RPC handshakes.`);
 }
@@ -29,6 +32,7 @@ for (let i = 2; i < process.argv.length; i++) {
   // 以前这里不认它，于是它被当成 method、真正的 method 又被当成 params 文件，最后报
   // `unknown argument: <params 路径>` 退出 5 —— 表现为一整屏 worker 全变「状态未知」。
   else if (a === "--no-start-app-server") shouldStart = false;
+  else if (a === "--watch-ms") watchMs = Number(process.argv[++i]);
   else if (a === "--timeout-ms") timeoutMs = Number(process.argv[++i] || "30000");
   else if (a === "-h" || a === "--help") { usage(); process.exit(0); }
   else if (!method) method = a;
@@ -36,6 +40,8 @@ for (let i = 2; i < process.argv.length; i++) {
   else { console.error(`unknown argument: ${a}`); usage(); process.exit(5); }
 }
 if (!method || !Number.isFinite(timeoutMs) || timeoutMs < 1000) { usage(); process.exit(5); }
+
+if ((!Number.isFinite(watchMs)) || (watchMs && (!Number.isFinite(watchMs) || watchMs < 1000 || watchMs > 55000 || method !== "thread/resume"))) { usage(); process.exit(5); }
 
 function isExecutable(file) {
   if (!file) return false;
@@ -114,12 +120,15 @@ function callProxy(bin, params) {
     let stderr = "";
     let handshakeDone = false;
     let settled = false;
+    let requestDispatched = false;
+    let watchTimer;
     let fragmentOpcode = 0;
     let fragments = [];
 
     const timer = setTimeout(() => fail(new Error(`timed out after ${timeoutMs}ms waiting for Codex app-server response`)), timeoutMs);
     function cleanup() {
       clearTimeout(timer);
+      if (watchTimer) clearTimeout(watchTimer);
       if (!child.stdin.destroyed) child.stdin.end();
       if (!child.killed) child.kill("SIGTERM");
     }
@@ -127,17 +136,24 @@ function callProxy(bin, params) {
     function fail(error) {
       if (settled) return;
       settled = true; cleanup();
+      error.requestDispatched = requestDispatched;
       if (stderr.trim()) error.stderr = stderr.trim();
       reject(error);
     }
     function sendJson(value) { child.stdin.write(clientFrame(value)); }
 
     function onMessage(payload) {
+      if (settled) return;
       let msg;
       try { msg = JSON.parse(payload.toString("utf8")); } catch { return; }
+      if (watchMs && msg.method && msg.id != null) {
+        process.stdout.write(`${JSON.stringify({method:"fleet/needs-attention",params:{threadId:params.threadId,requestMethod:msg.method}})}\n`);
+        return finish({reason:"needs-attention"});
+      }
       if (msg.id === 1) {
         if (msg.error) return fail(new Error(`initialize failed: ${JSON.stringify(msg.error)}`));
         sendJson({ method: "initialized", params: {} });
+        requestDispatched = true;
         sendJson({ id: 2, method, params });
       } else if (msg.id === 2) {
         if (msg.error) {
@@ -147,7 +163,19 @@ function callProxy(bin, params) {
           rpcError.rpcError = true;
           return fail(rpcError);
         }
-        finish(msg.result ?? null);
+        if (watchMs) {
+          clearTimeout(timer);
+          process.stdout.write(`${JSON.stringify({method:"fleet/subscribed",params:{threadId:params.threadId}})}\n`);
+          watchTimer = setTimeout(() => finish({reason:"timeout"}), watchMs);
+        } else finish(msg.result ?? null);
+      } else if (watchMs && msg.id != null && msg.method) {
+        // A notification subscriber is not authorized to decide worker approvals.
+        process.stdout.write(`${JSON.stringify({method:"fleet/needs-attention",params:{threadId:params.threadId,requestMethod:msg.method}})}\n`);
+        finish({reason:"needs-attention"});
+      } else if (watchMs && msg.method && (msg.params?.threadId === params.threadId)) {
+        const allowed = ["turn/completed", "thread/status/changed", "error"];
+        if (allowed.includes(msg.method)) process.stdout.write(`${JSON.stringify(msg)}\n`);
+        if (msg.method === "turn/completed") finish({reason:"turn-completed"});
       }
     }
 
@@ -218,7 +246,7 @@ function callProxy(bin, params) {
             clientInfo: { name: "multi-session-dev", title: "multi-session-dev", version: "2" },
             capabilities: {
               experimentalApi: true,
-              optOutNotificationMethods: ["agent/message/delta", "thread/status/changed", "thread/tokenUsage/updated", "turn/diff/updated"],
+              optOutNotificationMethods: watchMs ? ["item/agentMessage/delta", "thread/tokenUsage/updated", "turn/diff/updated"] : ["agent/message/delta", "thread/status/changed", "thread/tokenUsage/updated", "turn/diff/updated"],
             },
           },
         });
@@ -248,7 +276,7 @@ function wait(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
       console.error(firstError.message);
       process.exit(9);
     }
-    if (shouldStart || process.env.CODEX_APP_START === "1") {
+    if (!firstError.requestDispatched && !watchMs && (shouldStart || process.env.CODEX_APP_START === "1")) {
       startServer(bin);
       let lastError = firstError;
       for (const delayMs of [0, 250, 750, 1500]) {

@@ -309,11 +309,8 @@ function groupTitle(coord) {
 // 和回执文件路径——两条都没有信息量。所以：跑着的看 rollout 最近一条事件，落了回执的看回执首行。
 function liveDetail(job) {
   if (job.receipt) {
-    try {
-      const first = fs.readFileSync(job.summary_file, "utf8").split(/\r?\n/).find((l) => l.trim());
-      if (first) return `🧾 ${first.replace(/^result:\s*/i, "")}`;
-    } catch {}
-    return job.detail;
+    const line = jobsLib.receiptLine(job.summary_file);
+    return line ? `🧾 ${line}` : job.detail;
   }
   if (job.state !== "running" && job.state !== "blocked") return job.detail;
   const file = rolloutFor(job);

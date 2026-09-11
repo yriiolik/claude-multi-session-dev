@@ -246,11 +246,11 @@ def sidebar_attach(c, d):
     return update(c,d['module'],sidebar=result)
 
 def panel_attach(c, d):
-    """Codex app-server worker 派发成功后：登记面板注册表 + 在当前 Ghostty 窗口分屏拉起只读面板。
-    Codex worker 进不了 `claude agents`（它是 app-server 里的 thread），这块分屏提供终端内的只读进度视图。
+    """CLI 路径（Codex app-server / Claude --bg）worker 派发成功后：登记面板注册表 + 在当前 Ghostty 窗口分屏拉起只读面板。
+    两种后端同屏：按任务组列出子 session、状态与最近动作，→ 进详情看完整时间线（Codex 读 rollout，Claude 读 transcript）。
     尽力而为：面板脚本自己处理 Ghostty 没开/没授权/不是 macOS 的情况，绝不因面板让派发失败。
-    CC_FLEET_PANEL=0 全局关掉；native（Codex App 主端）与 Claude 后端不走这里。"""
-    if d.get('backend')!='codex' or d.get('transport')!='app-server' or os.environ.get('CC_FLEET_PANEL')=='0':
+    CC_FLEET_PANEL=0 全局关掉；native（Codex App 主端，App 自带侧栏）不走这里。"""
+    if d.get('transport') not in ('app-server','claude-bg') or os.environ.get('CC_FLEET_PANEL')=='0':
         return None
     fleet=meta(c); out={}
     steps=(('registered',os.environ.get('CC_FLEET_PANEL_REGISTER_BIN',str(ROOT/'cc-fleet-panel-register')),[str(c),fleet['rq']],None),
@@ -275,10 +275,13 @@ def dispatch(a):
             if d.get('permissions','full')=='full': args+=['--dangerously-skip-permissions']
             # Existing backend config remains authoritative; no model-name substitution.
             conf=Path(os.environ.get('CLAUDE_FLEET_CONFIG',str(Path.home()/'.claude/multi-session-dev.json')))
+            profile={}
             if conf.exists():
                 profile=json.loads(conf.read_text()).get(a.profile,{})
                 for field in ('model','effort'):
                     if profile.get(field): args+=['--'+field,str(profile[field])]
+            # 只作展示（面板详情页的模型行）；不参与 reply/路由。
+            d['claudeProfile']={k:str(profile[k]) for k in ('model','effort') if profile.get(k)}
             args += [prompt]
             # 在子项目目录启动：Claude 按启动目录向上加载 CLAUDE.md，根目录启动会漏掉子项目规则。
             p=run(args,cwd=workdir(d),timeout=55,check=False)

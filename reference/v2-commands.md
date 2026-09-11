@@ -79,7 +79,8 @@ events 的 turn-completed 只触发收回执，不直接判业务完成。连接
 - `CLAUDE_CLI_PATH`：Claude 二进制；`CLAUDE_FLEET_CONFIG`：默认 `~/.claude/multi-session-dev.json`，
   派发使用其中 `worker.model/effort`；可 `dispatch --profile spike`。没有配置则不传模型/effort。
 - v2 生成 UUID 后缀 RQ，协调数据在 git-common-dir，避免两端各自分配同号；历史全局序号池不受影响。
-- `CC_FLEET_PANEL=0`：不在 Ghostty 分屏拉起 Codex 只读面板（默认 app-server 派发成功即拉起，幂等复用）。
+- `CC_FLEET_PANEL=0`：不在 Ghostty 分屏拉起只读面板（默认 Codex app-server 与 Claude `--bg` 派发成功即拉起，
+  两种后端同屏，幂等复用）。
   手动开/关/看状态：`scripts/cc-fleet-panel-open` / `--close` / `--status`；比例与方向见 `commands.md`。
 
 ## 权限和完成

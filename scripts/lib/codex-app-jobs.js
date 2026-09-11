@@ -150,7 +150,7 @@ function listJobs(coord) {
 }
 
 // v2 名册（scripts/cc-fleet）：`<coord>/v2/<module>.json` 一个 JSON 一个 worker。翻译成与 `.codex-app.env`
-// 同一套字段给面板用；只收 Codex 后端（app-server / native），Claude 后端的 worker 在 `claude agents` 里看。
+// 同一套字段给面板用；Codex 后端（app-server / native）与 Claude 后端（claude-bg）都收，按 backend 字段区分。
 //
 // ⚠ 只给只读面板（readOnlySnapshot）用，**不并进 listJobs**：cc-fleet-status-codex-app 会把 detail 以 env
 // 行回写到 job.meta，v2 记录是 JSON，混进去会被写坏。
@@ -169,22 +169,29 @@ function listV2Jobs(coord) {
     const full = path.join(dir, f);
     let rec;
     try { rec = JSON.parse(fs.readFileSync(full, "utf8")); } catch { continue; }
-    // 还没拿到真实 thread id 的（prepared / native setting-up）不是 worker，不上面板。
-    if (!rec || rec.backend !== "codex" || !rec.sessionId) continue;
-    const routing = rec.routing || {};
+    // 还没拿到真实会话 ID 的（prepared / native setting-up / Claude 未对上 shortId）不是 worker，不上面板。
+    if (!rec) continue;
+    const claude = rec.backend === "claude";
+    if (claude ? !rec.shortId : rec.backend !== "codex" || !rec.sessionId) continue;
+    const routing = claude ? rec.claudeProfile || {} : rec.routing || {};
     const module = rec.module || f.replace(/\.json$/, "");
     out.push({
-      id: rec.sessionId,
-      thread_id: rec.sessionId,
+      backend: claude ? "claude" : "codex",
+      // Claude worker 用 `claude agents` 的短 id 寻址，transcript 按完整 sessionId 找
+      id: claude ? rec.shortId : rec.sessionId,
+      thread_id: claude ? "" : rec.sessionId,
+      short_id: claude ? rec.shortId : "",
+      session_id: rec.sessionId || "",
       turn_id: rec.turnId || "",
       rq,
       module,
       name: rec.name || `↳${module}`,
       started_at: String(Math.floor(Number(rec.startedAt || rec.createdAt) || 0)),
-      model_provider: routing.modelProvider || "inherit",
+      model_provider: claude ? "anthropic" : routing.modelProvider || "inherit",
       model: routing.model || "inherit",
-      reasoning_effort: routing.reasoningEffort || "inherit",
+      reasoning_effort: (claude ? routing.effort : routing.reasoningEffort) || "inherit",
       worktree_cwd: rec.worktree || "",
+      start_cwd: rec.cwd || rec.worktree || "",
       branch: rec.branch || "",
       terminated: rec.state === "stopped" ? "1" : "0",
       mode: `v2-${rec.transport || "codex"}`,
@@ -223,15 +230,91 @@ function makeAppCaller({ coord, codexBin = "", startAppServer = true, callBin = 
   };
 }
 
-// 只读快照：面板专用。有回执直接定案（不必打扰 app-server），否则读一次 thread。
+// ---------------------------------------------------------------------------
+// Claude 后端：状态来自公开 CLI `claude agents --json --all`（只读），与 cc-fleet status 同源。
+// ---------------------------------------------------------------------------
+
+function claudeBin() {
+  return process.env.CLAUDE_CLI_PATH || "claude";
+}
+
+function readClaudeAgents({ bin = "" } = {}) {
+  const res = spawnSync(bin || claudeBin(), ["agents", "--json", "--all"], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+    timeout: 15000,
+    maxBuffer: 16 * 1024 * 1024,
+  });
+  if (res.status !== 0) {
+    throw new Error(String(res.stderr || (res.error && res.error.message) || `claude agents exit ${res.status}`).trim());
+  }
+  const list = JSON.parse(res.stdout);
+  if (!Array.isArray(list)) throw new Error("unsupported claude agents JSON schema");
+  return list;
+}
+
+// 一次刷新只调一次 CLI（约 0.6s），多个协调目录 / 多个 worker 共用；失败也只失败一次，不逐个重试。
+// 没有 Claude worker 时根本不会被调用，纯 Codex 场景零额外开销。
+function lazyClaudeAgents(opts = {}) {
+  let done = false;
+  let value;
+  let error;
+  return () => {
+    if (!done) {
+      done = true;
+      try { value = readClaudeAgents(opts); } catch (e) { error = e; }
+    }
+    if (error) throw error;
+    return value;
+  };
+}
+
+// 纯函数：把 `claude agents` 的一条会话翻译成 fleet 状态词。done 只代表会话空闲，没回执照样是「需核验」。
+function classifyFromClaudeAgent(job, agent) {
+  if (!agent) {
+    job.state = "unknown";
+    job.detail = "claude agents 里找不到该会话（可能已被回收）；以回执为准";
+    return job;
+  }
+  job.agentState = agent.state || "";
+  const waiting = agent.waitingFor ? (typeof agent.waitingFor === "string" ? agent.waitingFor : JSON.stringify(agent.waitingFor)) : "";
+  const table = {
+    working: ["running", "Claude worker 执行中"],
+    blocked: ["blocked", `Claude worker 等待${waiting ? `：${waiting}` : "输入 / 审批"}`],
+    done: ["done", "Claude worker 已空闲/完成；如无回执请读最后回复核验"],
+    failed: ["failed", "Claude worker 失败"],
+    stopped: ["stopped", "Claude worker 已停止"],
+  };
+  const [state, detail] = table[agent.state] || ["unknown", `Claude worker 状态未知: ${agent.state || "-"}`];
+  job.state = job.terminated === "1" && !ACTIVE_STATES.has(state) ? "stopped" : state;
+  job.detail = detail;
+  return job;
+}
+
+// 详情页降级视图：transcript 找不到时读 `claude logs` 的终端输出。
+function readClaudeLogs(shortId, { bin = "" } = {}) {
+  if (!shortId) return { text: "", error: "缺少 Claude 会话 id" };
+  const res = spawnSync(bin || claudeBin(), ["logs", shortId], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+    timeout: 15000,
+    maxBuffer: 16 * 1024 * 1024,
+  });
+  if (res.status !== 0) return { text: "", error: String(res.stderr || `claude logs exit ${res.status}`).trim() };
+  return { text: res.stdout || "" };
+}
+
+// 只读快照：面板专用。有回执直接定案（不必打扰 app-server / claude CLI），否则按后端读一次状态。
 // 绝不 unarchive / resume / unpin / 写回元数据。
 function readOnlySnapshot(coord, opts = {}) {
   const callApp = opts.callApp || makeAppCaller({ coord, ...opts });
+  const claudeAgents = typeof opts.claudeAgents === "function" ? opts.claudeAgents : lazyClaudeAgents({ bin: opts.claudeBin });
   // filter 在**发起 app 调用之前**生效：注册表里躺着的历史 RQ 可能有几十个早已收工的
   // worker，逐个 thread/read 会让面板每一次刷新都 spawn 一堆进程。
   const keep = typeof opts.filter === "function" ? opts.filter : () => true;
   const jobs = [...listJobs(coord), ...listV2Jobs(coord)].filter(keep);
   let appUnavailable = false;
+  let claudeUnavailable = false;
   for (const job of jobs) {
     if (receiptDone(job.summary_file)) {
       job.receipt = 1;
@@ -240,6 +323,16 @@ function readOnlySnapshot(coord, opts = {}) {
       continue;
     }
     job.receipt = 0;
+    if (job.backend === "claude") {
+      try {
+        classifyFromClaudeAgent(job, claudeAgents().find((a) => a && a.id === job.short_id));
+      } catch (e) {
+        claudeUnavailable = true;
+        job.state = "unknown";
+        job.detail = `无法读取 claude agents: ${String(e.message || e).slice(0, 160)}`;
+      }
+      continue;
+    }
     const threadId = job.thread_id || job.id;
     if (!threadId) {
       job.state = "lost";
@@ -255,7 +348,7 @@ function readOnlySnapshot(coord, opts = {}) {
       job.detail = `无法读取 Codex App thread: ${String(e.message || e).slice(0, 160)}`;
     }
   }
-  return { coord, jobs, appUnavailable };
+  return { coord, jobs, appUnavailable, claudeUnavailable };
 }
 
 // ---------------------------------------------------------------------------
@@ -603,6 +696,10 @@ module.exports = {
   listJobs,
   listV2Jobs,
   makeAppCaller,
+  readClaudeAgents,
+  lazyClaudeAgents,
+  classifyFromClaudeAgent,
+  readClaudeLogs,
   readOnlySnapshot,
   registryPath,
   readRegistry,

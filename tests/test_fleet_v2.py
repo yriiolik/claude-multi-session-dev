@@ -98,11 +98,17 @@ class FleetTests(unittest.TestCase):
   reg=json.loads((self.root/'coords.json').read_text())['coords']
   self.assertEqual([(x['coord'],x['rq']) for x in reg],[(str(c),f['rq'])])
   self.assertTrue((c/'owner.meta').exists())
-  # Claude 后端的 worker 不上 Codex 面板；全局开关 0 时也不碰面板
+  # Claude 后端（claude --bg）同样登记 + 分屏；记下 model/effort 供面板详情展示
+  (self.root/'missing.json').write_text(json.dumps({'worker':{'model':'claude-opus-5','effort':'high'}}))
   c2,_,_=self.setup_worker(backend='claude',module='ui');out=self.cli('dispatch','--coord',c2,'--module','ui',env=env)
-  self.assertIsNone(out['panel']);self.assertEqual(len(log.read_text().splitlines()),1)
+  self.assertEqual(out['panel'],dict(registered=True,panelOpened=True));self.assertEqual(len(log.read_text().splitlines()),2)
+  self.assertEqual(out['claudeProfile'],dict(model='claude-opus-5',effort='high'))
+  self.assertEqual(json.loads((c2/'v2'/'ui.json').read_text())['claudeProfile'],dict(model='claude-opus-5',effort='high'))
+  # 全局开关 0 时不碰面板
   env0,log0=self.panel_env('0');c3,_,_=self.setup_worker(module='svc');out=self.cli('dispatch','--coord',c3,'--module','svc',env=env0)
-  self.assertIsNone(out['panel']);self.assertEqual(len(log0.read_text().splitlines()),1)
+  self.assertIsNone(out['panel']);self.assertEqual(len(log0.read_text().splitlines()),2)
+  c5,_,_=self.setup_worker(backend='claude',module='web');out=self.cli('dispatch','--coord',c5,'--module','web',env=env0)
+  self.assertIsNone(out['panel']);self.assertEqual(len(log0.read_text().splitlines()),2)
   # 面板脚本失败只在输出里标 False，派发本身仍是 running
   (self.root/'panel-open').write_text('#!/bin/sh\nexit 7\n');c4,_,_=self.setup_worker(module='job');out=self.cli('dispatch','--coord',c4,'--module','job',env=env)
   self.assertEqual(out['state'],'running');self.assertEqual(out['panel'],dict(registered=True,panelOpened=False))

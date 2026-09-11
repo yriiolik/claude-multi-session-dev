@@ -1,5 +1,7 @@
 #!/usr/bin/env node
-// cc-fleet-panel-codex-app — Codex App worker 的终端面板（对标 `claude agents` 的 FleetView）。
+// cc-fleet-panel-codex-app — fleet worker 的终端面板（对标 `claude agents` 的 FleetView）。
+// Codex worker（app-server thread，状态走 thread/read、明细走 rollout）与 Claude worker（`claude --bg`，
+// 状态走 `claude agents --json --all`、明细走会话 transcript）同屏展示，文件名沿用历史叫法。
 //
 // 为什么要有它：Codex worker 是 app-server 里的 thread，没有进程、没有 PTY，也不在
 // `~/.claude/sessions/<pid>.json` 里自注册，所以**永远不可能**出现在 `claude agents` 的列表里
@@ -24,6 +26,7 @@ const path = require("path");
 const { spawnSync } = require("child_process");
 const jobsLib = require("./lib/codex-app-jobs.js");
 const rollout = require("./lib/codex-rollout.js");
+const transcript = require("./lib/claude-transcript.js");
 
 // ---------------------------------------------------------------- 参数
 
@@ -258,7 +261,7 @@ function jobMtime(job) {
 function jobEndedAt(job) {
   if (jobsLib.ACTIVE_STATES.has(job.state)) return 0; // 还在跑，没有结束时间
   const started = Number(job.started_at) || 0;
-  const rf = rolloutFor(job);
+  const rf = logFor(job);
   const candidates = [job.receipt ? mtimeOf(job.summary_file) : 0, rf ? mtimeOf(rf) : 0, mtimeOf(job.meta)];
   // 早于开始时间的一律不认（文件没被更新过时 mtime 可能就是创建时刻，甚至更早）
   return candidates.find((t) => t && t >= started) || 0;
@@ -313,12 +316,13 @@ function liveDetail(job) {
     return line ? `🧾 ${line}` : job.detail;
   }
   if (job.state !== "running" && job.state !== "blocked") return job.detail;
-  const file = rolloutFor(job);
+  const file = logFor(job);
   if (!file) return job.detail;
-  const act = rollout.lastActivity(file);
+  const act = (job.backend === "claude" ? transcript : rollout).lastActivity(file);
   if (!act) return job.detail;
   if (act.kind === "shell") return `$ ${act.text}`;
   if (act.kind === "patch") return `✎ ${act.text}`;
+  if (act.kind === "tool") return `🔧 ${act.text}`;
   if (act.kind === "message") return `💬 ${act.text}`;
   return `🧠 ${act.text}`;
 }
@@ -335,11 +339,15 @@ function collect() {
   const groups = [];
   const jobs = [];
   let appUnavailable = false;
+  let claudeUnavailable = false;
+  // 一轮刷新共用一次 `claude agents` 调用；没有 Claude worker 就不会调
+  const claudeAgents = jobsLib.lazyClaudeAgents();
 
   for (const c of activeCoords()) {
     const snap = jobsLib.readOnlySnapshot(c.coord, {
       codexBin: opt.codexBin,
       startAppServer: opt.startAppServer,
+      claudeAgents,
       // 老 RQ 的已收工 worker 会永远留在注册表里。时间窗必须在 thread/read 之前就把它们挡掉，
       // 否则面板每一次刷新都会为历史记录 spawn 一堆 app 调用。
       //
@@ -354,6 +362,7 @@ function collect() {
       },
     });
     if (snap.appUnavailable) appUnavailable = true;
+    if (snap.claudeUnavailable) claudeUnavailable = true;
     if (!snap.jobs.length) continue;
 
     const { title, owner, ownerSource } = groupTitle(c.coord);
@@ -406,6 +415,7 @@ function collect() {
     pending: jobs.filter((j) => j.cls.bucket === "pending").length,
     done: jobs.filter((j) => j.cls.bucket === "done").length,
     appUnavailable,
+    claudeUnavailable,
   };
 }
 
@@ -414,19 +424,22 @@ function collect() {
 // rollout 文件路径按 thread id 扫目录树得到，结果缓存：面板每 2 秒刷一次，不能每次都遍历。
 const rolloutCache = new Map();
 
-function rolloutFor(job) {
-  const tid = job.thread_id || job.id;
+function logFor(job) {
+  // Claude worker 的明细在会话 transcript 里，按完整 sessionId 找
+  const claude = job.backend === "claude";
+  const tid = claude ? job.session_id : job.thread_id || job.id;
   if (!tid) return "";
   if (rolloutCache.has(tid)) {
     const cached = rolloutCache.get(tid);
     if (cached && fs.existsSync(cached)) return cached;
   }
-  const found = rollout.findRollout(tid);
+  const found = claude ? transcript.findTranscript(tid, { cwd: job.start_cwd }) : rollout.findRollout(tid);
   rolloutCache.set(tid, found);
   return found;
 }
 
 function readThreadFallback(job) {
+  if (job.backend === "claude") return jobsLib.readClaudeLogs(job.short_id);
   const threadId = job.thread_id || job.id;
   if (!threadId) return { error: "缺少 thread_id" };
   try {
@@ -473,6 +486,10 @@ function timelineLines(items, width, truncated) {
     if (it.type === "call") {
       if (it.kind === "patch") {
         out.push(`${C.magenta("✎ 改文件")} ${truncate(it.text, width - 12)}`);
+      } else if (it.kind === "tool") {
+        const tag = it.exitCode ? C.red(" ✗") : "";
+        out.push(`${C.blue("🔧")} ${truncate(it.text, width - 8)}${tag}`);
+        continue; // 读文件 / 搜索的输出没有看点，只留调用本身
       } else {
         const bad = it.exitCode !== null && it.exitCode !== undefined && it.exitCode !== 0;
         const head = bad ? C.red("✗ $") : C.cyan("$");
@@ -494,15 +511,21 @@ function timelineLines(items, width, truncated) {
 function detailLines(job, width) {
   const lines = [];
   const rule = C.dim("─".repeat(Math.max(10, Math.min(width, 160))));
-  const file = rolloutFor(job);
+  const file = logFor(job);
   let meta = {};
   let body = [];
 
   if (file) {
-    const tl = rollout.readTimeline(file);
+    const tl = (job.backend === "claude" ? transcript : rollout).readTimeline(file);
     meta = tl.meta || {};
     body = timelineLines(tl.items, width, tl.truncated);
     if (!tl.items.length) body = [C.dim("（rollout 里还没有可读事件）")];
+  } else if (job.backend === "claude") {
+    // transcript 找不到（会话刚起 / CLAUDE_CONFIG_DIR 不同）时退回 `claude logs` 的终端输出。
+    const res = readThreadFallback(job);
+    body.push(C.yellow("⚠ 找不到 transcript，降级为 claude logs 终端输出（看不到结构化的命令与思考）"));
+    if (res.error) body.push(C.red(`❌ ${res.error}`));
+    for (const l of String(res.text || "").split(/\r?\n/).slice(-200)) body.push(...wrap(l, width, "   "));
   } else {
     // rollout 找不到（thread 刚建 / CODEX_HOME 不同）时退回 app-server。它只给消息级 item，
     // 看不到命令与思考，所以明确告诉用户这是降级视图，别以为 worker 什么都没干。
@@ -522,7 +545,9 @@ function detailLines(job, width) {
     }
   }
 
-  lines.push(C.dim(`thread ${job.thread_id || job.id || "-"}`));
+  lines.push(C.dim(job.backend === "claude"
+    ? `claude  session ${job.session_id || "-"} · id ${job.short_id || "-"}`
+    : `thread ${job.thread_id || job.id || "-"}`));
   // 列表里只有一个耗时数字，容易分不清"跑了多久"和"什么时候跑的"，详情页把两头都摊开。
   const startedAt = Number(job.started_at) || 0;
   if (startedAt) {
@@ -536,7 +561,7 @@ function detailLines(job, width) {
   if (wd) lines.push(...wrap(`工作树 ${wd}`, width, "").map(C.dim));
   if (meta.tokens) lines.push(C.dim(`token  ${meta.tokens.toLocaleString("en-US")}`));
   lines.push(C.dim(`回执   ${job.receipt ? `🧾 在案 ${job.summary_file}` : "未落回执"}`));
-  lines.push(C.dim(`日志   ${file || "(未找到 rollout)"}`));
+  lines.push(C.dim(`日志   ${file || (job.backend === "claude" ? "(未找到 transcript)" : "(未找到 rollout)")}`));
   lines.push(rule);
 
   // 有回执时先把回执正文摆出来——这是验收时唯一有契约保证的内容。
@@ -567,20 +592,28 @@ function rowMark(job, frame) {
   return C[job.cls.tone](markChar(job, frame));
 }
 
+// 标题跟着在场的后端走：纯 Codex / 纯 Claude 各自点名，混合或空面板就叫 Fleet。
+function fleetTitle(model) {
+  const kinds = new Set(model.jobs.map((j) => j.backend || "codex"));
+  if (kinds.size !== 1) return "Fleet";
+  return kinds.has("claude") ? "Claude Fleet" : "Codex Fleet";
+}
+
 function renderList(model, ui) {
   const width = ui.width;
   const lines = [];
   const scope = opt.rq ? `RQ ${opt.rq}` : "全局";
-  lines.push(`${C.bold("Codex Fleet")} ${C.dim(`· ${scope} · ${model.groups.length} 任务组 · ${model.jobs.length} worker`)}`);
+  lines.push(`${C.bold(fleetTitle(model))} ${C.dim(`· ${scope} · ${model.groups.length} 任务组 · ${model.jobs.length} worker`)}`);
   const parts = [];
   if (model.pending) parts.push(C.cyan(`${model.pending} 未完成`));
   if (model.done) parts.push(C.green(`${model.done} 已完成`));
   lines.push(parts.length ? parts.join(C.dim(" · ")) : C.dim("暂无 worker"));
   if (model.appUnavailable) lines.push(C.red("⚠ app-server 不可达；未落回执的线程状态读不到"));
+  if (model.claudeUnavailable) lines.push(C.red("⚠ claude agents 读取失败；未落回执的 Claude worker 状态读不到"));
 
   if (!model.groups.length) {
     lines.push("");
-    lines.push(C.dim("（还没有 Codex worker；派发后会自动出现在这里）"));
+    lines.push(C.dim("（还没有 worker；派发后会自动出现在这里）"));
     lines.push("");
     lines.push(C.dim("↑↓ 选择 · → 进详情 · ← 返回 · r 刷新 · q 退出"));
     return lines;
@@ -865,6 +898,8 @@ if (opt.json) {
     pending: model.pending,
     done: model.done,
     appUnavailable: model.appUnavailable,
+    claudeUnavailable: model.claudeUnavailable,
+    title: fleetTitle(model),
     view: ui.view,
     cursor: ui.cursor,
     selected: sel ? { module: sel.module, rq: sel.rq, bucket: sel.cls.bucket } : null,
@@ -881,6 +916,7 @@ if (opt.json) {
     jobs: model.jobs.map((j) => ({
       module: j.module,
       rq: j.rq,
+      backend: j.backend || "codex",
       name: j.displayName,
       state: j.state,
       bucket: j.cls.bucket,
@@ -960,7 +996,7 @@ const listTimer = setInterval(() => {
     clearInterval(listTimer);
     if (spinTimer) clearInterval(spinTimer);
     if (!opt.plain) process.stdout.write("\x1b[?25h\x1b[?1049l");
-    console.log("✅ Codex worker 全部收工，面板自动关闭。");
+    console.log("✅ worker 全部收工，面板自动关闭。");
     shutdown(0);
   }
 }, opt.interval);

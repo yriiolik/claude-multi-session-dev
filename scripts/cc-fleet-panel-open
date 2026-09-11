@@ -102,6 +102,9 @@ const ENV_PASSTHROUGH = [
   "CODEX_HOME",
   "CODEX_CLI_PATH",
   "CODEX_APP_CALL_BIN",
+  // Claude worker 的状态走 `claude agents`、明细走 $CLAUDE_CONFIG_DIR/projects 下的 transcript
+  "CLAUDE_CLI_PATH",
+  "CLAUDE_CONFIG_DIR",
   "CC_FLEET_PANEL_REGISTRY",
   "CC_FLEET_PANEL_STATE",
   "CC_FLEET_PANEL_PIDFILE",

@@ -67,6 +67,7 @@ class FleetTests(unittest.TestCase):
  def db(self):return json.loads((self.root/'db.json').read_text())
  def receipt(self,c,d,**kw):
   r=dict(version=2,rq=json.loads((c/'fleet.json').read_text())['rq'],module=d['module'],attempt=d['attempt'],result='done',summary='finished',tests=[dict(command='check',result='passed',evidence='passed')],commit='')
+  if d['role'] in ('verify','integ'):r['commit']=self.git('rev-parse','HEAD',cwd=d['worktree'])
   r.update(kw);(c/(d['module']+'.receipt.json')).write_text(json.dumps(r))
  def test_four_routes_and_native_pending(self):
   for host,backend,transport in [('codex-app','codex','native'),('codex-app','claude','claude-bg'),('claude-code','codex','app-server'),('claude-code','claude','claude-bg'),('codex-cli','codex','app-server')]:
@@ -127,6 +128,32 @@ class FleetTests(unittest.TestCase):
   self.assertEqual(self.git('rev-parse','HEAD'),self.base)
   self.receipt(c,d,commit=sha,attempt='old');self.assertEqual(self.cli('status','--coord',c)['jobs'][0]['state'],'needs-review')
   self.receipt(c,d,commit=sha,tests=[dict(result='failed',evidence='assertion failure')]);self.assertEqual(self.cli('status','--coord',c)['jobs'][0]['state'],'needs-review')
+ def test_acceptance_without_execution_cannot_be_done(self):
+  for role in ('verify','integ'):
+   with self.subTest(role=role):
+    c,d,_=self.setup_worker(role=role)
+    self.receipt(c,d,tests=[dict(command='browser',result='not-run',evidence='environment unavailable')])
+    self.assertEqual(self.cli('status','--coord',c)['jobs'][0]['state'],'needs-review')
+    self.receipt(c,d,tests=[dict(command='smoke',result='passed',evidence='trace'),dict(command='branch',result='not-run',evidence='environment unavailable')])
+    self.assertEqual(self.cli('status','--coord',c)['jobs'][0]['state'],'needs-review')
+    self.receipt(c,d,result='blocked',tests=[dict(command='browser',result='not-run',evidence='environment unavailable')])
+    self.assertEqual(self.cli('status','--coord',c)['jobs'][0]['state'],'blocked')
+    self.receipt(c,d,result='failed',tests=[dict(command='browser',result='failed',evidence='wrong final state')])
+    self.assertEqual(self.cli('status','--coord',c)['jobs'][0]['state'],'failed')
+    self.receipt(c,d,tests=[dict(command='browser',result='passed',evidence='page trace')])
+    self.assertEqual(self.cli('status','--coord',c)['jobs'][0]['state'],'done')
+ def test_acceptance_must_match_current_integration(self):
+  c,d,f=self.setup_worker(role='verify')
+  self.receipt(c,d,commit='')
+  self.assertEqual(self.cli('status','--coord',c)['jobs'][0]['state'],'needs-review')
+  self.receipt(c,d)
+  self.assertEqual(self.cli('status','--coord',c)['jobs'][0]['state'],'done')
+  self.git('commit','--allow-empty','-m','integration changed')
+  self.git('update-ref','refs/heads/'+f['integrationBranch'],self.git('rev-parse','HEAD'))
+  self.assertEqual(self.cli('status','--coord',c)['jobs'][0]['state'],'needs-review')
+  self.git('merge','--ff-only',f['integrationBranch'],cwd=d['worktree'])
+  self.receipt(c,d)
+  self.assertEqual(self.cli('status','--coord',c)['jobs'][0]['state'],'done')
  def test_idle_without_receipt_needs_review(self):
   c,d,_=self.setup_worker();self.cli('dispatch','--coord',c,'--module','api');db=self.db()
   t=next(iter(db['threads'].values()));t['status']={'type':'idle'};t['turns'][-1]['status']='completed'

@@ -44,7 +44,12 @@ status/read 同时读取这两个位置，主端必须在收工前 `collect` 将
 - `unknown`：查询失败/后端缺记录；不要判失败后立即重复创建。
 - `launch-uncertain`：启动/回话可能已送达；先用公开列表和名册查证，再 reconcile。
 - `prepared` / `setting-up`：尚未派发/原生 worktree 仍在创建。
-- `done`：回执经过机械核验；仍需主端业务验收。
+- `done`：回执经过机械核验；仍需主端业务验收。verify/integ 存在 not-run 时不能 done（真正不适用项在报告说明理由，不伪装为已通过检查）。
+
+新派发前默认先生成用户用例并引用原始需求及本次参考资料（如有）；统一 worker prompt 和 reply 都提醒该流程。
+verify/integ 的 commit 必须是实际验收 SHA，且与工作树 HEAD 和当前集成分支一致；基线变化返回 needs-review，
+主端评估变化并在当前基线复验、更新证据与回执。机器核验不证明用例完整或页面确已操作，主端仍按 delivery-quality.md 逐例审核证据。
+失败如实保留 tests.result=failed，整体 result=failed 或 blocked；不能为让 done 通过校验隐藏失败。
 
 ```bash
 "$FLEET" reconcile --coord "$COORD" --module ui

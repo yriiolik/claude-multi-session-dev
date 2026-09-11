@@ -2,11 +2,11 @@
 name: multi-session-dev
 description: >-
   在 Codex 或 Claude Code 主 session 中，按既有模块编排独立 Codex / Claude Code 子 session，
-  支持混合后端、契约先行、worktree 隔离、回执和集成验收。用于用户要求多 session、独立任务并行开发、
+  支持混合后端、契约先行、worktree 隔离、需求追溯、用例先行和页面验收。用于用户要求多 session、独立任务并行开发、
   fleet 编排或跨客户端调度；不用于普通单任务开发，不在 FLEET-WORKER 子 session 内再次编排。
 ---
 
-# 跨客户端多 session 编排 · v2
+# 跨客户端多 session 编排 · v2.1
 
 本技能共享一套流程，通过主端能力和 worker 后端选择执行方式。不要把 Claude 工具名、模型名或目录
 替换成 Codex 字样来移植技能。`multi-thread-dev` 是旧入口，统一使用这里的流程。
@@ -16,7 +16,7 @@ description: >-
 首条任务带 `⟦FLEET-WORKER⟧` / `⟦CODEX-THREAD-WORKER⟧` 或 `FLEET_ROLE=worker` 时，你是 worker：
 按任务卡开发、自测、回执，不加载编排流程或再开 worker。标题 `↳` 只是展示，寻址用真实 ID。
 
-主 session 拆解、定契约、派发、监控和裁定。模块业务代码交给独立 session；主端可以维护技能、
+主 session 对需求完整性和最终业务闭环负责，承担拆解、定契约、派发、监控和裁定。模块业务代码交给独立 session；主端可以维护技能、
 协调文档、检查 Git 状态、审阅必要的 diff 和运行验收。纯探查优先使用可用的只读 subagent；
 没有相应工具时自行只读检查，不臆造 `Agent`、`ListAgents`、`Monitor` 或 `SendMessage`。
 开发 worker 是独立 session，不用内部 subagent 替代。
@@ -39,15 +39,29 @@ Codex CLI 没有 App 原生任务工具时自动走 app-server；不要把工具
 [native-codex.md](reference/native-codex.md)，跨客户端路径读 [backends-v2.md](reference/backends-v2.md)。
 技能脚本相对于本 SKILL.md 的 `scripts/` 定位，不能假设已加入 PATH。
 
+## 默认交付门槛（用户无需重复提醒）
+
+理解需求并确定方案后，**先生成用户验收用例，再派实现卡**。覆盖核心完整主流程、
+本次每项改动及相关业务分支/异常；涉及写入和异步交互时，覆盖幂等、事务失败与恢复。
+**最终通过真实页面操作逐条执行这些用例**，主流程必须从业务入口连续跑到最终结果。
+单测、API 测试、mock 页面或 worker 的 done 不能替代页面业务验收。
+没有页面入口的纯接口/CLI 需求，明确记录不适用原因和实际入口验证方式；有页面但环境/账号/工具
+不可用属于 blocked，不能降级成 API 通过。失败、阻塞、未执行均不算通过，不为通过而删用例。
+
+首次规划必读 [delivery-quality.md](reference/delivery-quality.md)，它规定需求追溯、粒度、
+上下文恢复和页面验收证据。派发使用 [task-card-template.md](reference/task-card-template.md)。
+主端保留简短的持久化状态索引；压缩后、追加需求后和最终验收前重新核对原始需求与用例清单。
+
 ## 一轮开发
 
-1. 读项目指导和模块地图，将需求归属到既有模块，默认一模块一卡一独立 session；耦合紧的同模块内容
-   不必硬拆。列出数据生产方、消费方和验收场景。
+1. 读项目指导、原始需求及本次参考资料（如有），将每项行为映射到需求锚点、用例和负责人。
+   默认按既有模块分配，按可独立验收的业务结果调整大小；不机械按模块编号、文件数或前后端拆卡。
+   指定贯穿核心主流程的负责人和独立验收者；具体规则见 delivery-quality.md。
 2. 跨模块接口未稳定时，按 [contract-first.md](reference/contract-first.md) 先定契约，再并行实现，
    最后独立联调/验收。该文档里的旧派发命令以 v2 路由替代，业务分层原则继续保留。
 3. `cc-fleet init` 创建唯一 RQ、协调目录、`fleet/<RQ>` 集成分支，并记录主端及可用的真实会话 ID；不可取得时使用明确标识的 controller ID，不能冒充真实会话 ID。
    只包含 base 的已提交内容；若用户要求包含未提交改动，先做受控快照，不擅自丢弃或提交用户改动。
-4. 任务卡写清范围、依赖契约、自测、L1/L2 追溯（项目需要时）、验收口径。`prepare` 生成统一
+4. 派实现卡前将用户用例和方案落盘；任务卡写清范围、原始来源、用例锚点、依赖契约、自测、L1/L2 追溯（项目需要时）、验收口径。`prepare` 生成统一
    worker prompt 和身份，CLI 路径还会预建独立 worktree；原生路径让 App 创建 worktree。
 5. 按路由派发。即时记录真实 thread/session ID；原生创建返回 `clientThreadId` 时仅记为 setup pending，
    等到真实 `threadId` 后再监控。不能把 client ID 当真实 ID，也不能因等待久而重复创建。
@@ -61,7 +75,9 @@ Codex CLI 没有 App 原生任务工具时自动走 app-server；不要把工具
 8. 用 `reply` 生成新 attempt，避免上一轮 done 回执冒充新一轮完成；原生路径按输出调用宿主消息工具。
    接口超时显示 launch-uncertain 时先 `reconcile`，不直接再派。换后端/重新实现用新 fix 模块卡。
 9. 模块完成后独立安排 integ/verify worker；验收必须在含全部已合入改动的集成基线上。
-   主端核对场景、回执、测试证据、必要的 diff，未达标定位回修。
+   先跑通完整主流程，再按用例逐项执行分支/异常。主端核对原始需求覆盖、逐例页面证据、
+   回执和必要的 diff，未达标定位回修。修复后复测失败项、受影响分支及完整主流程；记录最终验收 SHA，
+   后续合入改动时评估证据失效范围，不能沿用旧基线的“全部通过”。
 10. 验收通过后，按用户授权处理集成分支合回。不要从“多 session”推导出自动 push、发布、删除 worktree
     或删除分支的授权。默认保留本地成果和会话历史，明确报告未完成事项。
 

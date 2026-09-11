@@ -121,12 +121,18 @@ def preamble(c,d):
 角色 {d['role']}：developer 在范围内开发、自测、提交后运行 {shlex.quote(str(ROOT/'cc-fleet-land'))} {fleet['rq']}；
 scout/verify/integ 不修改业务代码、不提交合回，只执行任务卡要求的探查或验收。
 不要推远端、合回共享分支或删除 worktree。遇到范围/权限问题写 blocked 回执，说明所需输入。
+需求与验收：开工先读任务卡引用的原始需求、用户用例和契约；有本次参考资料时一并核对；压缩/恢复后重新读取。
+若实现/验收卡缺少用例或本次需求明确依赖的输入，报告缺项，不自行缩减需求；探查/契约阶段可先补齐输入。未提供或指定 demo/原型不属于缺项，不要求用户补充。
+开发自测按用例映射证据；verify/integ 在真实集成页面连续跑核心主流程，再逐项验证适用分支/异常、幂等和事务。
+API/单测或 mock 自己业务 API 的页面不能替代真实页面验收；纯接口/CLI 无页面时记录不适用理由。
+验收证据记录用例、实际操作/结果、截图或 trace 路径、实际基线 SHA/环境；失败/阻塞/未执行不得报通过。
+测试失败须如实写 tests.result=failed 并 result=failed 或 blocked，不得藏进 risks、改写 not-run 或删除断言来取得 done。
 完成时优先把以下 JSON 原子写到 {c/(d['module']+'.receipt.json')}（临时文件+rename）。
 若协调目录不可写，则 mkdir -p 创建临时回执父目录，改写 {inbox(c,d)}；两者任一写成功即完成回执步骤，
 不因协调目录只读而将已成功的任务标 blocked。主端会核验临时回执并收存；最后回复相同 JSON（含真实 worktree）。
 {{"version":2,"rq":"{fleet['rq']}","module":"{d['module']}","attempt":"{d['attempt']}",
- "worktree":"实际 worktree 的绝对路径","result":"done|failed|blocked","summary":"真实完成内容/问题","commit":"开发提交的完整 SHA，非开发可空",
- "tests":[{{"command":"实际执行的检查","result":"passed|failed|not-run","evidence":"结果文件路径或简短输出"}}],
+ "worktree":"实际 worktree 的绝对路径","result":"done|failed|blocked","summary":"真实完成内容/问题","commit":"开发提交或 verify/integ 实际验收的完整 SHA，scout 可空",
+ "tests":[{{"command":"实际执行的检查","result":"passed|failed|blocked|not-run","evidence":"结果文件路径或简短输出"}}],
  "risks":[],"needsInput":[]}}
 也可附加 {c/(d['module']+'.summary.md')} 方便人工查看。只做了计划不能报 done。
 \n任务卡：\n'''
@@ -304,6 +310,14 @@ def receipt(c,d):
             return dict(result='needs-review',summary='missing verification evidence')
         if any(not isinstance(t,dict) or t.get('result') not in ('passed','not-run') or not t.get('evidence') for t in r['tests']):
             return dict(result='needs-review',summary='invalid or failed verification evidence')
+        if d['role'] in ('verify','integ') and any(t.get('result')!='passed' for t in r['tests']):
+            return dict(result='needs-review',summary='acceptance has unexecuted verification')
+        if d['role'] in ('verify','integ'):
+            sha=r.get('commit','')
+            if not re.fullmatch('[a-f0-9]{40,64}',sha):
+                return dict(result='needs-review',summary='missing tested commit')
+            if sha!=git(wt,'rev-parse','HEAD') or sha!=git(f['repo'],'rev-parse',f['integrationBranch']):
+                return dict(result='needs-review',summary='acceptance baseline changed; reverify current integration')
         if d['role']=='developer':
             if not any(t.get('result')=='passed' for t in r['tests']):
                 return dict(result='needs-review',summary='developer has no passing verification')
@@ -364,6 +378,7 @@ def reply(a):
         if old.exists(): old.rename(c/'v2'/(a.module+'.receipt-'+d['attempt']+'.json.bak'))
         d['attempt']=uuid.uuid4().hex; d['state']='replying'; atomic(record(c,a.module),d)
     text=f"本轮 attempt={d['attempt']}；回执 attempt 更新为此值。协调目录不可写时，改写临时回执 {inbox(c,d)}，不要复用上一轮临时回执路径。\n"+text
+    text+='\n继续前重读任务卡及最新需求、用户用例与契约，以及本次参考资料（如有）；失败如实回执，修复后复测失败项和受影响的完整主流程。\n'
     if d['transport']=='native':
         emit(dict(d,nextAction='send_message_to_thread, then register the same threadId after acceptance',prompt=text)); return
     try:

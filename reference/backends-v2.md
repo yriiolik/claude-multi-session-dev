@@ -20,7 +20,7 @@ reply 协议失败明确报错，用户可 `claude attach <shortId>` 手工接�
 
 v2 预建 worktree，从该真实目录 thread/start，再 turn/start。不使用“先挂主目录、后覆盖 cwd”的侧栏技巧，
 不临时 pin，不强行注入用户级 CLAUDE.md。独立 session 为非 ephemeral、有清晰名称。
-具体侧栏归类由 App 决定；任务是否成功以 API 和回执为准。
+派发脚本通过服务端分区 API 自动归入“子 session”；任务是否成功以 API 和回执为准。
 
 派发成功后自动把协调目录登记进面板注册表，并在当前 Ghostty 窗口右侧分屏拉起只读面板
 `cc-fleet-panel-codex-app`（Codex worker 进不了 `claude agents`，这块分屏是用户看子 session 的地方）。

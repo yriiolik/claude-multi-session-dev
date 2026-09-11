@@ -20,7 +20,12 @@ if pathlib.Path(sys.argv[0]).name=='claude':
  if a[0]=='logs': print('worker transcript');sys.exit()
  sys.exit(3)
 method=a[-2];params=json.load(sys.stdin);db['calls'].append([method,params])
-if method=='thread/start':
+if method=='threadSection/list':
+ result={'data':[{'id':'server-section-id','name':'子 session'}], 'nextCursor':None}
+elif method=='thread/section/move':
+ if os.environ.get('FAKE_FAIL_SECTION'): save();sys.exit(8)
+ result={}
+elif method=='thread/start':
  i='thread-'+str(len(db['threads'])+1);t=dict(id=i,cwd=params['cwd'],status={'type':'idle'},turns=[]);db['threads'][i]=t;result={'thread':t}
 elif method=='thread/read': result={'thread':db['threads'][params['threadId']]}
 elif method=='turn/start':
@@ -142,7 +147,7 @@ class FleetTests(unittest.TestCase):
  def test_native_reply_outputs_instruction_without_backend_send(self):
   c,d,_=self.setup_worker(host='codex-app');self.cli('register','--coord',c,'--module','api','--session-id','native')
   p=self.root/'text';p.write_text('Continue.');out=self.cli('reply','--coord',c,'--module','api','--text-file',p)
-  self.assertIn('send_message_to_thread',out['nextAction']);self.assertIn(out['attempt'],out['prompt']);self.assertFalse((self.root/'db.json').exists())
+  self.assertIn('send_message_to_thread',out['nextAction']);self.assertIn(out['attempt'],out['prompt']);self.assertFalse(any(x[0] in ('thread/start','turn/start','turn/steer') for x in self.db()['calls']))
  def test_bind_checks_repo_and_baseline(self):
   c,d,_=self.setup_worker();self.cli('bind','--coord',c,'--module','api','--worktree',self.repo,ok=False)
   self.cli('bind','--coord',c,'--module','api','--worktree',d['worktree'])
@@ -193,5 +198,22 @@ class FleetTests(unittest.TestCase):
    if meth in ('thread/start','turn/start'):
     for k in ('approvalPolicy','sandbox','sandboxPolicy','approvalsReviewer','model'):
      self.assertNotIn(k,p)
+
+ def test_sidebar_automatic_and_retry_without_duplicate_thread(self):
+  c,d,_=self.setup_worker()
+  out=self.cli('dispatch','--coord',c,'--module','api',env=dict(self.env,FAKE_FAIL_SECTION='1'))
+  self.assertEqual(out['state'],'running');self.assertEqual(out['sidebar']['state'],'pending')
+  out=self.cli('reconcile','--coord',c,'--module','api')
+  self.assertEqual(out['sidebar'],dict(state='placed',sectionId='server-section-id'))
+  self.assertEqual(sum(x[0]=='thread/start' for x in self.db()['calls']),1)
+  count=sum(x[0]=='thread/section/move' for x in self.db()['calls'])
+  self.cli('reconcile','--coord',c,'--module','api')
+  self.assertEqual(sum(x[0]=='thread/section/move' for x in self.db()['calls']),count)
+ def test_sidebar_native_registration(self):
+  c,d,_=self.setup_worker(host='codex-app')
+  self.cli('register','--coord',c,'--module','api','--client-thread-id','pending')
+  self.assertFalse((self.root/'db.json').exists())
+  out=self.cli('register','--coord',c,'--module','api','--session-id','native')
+  self.assertEqual(out['sidebar']['state'],'placed')
 
 if __name__=='__main__':unittest.main(verbosity=2)

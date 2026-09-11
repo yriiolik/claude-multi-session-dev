@@ -51,8 +51,6 @@ Codex CLI 没有 App 原生任务工具时自动走 app-server；不要把工具
    worker prompt 和身份，CLI 路径还会预建独立 worktree；原生路径让 App 创建 worktree。
 5. 按路由派发。即时记录真实 thread/session ID；原生创建返回 `clientThreadId` 时仅记为 setup pending，
    等到真实 `threadId` 后再监控。不能把 client ID 当真实 ID，也不能因等待久而重复创建。
-   当前主端能调用 Codex 侧栏工具时，每个新建的 Codex worker（含 app-server 路径）都按
-   [sidebar-placement.md](reference/sidebar-placement.md) 自动移入用户的“子 session”分区。
    Claude Code / Codex CLI 主端跑在 Ghostty 里时，app-server 路径派发成功即自动在右侧分屏拉起只读面板
    `cc-fleet-panel-codex-app` 展示子 session（`CC_FLEET_PANEL=0` 关闭）；编排判断仍只看 `status` 与回执。
 6. Codex App 原生 worker 用 `wait_threads` + cursor 等待；跨客户端可订阅 Codex events，或使用

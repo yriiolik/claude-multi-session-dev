@@ -178,7 +178,7 @@ def register(a):
     if a.client_thread_id:
         emit(update(c,a.module,clientThreadId=a.client_thread_id,state='setting-up')); return
     if d.get('sessionId') and d['sessionId']!=a.session_id: raise ValueError('task already has a different threadId')
-    emit(update(c,a.module,sessionId=a.session_id,hostId=a.host_id,state='running',clientThreadId=None))
+    emit(sidebar_attach(c,update(c,a.module,sessionId=a.session_id,hostId=a.host_id,state='running',clientThreadId=None)))
 
 def claude_bin(): return os.environ.get('CLAUDE_CLI_PATH','claude')
 def claude_jobs():
@@ -186,9 +186,35 @@ def claude_jobs():
     if not isinstance(obj,list): raise ValueError('unsupported Claude agents JSON schema')
     return obj
 
+def sidebar_attach(c, d):
+    """Use server-owned sections, never private desktop UI state or worker prompts."""
+    if d.get('backend') != 'codex' or not d.get('sessionId'): return d
+    if d.get('hostId', 'local') != 'local':
+        result = dict(state='pending', reason='remote host requires its own app-server connection')
+    else:
+        try:
+            sections=[]; cursor=None; seen=set()
+            while True:
+                page=call('threadSection/list', dict(limit=100, **({'cursor':cursor} if cursor else {})))
+                sections.extend(page['data']); cursor=page.get('nextCursor')
+                if not cursor: break
+                if cursor in seen: raise ValueError('repeated section cursor')
+                seen.add(cursor)
+            matches=[x for x in sections if x.get('name')=='子 session']
+            if len(matches)!=1: raise ValueError('expected one existing 子 session section')
+            section_id=matches[0]['id']
+            previous=d.get('sidebar', {})
+            if previous.get('state')=='placed' and previous.get('sectionId')==section_id:
+                return d
+            call('thread/section/move', dict(threadId=d['sessionId'],sectionId=section_id))
+            result=dict(state='placed',sectionId=section_id)
+        except Exception as e:
+            result=dict(state='pending',reason=str(e))
+    return update(c,d['module'],sidebar=result)
+
 def panel_attach(c, d):
     """Codex app-server worker 派发成功后：登记面板注册表 + 在当前 Ghostty 窗口分屏拉起只读面板。
-    Codex worker 进不了 `claude agents`（它是 app-server 里的 thread），这块分屏是用户唯一能看到子 session 的地方。
+    Codex worker 进不了 `claude agents`（它是 app-server 里的 thread），这块分屏提供终端内的只读进度视图。
     尽力而为：面板脚本自己处理 Ghostty 没开/没授权/不是 macOS 的情况，绝不因面板让派发失败。
     CC_FLEET_PANEL=0 全局关掉；native（Codex App 主端）与 Claude 后端不走这里。"""
     if d.get('backend')!='codex' or d.get('transport')!='app-server' or os.environ.get('CC_FLEET_PANEL')=='0':
@@ -248,6 +274,7 @@ def dispatch(a):
         # Preserve a concurrently written bind/worktree update.
         d=update(c,m,**{k:v for k,v in d.items() if k not in ('module','worktree','branch')})
         # 记录先落盘再开面板：面板第一次扫描就能看到这个 worker。
+        d=sidebar_attach(c,d)
         emit(dict(d,panel=panel_attach(c,d)))
     except Exception:
         update(c,m,state='launch-uncertain')
@@ -406,7 +433,7 @@ def reconcile(a):
         t=call('thread/read',dict(threadId=sid,includeTurns=False))['thread']
         if d['transport']!='native' and Path(t.get('cwd','/')).resolve()!=Path(d['worktree']).resolve():
             raise ValueError('thread cwd does not match prepared worktree')
-        emit(update(c,a.module,sessionId=sid,state='running'))
+        emit(sidebar_attach(c,update(c,a.module,sessionId=sid,state='running')))
 
 def events(a):
     c=coord(a.coord); d=load(c,a.module)

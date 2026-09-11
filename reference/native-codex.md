@@ -21,8 +21,7 @@ Codex CLI 或 Claude 主端使用 app-server，不能写一个“调用 create_t
 核对同项目、唯一标题，取得真实 threadId 后更新登记。不要用 clientThreadId 调 read/wait/message。
 有相同候选时保持 setup pending 并核对，不重新创建。
 
-登记真实 threadId 后，先按 [sidebar-placement.md](sidebar-placement.md) 调用侧栏移动工具，
-将新建 worker 归入“子 session”分区。原生创建返回的 hostId 原样传入。
+登记真实 threadId 时原样传入 hostId。
 
 6. 调 `wait_threads`，传真实 threadId/hostId；最多8个目标，一次等待建议50秒，后续传返回 cursor。
    ready/inactive 不等于交付；完成时用 `status` 核验共享目录或临时 inbox 回执，再 `collect` 持久收存。

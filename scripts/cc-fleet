@@ -76,8 +76,30 @@ def permission_params(d, turn=False):
     return dict(approvalPolicy='never', **({'sandboxPolicy': {'type': 'dangerFullAccess'}}
                                          if turn else {'sandbox': 'danger-full-access'}))
 
+def default_backend(host):
+    # 未指定 --backend 时跟随主端（用户 2026-09-11 纠正）：Claude 主端派 Claude，Codex 主端派 Codex。
+    return 'claude' if host=='claude-code' else 'codex'
+
+def clean_subdir(s):
+    s=(s or '').strip().strip('/')
+    if s in ('','.'): return ''
+    if Path(s).is_absolute() or '..' in Path(s).parts: raise ValueError('subdir must be relative inside the repository')
+    return Path(s).as_posix()
+
+def toplevel(p):
+    return str(Path(git(Path(p).resolve(),'rev-parse','--show-toplevel')).resolve())
+
+def worktree_path(fleet, m):
+    # 不放 .git 内：Vite 等默认拒绝服务 **/.git/** 的文件；放仓库 .claude/worktrees 下沿用 Claude 目录信任。
+    return Path(fleet['repo'])/'.claude'/'worktrees'/f"fleet-{fleet['rq']}-{m}"
+
+def exclude_worktrees(fleet):
+    if run(['git','-C',fleet['repo'],'check-ignore','-q','.claude/worktrees/probe'],check=False).returncode==0: return
+    ex=Path(fleet['commonDir'])/'info'/'exclude'; ex.parent.mkdir(parents=True,exist_ok=True)
+    with ex.open('a') as f: f.write('\n.claude/worktrees/\n')
+
 def route(fleet):
-    # User's host-specific default; never send an OpenAI model to a third-party provider.
+    # Claude 主端显式派 Codex 时的固定路由；never send an OpenAI model to a third-party provider.
     if fleet['owner']['host']=='claude-code':
         return dict(active='claude-main-gpt6-low',mode='fixed',model='gpt-6-astra',
                     modelProvider='openai',reasoningEffort='low',providerType='openai')
@@ -88,6 +110,9 @@ def init(a):
     common=Path(git(repo,'rev-parse','--path-format=absolute','--git-common-dir')).resolve()
     base=a.base or git(repo,'symbolic-ref','--short','HEAD')
     sha=git(repo,'rev-parse','--verify',base+'^{commit}')
+    # 主 session 所在子目录（多项目仓库的子项目）；worker 默认在自己 worktree 的同一子目录启动，才能加载该目录规则。
+    try: subdir=clean_subdir(Path(a.cwd).resolve().relative_to(repo).as_posix())
+    except ValueError: subdir=''
     rq=name(a.rq or ('RQ-'+datetime.datetime.now().strftime('%Y%m%d-%H%M%S')+'-'+uuid.uuid4().hex[:8]))
     c=common/'fleet'/rq
     c.mkdir(parents=True,exist_ok=False)
@@ -97,74 +122,75 @@ def init(a):
     owner_id=a.owner_id or os.environ.get('CODEX_THREAD_ID' if a.host.startswith('codex') else 'CLAUDE_SESSION_ID')
     identity_source='session' if owner_id else 'generated-controller'
     owner_id=owner_id or ('controller-'+uuid.uuid4().hex)
-    d=dict(version=2,rq=rq,repo=str(repo),commonDir=str(common),base=base,baseCommit=sha,
+    d=dict(version=2,rq=rq,repo=str(repo),commonDir=str(common),subdir=subdir,base=base,baseCommit=sha,
            integrationBranch='fleet/'+rq,inboxRoot=str((Path(tempfile.gettempdir())/'fleet-v2-inbox'/rq).resolve()),owner={'host':a.host,'id':owner_id,'identitySource':identity_source},createdAt=time.time())
     atomic(c/'fleet.json',d); (c/'base.ref').write_text(base+'\n')
     emit(dict(d,coord=str(c),uncommittedChangesExcluded=bool(git(repo,'status','--porcelain'))))
 
 def preamble(c,d):
-    fleet=meta(c)
-    return f'''⟦FLEET-WORKER⟧ rq={fleet['rq']} module={d['module']} role={d['role']} backend={d['backend']}
-你是独立 worker，不加载 multi-session-dev / multi-thread-dev 编排技能，不继续派发 worker。
-主 session: {json.dumps(fleet['owner'],ensure_ascii=False)}。只完成下面任务卡授权的范围。
-协调目录: {c}
-任务身份: {d['attempt']}（回执 attempt 必须完全一致）
-集成分支: {fleet['integrationBranch']}
-工作目录: {d.get('worktree') or 'Codex App 为本任务创建的全新隔离 worktree'}
-开始时核验自己在本仓库的独立 worktree，不能在主 checkout 修改文件。
-若 App worktree 尚未从集成分支开始，先确认工作树干净，再 git switch --detach {fleet['integrationBranch']}。
-禁止 reset --hard、清理别人的 worktree 或覆盖未提交修改。然后调用：
-{shlex.quote(str(ROOT/'cc-fleet'))} bind --coord {shlex.quote(str(c))} --module {d['module']} --worktree "$PWD"
-若 bind 因共享协调目录只读而失败，不阻断业务任务；在回执 worktree 中写真实工作目录，主端会验证后绑定。
-若修改本工作树 Git 元数据确需审批，使用宿主审批工具申请本任务必要权限；无可用审批通道则报告 blocked。
-遵守工作目录适用的 AGENTS.md / CLAUDE.md；不要假定对端工具存在，不需要 SendMessage/Monitor。
-角色 {d['role']}：developer 在范围内开发、自测、提交后运行 {shlex.quote(str(ROOT/'cc-fleet-land'))} {fleet['rq']}；
-scout/verify/integ 不修改业务代码、不提交合回，只执行任务卡要求的探查或验收。
-不要推远端、合回共享分支或删除 worktree。遇到范围/权限问题写 blocked 回执，说明所需输入。
-需求与验收：开工先读任务卡引用的原始需求、用户用例和契约；有本次参考资料时一并核对；压缩/恢复后重新读取。
-若实现/验收卡缺少用例或本次需求明确依赖的输入，报告缺项，不自行缩减需求；探查/契约阶段可先补齐输入。未提供或指定 demo/原型不属于缺项，不要求用户补充。
-开发自测按用例映射证据；verify/integ 在真实集成页面连续跑核心主流程，再逐项验证适用分支/异常、幂等和事务。
-API/单测或 mock 自己业务 API 的页面不能替代真实页面验收；纯接口/CLI 无页面时记录不适用理由。
-验收证据记录用例、实际操作/结果、截图或 trace 路径、实际基线 SHA/环境；失败/阻塞/未执行不得报通过。
-测试失败须如实写 tests.result=failed 并 result=failed 或 blocked，不得藏进 risks、改写 not-run 或删除断言来取得 done。
-完成时优先把以下 JSON 原子写到 {c/(d['module']+'.receipt.json')}（临时文件+rename）。
-若协调目录不可写，则 mkdir -p 创建临时回执父目录，改写 {inbox(c,d)}；两者任一写成功即完成回执步骤，
-不因协调目录只读而将已成功的任务标 blocked。主端会核验临时回执并收存；最后回复相同 JSON（含真实 worktree）。
-{{"version":2,"rq":"{fleet['rq']}","module":"{d['module']}","attempt":"{d['attempt']}",
- "worktree":"实际 worktree 的绝对路径","result":"done|failed|blocked","summary":"真实完成内容/问题","commit":"开发提交或 verify/integ 实际验收的完整 SHA，scout 可空",
- "tests":[{{"command":"实际执行的检查","result":"passed|failed|blocked|not-run","evidence":"结果文件路径或简短输出"}}],
- "risks":[],"needsInput":[]}}
-也可附加 {c/(d['module']+'.summary.md')} 方便人工查看。只做了计划不能报 done。
+    # 只放本任务独有的数据与不可推导的边界；项目规则交给客户端按启动目录自动加载的 CLAUDE.md / AGENTS.md。
+    fleet=meta(c); role=d['role']; rq=fleet['rq']
+    if d['transport']=='native':
+        where=(f"在 App 新建的隔离 worktree 内工作；若它尚未基于集成分支，确认工作树干净后 git switch --detach {fleet['integrationBranch']}"
+               +(f"，再 cd {d['subdir']}" if d.get('subdir') else '')+'。')
+    else:
+        where=f"工作目录 {d['cwd']}（worktree 根 {d['worktree']}），不在主 checkout 改文件。"
+    if d.get('permissions')=='inherit': where+='Git 元数据写入需审批时用宿主审批工具申请，无通道则报 blocked。'
+    if role=='developer':
+        duty=f"developer：只在范围内开发，按用例自测并留证据，提交后运行 {shlex.quote(str(ROOT/'cc-fleet-land'))} {rq}。"
+    else:
+        duty=f'{role}：不改业务代码、不提交合回。'
+        if role in ('verify','integ'):
+            duty+=('在含全部改动的集成版本上用真实页面先连续跑核心主流程，再逐项验证适用分支/异常、幂等和事务；'
+                   'API/单测或 mock 自家业务 API 不能替代页面验收，纯接口/CLI 需求记录不适用理由；'
+                   '逐例记录操作、结果、截图或 trace 路径、基线 SHA/环境。')
+    return f'''⟦FLEET-WORKER⟧ rq={rq} module={d['module']} role={role} backend={d['backend']}
+你是独立 worker：不加载 multi-session-dev 编排技能、不再派发 worker，只做任务卡授权的范围。主 session：{fleet['owner']['id']}。
+协调目录 {c}；任务身份 {d['attempt']}（回执 attempt 须一致）；集成分支 {fleet['integrationBranch']}。
+{where}
+开工先运行 {shlex.quote(str(ROOT/'cc-fleet'))} bind --coord {shlex.quote(str(c))} --module {d['module']} --worktree "$PWD"；协调目录只读致失败时不阻断，回执里写真实 worktree。
+规则以启动目录适用的 CLAUDE.md / AGENTS.md 为准（客户端已按目录自动加载）；AGENTS.md 只是指针时按指针读取对应文件；任务涉及其他子项目时先读该子目录的规则文件。
+{duty}
+禁止 reset --hard、推远端、合回共享分支、删除或清理 worktree；范围/权限问题写 blocked 回执并说明所需输入。
+开工及压缩恢复后先读任务卡引用的原始需求、用户用例、契约（及本次参考资料）；实现/验收卡缺用例或必需输入时报告缺项，不自行缩减需求。
+失败如实写 tests.result=failed 且 result=failed/blocked，不藏进 risks、不改 not-run、不删断言；只做了计划不能报 done。
+完成时把下列 JSON 原子写到 {c/(d['module']+'.receipt.json')}（临时文件+rename）；该目录不可写就 mkdir -p 后改写 {inbox(c,d)}，任一成功即可；最后回复同一 JSON。
+{{"version":2,"rq":"{rq}","module":"{d['module']}","attempt":"{d['attempt']}","worktree":"worktree 根绝对路径","result":"done|failed|blocked","summary":"真实完成内容/问题","commit":"开发提交或实际验收的完整 SHA，scout 可空","tests":[{{"command":"实际执行的检查","result":"passed|failed|blocked|not-run","evidence":"结果文件路径或简短输出"}}],"risks":[],"needsInput":[]}}
 \n任务卡：\n'''
 
 def prepare(a):
     c=coord(a.coord); fleet=meta(c); m=name(a.module)
-    a.backend=a.backend or 'codex'
+    a.backend=a.backend or default_backend(fleet['owner']['host'])
     transport=a.transport
     if transport=='auto': transport='native' if fleet['owner']['host']=='codex-app' and a.backend=='codex' and a.permissions=='inherit' else ('app-server' if a.backend=='codex' else 'claude-bg')
     if (a.backend=='claude' and transport!='claude-bg') or (a.backend=='codex' and transport not in ('native','app-server')):
         raise ValueError('backend/transport mismatch')
     if transport=='native' and fleet['owner']['host']!='codex-app': raise ValueError('native requires a Codex App main session')
     if transport=='native' and a.permissions=='full': raise ValueError('native cannot set full permissions; use app-server or --permissions inherit')
+    subdir=clean_subdir(fleet.get('subdir','') if a.subdir is None else a.subdir)
+    if subdir and run(['git','-C',fleet['repo'],'cat-file','-e',f"{fleet['integrationBranch']}:{subdir}"],check=False).returncode:
+        raise ValueError(f'subdir not found on integration branch: {subdir}')
     task=Path(a.task).resolve().read_text()
     if not task.strip(): raise ValueError('empty task card')
     with lock(c,m):
         if record(c,m).exists(): raise ValueError('module already registered; use reply, or a new fix module')
         d=dict(version=2,module=m,backend=a.backend,transport=transport,role=a.role,permissions=a.permissions,
                attempt=uuid.uuid4().hex,state='prepared',name=f'↳{m}@{fleet["rq"]}',createdAt=time.time(),
-               sessionId=None,shortId=None,worktree=None,branch=None,baselineCommit=git(fleet['repo'],'rev-parse',fleet['integrationBranch']))
+               sessionId=None,shortId=None,worktree=None,branch=None,subdir=subdir,cwd=None,
+               baselineCommit=git(fleet['repo'],'rev-parse',fleet['integrationBranch']))
         if transport!='native':
-            wt=Path(fleet['commonDir'])/'fleet-worktrees'/fleet['rq']/m
+            wt=worktree_path(fleet,m); exclude_worktrees(fleet)
             branch=f'fleet-worker/{fleet["rq"]}/{m}'
             git(fleet['repo'],'worktree','add','-b',branch,str(wt),fleet['integrationBranch'])
-            d.update(worktree=str(wt),branch=branch)
+            d.update(worktree=str(wt),branch=branch,cwd=str(wt/subdir) if subdir else str(wt))
         atomic(record(c,m),d)
         prompt=preamble(c,d)+task
         (c/f'{m}.prompt.md').write_text(prompt)
     emit(dict(d,coord=str(c),promptFile=str(c/f'{m}.prompt.md'),integrationBranch=fleet['integrationBranch']))
 
 def bind(a):
-    c=coord(a.coord); f=meta(c); wt=Path(a.worktree).resolve()
+    # worker 在子项目目录启动，$PWD 可能是子目录；一律规整到 worktree 根。
+    c=coord(a.coord); f=meta(c); wt=Path(toplevel(a.worktree))
     if wt==Path(f['repo']).resolve(): raise ValueError('worker must not use primary checkout')
     if Path(git(wt,'rev-parse','--path-format=absolute','--git-common-dir')).resolve()!=Path(f['commonDir']): raise ValueError('wrong repository')
     # Require the full current integration baseline, not simply a branch with a familiar name.
@@ -186,6 +212,7 @@ def register(a):
     if d.get('sessionId') and d['sessionId']!=a.session_id: raise ValueError('task already has a different threadId')
     emit(sidebar_attach(c,update(c,a.module,sessionId=a.session_id,hostId=a.host_id,state='running',clientThreadId=None)))
 
+def workdir(d): return d.get('cwd') or d['worktree']
 def claude_bin(): return os.environ.get('CLAUDE_CLI_PATH','claude')
 def claude_jobs():
     obj=json.loads(run([claude_bin(),'agents','--json','--all']).stdout)
@@ -253,16 +280,18 @@ def dispatch(a):
                 for field in ('model','effort'):
                     if profile.get(field): args+=['--'+field,str(profile[field])]
             args += [prompt]
-            p=run(args,cwd=d['worktree'],timeout=55,check=False)
+            # 在子项目目录启动：Claude 按启动目录向上加载 CLAUDE.md，根目录启动会漏掉子项目规则。
+            p=run(args,cwd=workdir(d),timeout=55,check=False)
             # Reconcile through public JSON, not localized launch output or session-name prefixes.
-            hits=[j for j in claude_jobs() if j.get('name')==d['name'] and Path(j.get('cwd','/')).resolve()==Path(d['worktree']).resolve()]
+            hits=[j for j in claude_jobs() if j.get('name')==d['name'] and Path(j.get('cwd','/')).resolve()==Path(workdir(d)).resolve()]
             if len(hits)!=1 or not hits[0].get('id'):
                 raise RuntimeError('launch outcome uncertain; inspect claude agents --json --all; do not redispatch')
             j=hits[0]; d.update(shortId=j['id'],sessionId=j.get('sessionId'),state='running')
         else:
             routing=route(meta(c)); d['routing']=routing
             # Apply fleet permission preference explicitly at thread and turn boundaries.
-            params=dict(cwd=d['worktree'],ephemeral=False,serviceName='multi-session-dev-v2',threadSource='user')
+            # Codex 只加载 git 根到 cwd 路径上的 AGENTS.md，cwd 必须是子项目目录。
+            params=dict(cwd=workdir(d),ephemeral=False,serviceName='multi-session-dev-v2',threadSource='user')
             if routing.get('model'): params['model']=routing['model']
             if routing.get('modelProvider'): params['modelProvider']=routing['modelProvider']
             if routing.get('providerType')=='deepseek': params['serviceTier']=None
@@ -272,7 +301,7 @@ def dispatch(a):
             # Persist ID before any subsequent RPC; a failed reply must never duplicate this thread.
             update(c,m,sessionId=d['sessionId'],routing=routing)
             call('thread/name/set',dict(threadId=d['sessionId'],name=d['name']))
-            turn=dict(threadId=d['sessionId'],cwd=d['worktree'],input=[dict(type='text',text=prompt)])
+            turn=dict(threadId=d['sessionId'],cwd=workdir(d),input=[dict(type='text',text=prompt)])
             if routing.get('reasoningEffort'): turn['effort']=routing['reasoningEffort']
             if routing.get('providerType')=='deepseek': turn.update(serviceTier=None,summary='none')
             turn.update(permission_params(d, turn=True))
@@ -297,6 +326,8 @@ def receipt(c,d):
         return dict(result='needs-review',summary='invalid receipt')
     if r['result']=='done':
         wt=r.get('worktree') or d.get('worktree')
+        if wt and Path(wt).is_dir():
+            with contextlib.suppress(RuntimeError): wt=toplevel(wt)
         f=meta(c)
         if not wt or Path(wt).resolve()==Path(f['repo']).resolve():
             return dict(result='needs-review',summary='missing independent worktree')
@@ -395,7 +426,7 @@ def reply(a):
                 params['expectedTurnId']=latest['id']; call('turn/steer',params)
             else:
                 call('thread/resume',dict(threadId=d['sessionId'], **permission_params(d)))
-                if d.get('worktree'): params['cwd']=d['worktree']
+                if d.get('worktree'): params['cwd']=workdir(d)
                 routing=d.get('routing',{})
                 if routing.get('reasoningEffort'): params['effort']=routing['reasoningEffort']
                 if routing.get('providerType')=='deepseek': params.update(serviceTier=None,summary='none')
@@ -431,7 +462,8 @@ def collect(a):
     if r.get('worktree') and not d.get('worktree'):
         # receipt() has verified repository identity and prepared baseline for done.
         if r['result']=='done':
-            update(c,a.module,worktree=str(Path(r['worktree']).resolve()),branch=git(r['worktree'],'rev-parse','--abbrev-ref','HEAD'))
+            wt=toplevel(r['worktree'])
+            update(c,a.module,worktree=wt,cwd=str(Path(wt)/d['subdir']) if d.get('subdir') else wt,branch=git(wt,'rev-parse','--abbrev-ref','HEAD'))
     atomic(c/(d['module']+'.receipt.json'),r)
     emit(dict(result=r['result'],receiptFile=str(c/(d['module']+'.receipt.json'))))
 
@@ -439,14 +471,14 @@ def collect(a):
 def reconcile(a):
     c=coord(a.coord); d=load(c,a.module)
     if d['backend']=='claude':
-        hits=[j for j in claude_jobs() if j.get('name')==d['name'] and Path(j.get('cwd','/')).resolve()==Path(d['worktree']).resolve()]
+        hits=[j for j in claude_jobs() if j.get('name')==d['name'] and Path(j.get('cwd','/')).resolve()==Path(workdir(d)).resolve()]
         if len(hits)!=1: raise ValueError('cannot uniquely reconcile worker; inspect public session list')
         j=hits[0]; emit(update(c,a.module,shortId=j['id'],sessionId=j.get('sessionId'),state='running'))
     else:
         sid=a.session_id or d.get('sessionId')
         if not sid: raise ValueError('supply --session-id from the verified Codex task list')
         t=call('thread/read',dict(threadId=sid,includeTurns=False))['thread']
-        if d['transport']!='native' and Path(t.get('cwd','/')).resolve()!=Path(d['worktree']).resolve():
+        if d['transport']!='native' and Path(t.get('cwd','/')).resolve()!=Path(workdir(d)).resolve():
             raise ValueError('thread cwd does not match prepared worktree')
         emit(sidebar_attach(c,update(c,a.module,sessionId=sid,state='running')))
 
@@ -469,7 +501,9 @@ def parser():
         if cmd not in ('status','wait'): q.add_argument('--module',required=True,type=name)
         if cmd=='prepare':
             q.add_argument('--permissions',choices=('full','inherit'),default='full',help='worker permissions (default: full); inherit preserves backend configuration')
-            q.add_argument('--backend',choices=('codex','claude')); q.add_argument('--transport',default='auto',choices=('auto','native','app-server','claude-bg'))
+            q.add_argument('--backend',choices=('codex','claude'),help='default follows host: claude-code -> claude, codex-* -> codex')
+            q.add_argument('--transport',default='auto',choices=('auto','native','app-server','claude-bg'))
+            q.add_argument('--subdir',help='worker start dir relative to repo root (default: subdir of init --cwd; "" for repo root)')
             q.add_argument('--task',required=True); q.add_argument('--role',default='developer',choices=('developer','scout','verify','integ'))
         if cmd=='dispatch': q.add_argument('--profile',default='worker')
         if cmd=='register':

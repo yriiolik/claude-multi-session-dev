@@ -30,10 +30,11 @@ description: >-
 | claude-code | codex | `cc-fleet` → Codex app-server |
 | claude-code | claude | `cc-fleet` → Claude 公开后台 CLI |
 
-用户明确指定 worker 后端时服从；未指定时默认使用 Codex worker。同一 RQ 可以混用两个 backend。
-**用户偏好（2026-09-11）：Claude Code 主端调用本技能时，默认派 Codex 子 session，模型 `gpt-6-astra`、
-思考档 `low`、provider `openai`。** 由脚本在新派发时执行，后续 reply 沿用登记的 routing；不要改 Claude
-主 session 自己的模型，也不要将 GPT-6 名称传给 Claude 后端。用户明确指定 Claude worker 时仍可使用 Claude 后端。
+用户明确指定 worker 后端时服从；**未指定时跟随主端**：Claude Code 主端默认派 Claude worker（`claude --bg`，
+模型按 `~/.claude/multi-session-dev.json`），Codex 主端默认派 Codex worker。同一 RQ 可以混用两个 backend。
+（2026-09-11 用户纠正：v2 曾把 Claude 主端未指定时默认成 Codex，属误改，不要恢复。）
+Claude Code 主端**明确要求** Codex worker 时，脚本固定使用 `gpt-6-astra` / `low` / provider `openai`，
+后续 reply 沿用登记的 routing；不要改 Claude 主 session 自己的模型，也不要将 GPT-6 名称传给 Claude 后端。
 Codex CLI 没有 App 原生任务工具时自动走 app-server；不要把工具名称当作所有客户端都提供的能力。
 使用前读取 [v2-commands.md](reference/v2-commands.md)。Codex App 原生路径另读
 [native-codex.md](reference/native-codex.md)，跨客户端路径读 [backends-v2.md](reference/backends-v2.md)。
@@ -62,7 +63,9 @@ Codex CLI 没有 App 原生任务工具时自动走 app-server；不要把工具
 3. `cc-fleet init` 创建唯一 RQ、协调目录、`fleet/<RQ>` 集成分支，并记录主端及可用的真实会话 ID；不可取得时使用明确标识的 controller ID，不能冒充真实会话 ID。
    只包含 base 的已提交内容；若用户要求包含未提交改动，先做受控快照，不擅自丢弃或提交用户改动。
 4. 派实现卡前将用户用例和方案落盘；任务卡写清范围、原始来源、用例锚点、依赖契约、自测、L1/L2 追溯（项目需要时）、验收口径。`prepare` 生成统一
-   worker prompt 和身份，CLI 路径还会预建独立 worktree；原生路径让 App 创建 worktree。
+   worker prompt 和身份，CLI 路径还会预建独立 worktree（`<repo>/.claude/worktrees/fleet-<RQ>-<module>`）；原生路径让 App 创建 worktree。
+   worker 在 worktree 内与主 session 相同的子目录启动（取 `init --cwd` 相对仓库根的路径，跨子项目的卡用
+   `prepare --subdir` 覆盖），客户端才会自动加载该子项目的 CLAUDE.md / AGENTS.md；从根目录启动会漏掉子项目规则。
 5. 按路由派发。即时记录真实 thread/session ID；原生创建返回 `clientThreadId` 时仅记为 setup pending，
    等到真实 `threadId` 后再监控。不能把 client ID 当真实 ID，也不能因等待久而重复创建。
    Claude Code / Codex CLI 主端跑在 Ghostty 里时，app-server 路径派发成功即自动在右侧分屏拉起只读面板
@@ -86,7 +89,7 @@ Codex CLI 没有 App 原生任务工具时自动走 app-server；不要把工具
 - `cc-fleet` v2 名册包含 host/owner、backend/transport、真实 ID、worktree、attempt，不能混用旧 `.sid` 名册。
 - 每个开发 worker 使用独立 worktree；从集成基线开始，提交后用现有 `cc-fleet-land` 的 CAS 合回机制。
   不在已有目录执行 `reset --hard`，不让 worker 清理自己的 worktree；完成前先保证 commit 可追溯。
-- 模型/provider 除上述 Claude 主端 GPT-6 low 偏好外沿用各后端配置。其他主端的 Codex app-server 复用现有 session 路由；原生 App 沿用保存项目默认，
+- 模型/provider 除上述 Claude 主端显式派 Codex 的 GPT-6 low 路由外沿用各后端配置。其他主端的 Codex app-server 复用现有 session 路由；原生 App 沿用保存项目默认，
   若用户要求独立 provider 路由则选择 app-server。不把后端 A 的模型名/effort 强塞给后端 B。
 - 用户偏好（2026-09-11）：worker 默认开放权限。Codex app-server 在启动、恢复及新 turn 显式设置完整访问和无需审批；Claude 新 worker 使用 `--dangerously-skip-permissions`。`prepare --permissions inherit` 可改为继承后端配置。开放权限不扩大任务授权，不代表允许推送、发布或删除成果；宿主若仍拒绝执行，应报告 blocked。
 - 不把整份用户级 CLAUDE.md 强行提升为 Codex developer instructions。两端读取各自适用的项目规则，

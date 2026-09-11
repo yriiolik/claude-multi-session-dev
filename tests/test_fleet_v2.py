@@ -191,9 +191,10 @@ class FleetTests(unittest.TestCase):
   self.cli('register','--coord',c,'--module','api','--session-id','native')
   self.receipt(c,d,worktree=str(wt));self.cli('collect','--coord',c,'--module','api')
   self.assertEqual(json.loads((c/'v2/api.json').read_text())['worktree'],str(wt.resolve()))
- def test_claude_main_defaults_gpt6_low_and_preserves_resume(self):
+ def test_claude_main_explicit_codex_uses_gpt6_low_and_preserves_resume(self):
+  # 2026-09-11 用户纠正需求：Claude 主端未指定时默认派 Claude；gpt-6-astra/low 只作用于显式 --backend codex。
   f=self.cli('init','--cwd',self.repo,'--host','claude-code','--owner-id','main')
-  c=pathlib.Path(f['coord']);d=self.cli('prepare','--coord',c,'--module','api','--task',self.task)
+  c=pathlib.Path(f['coord']);d=self.cli('prepare','--coord',c,'--module','api','--backend','codex','--task',self.task)
   self.assertEqual(d['backend'],'codex');self.assertEqual(d['transport'],'app-server')
   self.cli('dispatch','--coord',c,'--module','api')
   calls=self.db()['calls'];start=next(p for m,p in calls if m=='thread/start');turn=next(p for m,p in calls if m=='turn/start')
@@ -242,5 +243,56 @@ class FleetTests(unittest.TestCase):
   self.assertFalse((self.root/'db.json').exists())
   out=self.cli('register','--coord',c,'--module','api','--session-id','native')
   self.assertEqual(out['sidebar']['state'],'placed')
+
+ def test_default_backend_follows_host(self):
+  for host,backend,transport in [('claude-code','claude','claude-bg'),('codex-cli','codex','app-server'),('codex-app','codex','app-server')]:
+   with self.subTest(host=host):
+    f=self.cli('init','--cwd',self.repo,'--host',host,'--owner-id','main');c=pathlib.Path(f['coord'])
+    d=self.cli('prepare','--coord',c,'--module','api','--task',self.task)
+    self.assertEqual((d['backend'],d['transport']),(backend,transport))
+  # Claude 主端未指定后端：派发走 claude --bg，绝不启动 Codex thread
+  f=self.cli('init','--cwd',self.repo,'--host','claude-code','--owner-id','main');c=pathlib.Path(f['coord'])
+  self.cli('prepare','--coord',c,'--module','ui','--task',self.task);self.cli('dispatch','--coord',c,'--module','ui')
+  calls=self.db()['calls'];self.assertTrue(any('--bg' in x for x in calls));self.assertFalse(any(x[0]=='thread/start' for x in calls))
+ def commit_subproject(self):
+  sub=self.repo/'factory';sub.mkdir();(sub/'CLAUDE.md').write_text('sub rules');(sub/'AGENTS.md').write_text('sub pointer')
+  self.git('add','.');self.git('commit','-m','subproject');return sub
+ def test_worker_starts_in_host_subdir_and_normalizes_worktree(self):
+  sub=self.commit_subproject()
+  f=self.cli('init','--cwd',sub,'--host','claude-code','--owner-id','main');c=pathlib.Path(f['coord'])
+  self.assertEqual(f['subdir'],'factory')
+  d=self.cli('prepare','--coord',c,'--module','ui','--role','scout','--task',self.task);wt=pathlib.Path(d['worktree'])
+  self.assertEqual(d['cwd'],str(wt/'factory'));self.assertTrue((wt/'factory'/'CLAUDE.md').exists())
+  self.assertIn('工作目录 '+d['cwd'],(c/'ui.prompt.md').read_text())
+  self.cli('dispatch','--coord',c,'--module','ui')
+  self.assertEqual(pathlib.Path(self.db()['jobs'][-1]['cwd']).resolve(),pathlib.Path(d['cwd']).resolve())
+  self.assertEqual(self.cli('reconcile','--coord',c,'--module','ui')['state'],'running')
+  self.assertEqual(self.cli('bind','--coord',c,'--module','ui','--worktree',d['cwd'])['worktree'],d['worktree'])
+  self.receipt(c,d,worktree=d['cwd']);self.assertEqual(self.cli('status','--coord',c)['jobs'][0]['state'],'done')
+  # Codex 同样从子项目目录起 thread 与 turn（Codex 只加载 git 根到 cwd 路径上的 AGENTS.md）
+  d2=self.cli('prepare','--coord',c,'--module','api','--backend','codex','--task',self.task);self.cli('dispatch','--coord',c,'--module','api')
+  calls=self.db()['calls'];start=next(x[1] for x in calls if x[0]=='thread/start');turn=next(x[1] for x in calls if x[0]=='turn/start')
+  self.assertEqual((start['cwd'],turn['cwd']),(d2['cwd'],d2['cwd']))
+ def test_subdir_override_and_validation(self):
+  sub=self.commit_subproject()
+  f=self.cli('init','--cwd',sub,'--host','claude-code','--owner-id','main');c=pathlib.Path(f['coord'])
+  d=self.cli('prepare','--coord',c,'--module','root','--subdir','','--task',self.task);self.assertEqual(d['cwd'],d['worktree'])
+  self.cli('prepare','--coord',c,'--module','bad','--subdir','nope','--task',self.task,ok=False)
+  self.cli('prepare','--coord',c,'--module','esc','--subdir','../x','--task',self.task,ok=False)
+  self.assertFalse((self.repo/'.claude'/'worktrees'/f"fleet-{f['rq']}-bad").exists())
+ def test_worktree_outside_git_dir_and_excluded(self):
+  c,d,f=self.setup_worker(backend='claude')
+  self.assertNotIn('/.git/',d['worktree']);self.assertTrue(d['worktree'].startswith(str(pathlib.Path(f['repo'])/'.claude'/'worktrees')+'/'))
+  self.assertEqual(self.git('status','--porcelain'),'')
+  self.setup_worker(backend='claude',module='ui')
+  ex=(pathlib.Path(f['commonDir'])/'info'/'exclude').read_text();self.assertEqual(ex.count('.claude/worktrees/'),1)
+ def test_preamble_is_role_and_transport_specific(self):
+  c,d,_=self.setup_worker(backend='claude');p=(c/'api.prompt.md').read_text()
+  self.assertIn('cc-fleet-land',p);self.assertIn(d['attempt'],p);self.assertIn('CLAUDE.md / AGENTS.md',p);self.assertNotIn('git switch --detach',p)
+  # 绝对路径归一为 P 后比较：旧版前缀约 1740 字，精简后约 1140–1210 字；防止退回旧体量
+  import re;self.assertLess(len(re.sub(r"/[^\s；，。（）\"']+",'P',p.split('\n任务卡：\n')[0])),1300)
+  c2,_,_=self.setup_worker(backend='claude',role='verify',module='ver');p2=(c2/'ver.prompt.md').read_text()
+  self.assertNotIn('cc-fleet-land',p2);self.assertIn('真实页面',p2)
+  c3,_,_=self.setup_worker(host='codex-app',module='nat');self.assertIn('git switch --detach',(c3/'nat.prompt.md').read_text())
 
 if __name__=='__main__':unittest.main(verbosity=2)

@@ -18,8 +18,14 @@
 "$FLEET" stop --coord "$COORD" --module api
 ```
 
-`prepare` 省略 --backend 时使用 codex。Claude Code 主端的新 Codex worker 固定使用用户偏好的
-`gpt-6-astra` / `low` / `openai`；后续 reply 保持已保存 routing，显式 --backend claude 不受此偏好影响。
+`prepare` 省略 --backend 时跟随主端：`claude-code` → claude，`codex-app` / `codex-cli` → codex。
+Claude Code 主端显式 `--backend codex` 时固定使用 `gpt-6-astra` / `low` / `openai`；后续 reply 保持已保存 routing。
+
+worktree 建在 `<repo>/.claude/worktrees/fleet-<RQ>-<module>`（该路径未被忽略时自动写入 `.git/info/exclude`），
+不放 `.git/` 内：Vite 等开发服务器默认拒绝服务 `**/.git/**`。worker 启动目录（名册 `cwd`）取 `init --cwd`
+相对仓库根的子目录；`prepare --subdir <相对路径>` 按卡覆盖，`--subdir ''` 为仓库根。Claude 与 Codex 都只加载
+git 根到启动目录路径上的 CLAUDE.md / AGENTS.md（2026-09-11 实测；不会越过 worktree 根读到主 checkout），
+所以子项目卡必须从子项目目录启动。`bind` 与回执里的子目录路径统一规整为 worktree 根。
 
 `prepare --transport auto` 根据明确 host/backend 选择路径，不靠环境变量猜宿主。可强制
 `--transport app-server` / `claude-bg` / `native`（原生仅 Codex App + Codex）。`--role` 为

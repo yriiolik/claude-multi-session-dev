@@ -2,8 +2,9 @@
 
 ## Claude 后台 session（两个主端都能调用）
 
-`cc-fleet prepare --backend claude` 从集成分支创建独立 worktree，再由 `dispatch` 在该目录调用
-`claude --bg --name ... <完整prompt>`。已有 linked worktree 不再自动创建第二层 worktree。
+`cc-fleet prepare --backend claude`（Claude Code 主端省略 --backend 时也走这里）从集成分支创建独立 worktree，
+再由 `dispatch` 在其子项目启动目录（名册 `cwd`）调用 `claude --bg --name ... <完整prompt>`，
+这样 Claude 启动即加载 worktree 根与子项目的 CLAUDE.md。已有 linked worktree 不再自动创建第二层 worktree。
 默认附加 `--dangerously-skip-permissions`，显式 `--permissions inherit` 时省略。
 派发后用 `claude agents --json --all` 按唯一任务名称和准确 cwd 解析后台 short ID、真实 sessionId。
 名称仅用于启动结果关联，后续管理使用 ID；stdout 文案/语言变化不影响关联。
@@ -18,7 +19,8 @@ reply 协议失败明确报错，用户可 `claude attach <shortId>` 手工接�
 
 ## Codex app-server（两个主端/CLI 都能调用）
 
-v2 预建 worktree，从该真实目录 thread/start，再 turn/start。不使用“先挂主目录、后覆盖 cwd”的侧栏技巧，
+v2 预建 worktree，从其子项目启动目录（名册 `cwd`）thread/start，再 turn/start；Codex 只加载 git 根到 cwd
+路径上的 AGENTS.md，子目录 AGENTS.md 只是指针时由 worker 按统一前缀要求读取所指文件。不使用“先挂主目录、后覆盖 cwd”的侧栏技巧，
 不临时 pin，不强行注入用户级 CLAUDE.md。独立 session 为非 ephemeral、有清晰名称。
 派发脚本通过服务端分区 API 自动归入“子 session”；任务是否成功以 API 和回执为准。
 
@@ -28,7 +30,7 @@ v2 预建 worktree，从该真实目录 thread/start，再 turn/start。不使�
 只提示不报错，绝不因面板让派发失败。`CC_FLEET_PANEL=0` 全局关掉。native 路径（Codex App 主端）不开面板。
 
 传输复用 `cc-codex-app-call`，它通过官方 `codex app-server proxy` 使用 WebSocket handshake。
-权限默认开放：Codex 的 thread/start、thread/resume 使用 `approvalPolicy=never` 和 `sandbox=danger-full-access`，turn/start 使用 `approvalPolicy=never` 和 `sandboxPolicy={"type":"dangerFullAccess"}`。`--permissions inherit` 不传权限覆盖。Claude Code 主端的新 Codex worker 使用用户指定的 `gpt-6-astra` / `low` / `openai`；
+权限默认开放：Codex 的 thread/start、thread/resume 使用 `approvalPolicy=never` 和 `sandbox=danger-full-access`，turn/start 使用 `approvalPolicy=never` 和 `sandboxPolicy={"type":"dangerFullAccess"}`。`--permissions inherit` 不传权限覆盖。Claude Code 主端显式派的 Codex worker 使用用户指定的 `gpt-6-astra` / `low` / `openai`；
 其他主端沿用原有 session route 的 model/modelProvider/effort。不会把 GPT-6 发到 DeepSeek provider。
 模型不可用时报告实际错误，不静默更换模型；本偏好不修改全局配置或已有 session 的 routing。
 DeepSeek 特例继续省去 priority 和 reasoning summary。threadId 在 turn/start 前落盘，避免后续 RPC 失败丢身份。

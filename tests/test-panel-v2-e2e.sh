@@ -9,12 +9,13 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 FLEET="$ROOT/scripts/cc-fleet"
 PANEL="$ROOT/scripts/cc-fleet-panel-codex-app"
 T="$(mktemp -d)"
-trap 'rm -rf "$T"; rm -rf "${TMPDIR:-/tmp}/fleet-v2-inbox/RQ-panel-v2-e2e" "${TMPDIR:-/tmp}/fleet-v2-inbox/RQ-panel-v2-e2e-c"' EXIT
+trap 'rm -rf "$T"; rm -rf "${TMPDIR:-/tmp}/fleet-v2-inbox/RQ-panel-v2-e2e" "${TMPDIR:-/tmp}/fleet-v2-inbox/RQ-panel-v2-e2e-c" "${TMPDIR:-/tmp}/fleet-v2-inbox/RQ-panel-v2-e2e-b"' EXIT
 PASS=0; FAIL=0; CASE="init"
 ok(){ PASS=$((PASS+1)); }
 fail(){ echo "✗ [$CASE] $1"; FAIL=$((FAIL+1)); }
 assert_eq(){ [[ "$1" == "$2" ]] && ok || fail "$3: 期望 [$2] 实得 [$1]"; }
 assert_contains(){ [[ "$1" == *"$2"* ]] && ok || fail "$3: 找不到 [$2]"; }
+assert_not_contains(){ [[ "$1" != *"$2"* ]] && ok || fail "$3: 不应出现 [$2]"; }
 jq_(){ node -pe 'const j=JSON.parse(require("fs").readFileSync(0,"utf8")); eval(process.argv[1])' "$1"; }
 
 R="$T/repo"; mkdir -p "$R"
@@ -165,6 +166,41 @@ C2="$(printf '%s' "$INIT2" | jq_ 'j.coord')"
 P="$("$PANEL" --json --rq RQ-panel-v2-e2e-c)"
 assert_eq "$(printf '%s' "$P" | jq_ 'j.jobs.map(x=>x.module+":"+x.backend).join()')" "solo:claude" "Claude 主端未指定后端 → Claude worker"
 assert_eq "$(printf '%s' "$P" | jq_ 'j.title')" "Claude Fleet" "纯 Claude 标题是 Claude Fleet"
+
+CASE="两个编排主 session 并行、其一关分屏"
+: > "$OSA_LOG"
+INIT3="$(CC_FLEET_PANEL=0 "$FLEET" init --cwd "$R" --host claude-code --owner-id main-e2e-b --rq RQ-panel-v2-e2e-b)"
+C3="$(printf '%s' "$INIT3" | jq_ 'j.coord')"
+assert_contains "$(cat "$T/coords.json")" "$C3" "init 即登记（未派发、关分屏也登记）"
+CC_FLEET_PANEL=0 "$FLEET" prepare --coord "$C3" --module cx --backend codex --task "$T/card.md" > /dev/null
+OUT="$(CC_FLEET_PANEL=0 "$FLEET" dispatch --coord "$C3" --module cx)"; RC=$?
+assert_eq "$RC" "0" "关分屏派发 Codex worker 成功（${OUT:0:200}）"
+assert_eq "$(printf '%s' "$OUT" | jq_ 'JSON.stringify(j.panel)')" '{"registered":true,"panelOpened":null}' "关分屏：登记照做、不开分屏"
+assert_eq "$(wc -c < "$OSA_LOG" | tr -d ' ')" "0" "关分屏的 session 没有调 osascript"
+P="$("$PANEL" --json)"
+assert_eq "$(printf '%s' "$P" | jq_ 'j.groups.map(g=>g.rq).sort().join()')" "RQ-panel-v2-e2e,RQ-panel-v2-e2e-b,RQ-panel-v2-e2e-c" "三个任务组同屏"
+assert_eq "$(printf '%s' "$P" | jq_ 'j.jobs.find(x=>x.rq==="RQ-panel-v2-e2e-b").backend')" "codex" "关分屏那组的 Codex 子 session 在面板上"
+assert_eq "$(printf '%s' "$P" | jq_ 'j.title')" "Fleet" "Codex + Claude 混合标题"
+assert_eq "$(printf '%s' "$P" | jq_ 'JSON.stringify(j.backends)')" '{"claude":2,"codex":2}' "按后端报数"
+OUT="$("$PANEL" --once --plain)"
+assert_contains "$OUT" "3 任务组 · 4 worker · Claude 2 · Codex 2" "列表标题报任务组数与后端数"
+assert_contains "$(printf '%s\n' "$OUT" | grep '↳cx')" "Codex" "Codex 子 session 行标后端"
+assert_contains "$(printf '%s\n' "$OUT" | grep '↳solo')" "Claude" "Claude 子 session 行标后端"
+
+CASE="漏登记自愈"
+# 模拟老版本脚本派发：注册表里没有这个任务组
+node -e 'const fs=require("fs");const f=process.argv[1];const j=JSON.parse(fs.readFileSync(f,"utf8"));j.coords=j.coords.filter(c=>c.coord!==process.argv[2]);fs.writeFileSync(f,JSON.stringify(j))' "$T/coords.json" "$C3"
+assert_not_contains "$(cat "$T/coords.json")" "$C3" "注册表已抹掉该组"
+P="$("$PANEL" --json)"
+assert_contains "$(printf '%s' "$P" | jq_ 'j.groups.map(g=>g.rq).join()')" "RQ-panel-v2-e2e-b" "自动发现同仓库里漏登记的近期任务组"
+P="$("$PANEL" --json --no-discover)"
+assert_not_contains "$(printf '%s' "$P" | jq_ 'j.groups.map(g=>g.rq).join()')" "RQ-panel-v2-e2e-b" "--no-discover 只看注册表"
+
+CASE="组标题取 fleet.json 主 session"
+mkdir -p "$T/home/.claude/sessions"
+printf '{"pid":4343,"sessionId":"main-e2e-b","name":"第二个编排主 session","cwd":"%s"}\n' "$R" > "$T/home/.claude/sessions/4343.json"
+P="$(HOME="$T/home" "$PANEL" --json)"
+assert_eq "$(printf '%s' "$P" | jq_ 'j.groups.find(g=>g.rq==="RQ-panel-v2-e2e-b").title')" "第二个编排主 session" "按 fleet.json 的主 session id 取实时名字"
 
 echo "==== panel-v2 e2e: $PASS passed, $FAIL failed ===="
 [[ $FAIL -eq 0 ]]

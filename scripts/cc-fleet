@@ -125,6 +125,8 @@ def init(a):
     d=dict(version=2,rq=rq,repo=str(repo),commonDir=str(common),subdir=subdir,base=base,baseCommit=sha,
            integrationBranch='fleet/'+rq,inboxRoot=str((Path(tempfile.gettempdir())/'fleet-v2-inbox'/rq).resolve()),owner={'host':a.host,'id':owner_id,'identitySource':identity_source},createdAt=time.time())
     atomic(c/'fleet.json',d); (c/'base.ref').write_text(base+'\n')
+    # 建组即登记面板：任何后端/传输（含 native）、无论本 session 开不开分屏，全局面板都看得到这个任务组。
+    panel_register(c,rq)
     emit(dict(d,coord=str(c),uncommittedChangesExcluded=bool(git(repo,'status','--porcelain'))))
 
 def preamble(c,d):
@@ -245,19 +247,24 @@ def sidebar_attach(c, d):
             result=dict(state='pending',reason=str(e))
     return update(c,d['module'],sidebar=result)
 
+def panel_register(c, rq):
+    """登记面板全局注册表。与分屏开关无关、总是做：面板是全机一块，别的主 session 已开着的面板要看得到本任务组；
+    CC_FLEET_PANEL=0 只表示「本 session 不开分屏」。幂等（刷新 lastSeen 与 owner.meta），尽力而为，失败不影响编排。"""
+    bin_=os.environ.get('CC_FLEET_PANEL_REGISTER_BIN',str(ROOT/'cc-fleet-panel-register'))
+    try: return run([bin_,str(c),rq],timeout=30,check=False).returncode==0
+    except Exception: return False
+
 def panel_attach(c, d):
     """CLI 路径（Codex app-server / Claude --bg）worker 派发成功后：登记面板注册表 + 在当前 Ghostty 窗口分屏拉起只读面板。
     两种后端同屏：按任务组列出子 session、状态与最近动作，→ 进详情看完整时间线（Codex 读 rollout，Claude 读 transcript）。
     尽力而为：面板脚本自己处理 Ghostty 没开/没授权/不是 macOS 的情况，绝不因面板让派发失败。
-    CC_FLEET_PANEL=0 全局关掉；native（Codex App 主端，App 自带侧栏）不走这里。"""
-    if d.get('transport') not in ('app-server','claude-bg') or os.environ.get('CC_FLEET_PANEL')=='0':
-        return None
-    fleet=meta(c); out={}
-    steps=(('registered',os.environ.get('CC_FLEET_PANEL_REGISTER_BIN',str(ROOT/'cc-fleet-panel-register')),[str(c),fleet['rq']],None),
-           ('panelOpened',os.environ.get('CC_FLEET_PANEL_OPEN_BIN',str(ROOT/'cc-fleet-panel-open')),['--quiet'],dict(os.environ,CC_FLEET_PANEL_CWD=fleet['repo'])))
-    for key,bin_,args,env in steps:
-        try: out[key]=run([bin_,*args],timeout=30,check=False,env=env).returncode==0
-        except Exception: out[key]=False
+    CC_FLEET_PANEL=0 只是不开分屏（panelOpened=None），登记照做；native（Codex App 主端，App 自带侧栏）不走这里。"""
+    if d.get('transport') not in ('app-server','claude-bg'): return None
+    fleet=meta(c); out=dict(registered=panel_register(c,fleet['rq']),panelOpened=None)
+    if os.environ.get('CC_FLEET_PANEL')=='0': return out
+    bin_=os.environ.get('CC_FLEET_PANEL_OPEN_BIN',str(ROOT/'cc-fleet-panel-open'))
+    try: out['panelOpened']=run([bin_,'--quiet'],timeout=30,check=False,env=dict(os.environ,CC_FLEET_PANEL_CWD=fleet['repo'])).returncode==0
+    except Exception: out['panelOpened']=False
     return out
 
 def dispatch(a):

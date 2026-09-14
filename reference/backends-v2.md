@@ -33,7 +33,8 @@ v2 预建 worktree，从其子项目启动目录（名册 `cwd`）thread/start�
 `cc-fleet-panel-codex-app`（文件名沿用历史叫法；Codex 与 Claude worker 同屏，这块分屏是用户看子 session 的地方）。
 Codex worker 状态读 thread/read、明细读 rollout。面板读 `v2/<module>.json` 名册与 `<module>.receipt.json` 回执，
 标题随在场后端显示 Codex Fleet / Claude Fleet / Fleet，幂等复用已开的分屏；Ghostty 没开/未授权/非 macOS
-只提示不报错，绝不因面板让派发失败。`CC_FLEET_PANEL=0` 全局关掉。native 路径（Codex App 主端，App 自带侧栏）不开面板。
+只提示不报错，绝不因面板让派发失败。`CC_FLEET_PANEL=0` 只关分屏不关登记（`init` 即登记，并行的多个任务组、任何后端都进同一块面板）。
+native 路径（Codex App 主端，App 自带侧栏）不开分屏，但同样登记。
 
 传输复用 `cc-codex-app-call`，它通过官方 `codex app-server proxy` 使用 WebSocket handshake。
 权限默认开放：Codex 的 thread/start、thread/resume 使用 `approvalPolicy=never` 和 `sandbox=danger-full-access`，turn/start 使用 `approvalPolicy=never` 和 `sandboxPolicy={"type":"dangerFullAccess"}`。`--permissions inherit` 不传权限覆盖。Claude Code 主端显式派的 Codex worker 使用用户指定的 `gpt-6-astra` / `low` / `openai`；

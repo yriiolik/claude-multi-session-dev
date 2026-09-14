@@ -69,7 +69,8 @@ Codex CLI 没有 App 原生任务工具时自动走 app-server；不要把工具
 5. 按路由派发。即时记录真实 thread/session ID；原生创建返回 `clientThreadId` 时仅记为 setup pending，
    等到真实 `threadId` 后再监控。不能把 client ID 当真实 ID，也不能因等待久而重复创建。
    Claude Code / Codex CLI 主端跑在 Ghostty 里时，CLI 路径（Codex app-server 与 Claude `--bg`）派发成功即自动在右侧分屏
-   拉起只读面板 `cc-fleet-panel-codex-app`，两种后端的子 session 按任务组同屏展示（`CC_FLEET_PANEL=0` 关闭）；
+   拉起只读面板 `cc-fleet-panel-codex-app`，两种后端的子 session 按任务组同屏展示；面板是全机一块，多个编排主 session 并行时所有任务组都在里面（`init` 即登记，
+   `CC_FLEET_PANEL=0` 只是本 session 不开分屏，登记照做）；
    编排判断仍只看 `status` 与回执。
 6. Codex App 原生 worker 用 `wait_threads` + cursor 等待；跨客户端可订阅 Codex events，或使用
    有界 `cc-fleet wait`。Claude 主端存在 Monitor 才用它挂有界等待；没有推醒机制时继续主端工具等待，

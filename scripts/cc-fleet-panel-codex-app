@@ -48,6 +48,7 @@ const opt = {
   startAppServer: true,
   spin: true,
   targetRatio: Number(process.env.CC_FLEET_PANEL_RATIO) || 0,
+  discover: process.env.CC_FLEET_PANEL_DISCOVER !== "0",
 };
 
 function usage() {
@@ -74,7 +75,8 @@ function usage() {
   --json                 输出状态模型 JSON 后退出
   --keys a,b,c           先按一串键再渲染（配合 --once，测试用）
   --codex-bin PATH       指定 Codex CLI
-  --no-start-app-server  只连已有 app-server`);
+  --no-start-app-server  只连已有 app-server
+  --no-discover          只看注册表，不自动发现已知仓库里漏登记的近期任务组（CC_FLEET_PANEL_DISCOVER=0 同效）`);
 }
 
 for (let i = 2; i < process.argv.length; i++) {
@@ -98,6 +100,7 @@ for (let i = 2; i < process.argv.length; i++) {
   else if (a === "--codex-bin") opt.codexBin = process.argv[++i] || "";
   else if (a === "--start-app-server") opt.startAppServer = true;
   else if (a === "--no-start-app-server") opt.startAppServer = false;
+  else if (a === "--no-discover") opt.discover = false;
   else if (a === "-h" || a === "--help") { usage(); process.exit(0); }
   else { console.error(`unknown flag: ${a}`); usage(); process.exit(5); }
 }
@@ -291,14 +294,24 @@ function activeCoords() {
     seen.add(abs);
     out.push({ coord: abs, rq: rq || path.basename(abs) });
   };
+  const registered = jobsLib.listCoords();
   for (const c of opt.coords) add(c, opt.rq);
-  for (const c of jobsLib.listCoords()) add(c.coord, c.rq);
+  for (const c of registered) add(c.coord, c.rq);
+  // 漏登记的任务组（老版本脚本派发、登记失败）靠自动发现补上：只扫注册表里出现过的仓库，只收时间窗内有名册写入的 RQ
+  if (opt.discover) {
+    const hours = opt.maxAgeHours > 0 ? opt.maxAgeHours : 24;
+    const known = [...registered, ...opt.coords.map((coord) => ({ coord }))];
+    for (const c of jobsLib.discoverCoords(known, { sinceSec: Math.floor(Date.now() / 1000) - hours * 3600 })) add(c.coord, c.rq);
+  }
   return opt.rq ? out.filter((c) => c.rq === opt.rq) : out;
 }
 
 // 组标题用主 session 的**实时**名字（派发时落的 owner.meta 只存 pid/id，名字会被取名 hook 改写）。
-// owner.meta 之前派发的历史 RQ 没有归属记录，退而按 task.meta 的 cwd 推断，最后才退到仓库名。
+// v2 的 fleet.json 在 init 时就记下主 session id，最可信，优先用；其次 owner.meta；
+// 都没有的历史 RQ 退而按 task.meta 的 cwd 推断，最后才退到仓库名。
 function groupTitle(coord) {
+  const fromFleet = jobsLib.ownerFromFleet(coord);
+  if (fromFleet && fromFleet.name) return { title: fromFleet.name, owner: fromFleet, ownerSource: "fleet" };
   const owner = jobsLib.readOwnerMeta(coord);
   const live = jobsLib.resolveOwnerName(owner);
   if (live) return { title: live, owner, ownerSource: "meta" };
@@ -599,11 +612,23 @@ function fleetTitle(model) {
   return kinds.has("claude") ? "Claude Fleet" : "Codex Fleet";
 }
 
+function backendCounts(model) {
+  const out = { claude: 0, codex: 0 };
+  for (const j of model.jobs) out[j.backend === "claude" ? "claude" : "codex"] += 1;
+  return out;
+}
+
+const BACKEND_LABEL = { claude: "Claude", codex: "Codex" };
+
 function renderList(model, ui) {
   const width = ui.width;
   const lines = [];
   const scope = opt.rq ? `RQ ${opt.rq}` : "全局";
-  lines.push(`${C.bold(fleetTitle(model))} ${C.dim(`· ${scope} · ${model.groups.length} 任务组 · ${model.jobs.length} worker`)}`);
+  const counts = backendCounts(model);
+  const mixed = counts.claude > 0 && counts.codex > 0;
+  // 混合后端时标题只叫 Fleet，按后端报数，行内再加一列后端名，免得分不清哪个是 Codex 子 session
+  const mix = mixed ? ` · Claude ${counts.claude} · Codex ${counts.codex}` : "";
+  lines.push(`${C.bold(fleetTitle(model))} ${C.dim(`· ${scope} · ${model.groups.length} 任务组 · ${model.jobs.length} worker${mix}`)}`);
   const parts = [];
   if (model.pending) parts.push(C.cyan(`${model.pending} 未完成`));
   if (model.done) parts.push(C.green(`${model.done} 已完成`));
@@ -625,7 +650,8 @@ function renderList(model, ui) {
   );
   const stateW = 6;
   const ageW = 5;
-  const detailW = Math.max(10, width - 5 - nameW - stateW - ageW - 4);
+  const backendW = mixed ? 7 : 0;
+  const detailW = Math.max(10, width - 5 - nameW - backendW - stateW - ageW - 4);
 
   for (const g of model.groups) {
     lines.push("");
@@ -645,11 +671,12 @@ function renderList(model, ui) {
       const label = padTo(job.cls.label, stateW);
       const detail = padTo(truncate(job.detail || "", detailW), detailW);
       const age = padTo(fmtAge(jobElapsed(job, model.now)), ageW);
+      const be = mixed ? padTo(BACKEND_LABEL[job.backend === "claude" ? "claude" : "codex"], backendW - 1) + " " : "";
       if (selected) {
         // 选中行整行反色，配色必须按无色文本排版，ANSI 转义混进 padTo 会算多
-        lines.push(C.sel(padTo(`   ${markChar(job, ui.frame)} ${name} ${label} ${detail} ${age}`, width)));
+        lines.push(C.sel(padTo(`   ${markChar(job, ui.frame)} ${name} ${be}${label} ${detail} ${age}`, width)));
       } else {
-        lines.push(`   ${rowMark(job, ui.frame)} ${name} ${C[job.cls.tone](label)} ${C.dim(detail)} ${C.dim(age)}`);
+        lines.push(`   ${rowMark(job, ui.frame)} ${name} ${C.dim(be)}${C[job.cls.tone](label)} ${C.dim(detail)} ${C.dim(age)}`);
       }
     }
   }
@@ -900,6 +927,7 @@ if (opt.json) {
     appUnavailable: model.appUnavailable,
     claudeUnavailable: model.claudeUnavailable,
     title: fleetTitle(model),
+    backends: backendCounts(model),
     view: ui.view,
     cursor: ui.cursor,
     selected: sel ? { module: sel.module, rq: sel.rq, bucket: sel.cls.bucket } : null,

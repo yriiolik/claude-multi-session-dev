@@ -80,7 +80,9 @@ events 的 turn-completed 只触发收回执，不直接判业务完成。连接
   派发使用其中 `worker.model/effort`；可 `dispatch --profile spike`。没有配置则不传模型/effort。
 - v2 生成 UUID 后缀 RQ，协调数据在 git-common-dir，避免两端各自分配同号；历史全局序号池不受影响。
 - `CC_FLEET_PANEL=0`：不在 Ghostty 分屏拉起只读面板（默认 Codex app-server 与 Claude `--bg` 派发成功即拉起，
-  两种后端同屏，幂等复用）。
+  两种后端同屏，幂等复用）。**登记不受它影响**：`init` 与 `dispatch` 总会把协调目录登记进全局注册表，
+  别的主 session 已开着的面板照样显示本任务组；面板还会自动发现已知仓库里漏登记的近期 v2 任务组
+  （`--no-discover` / `CC_FLEET_PANEL_DISCOVER=0` 关）。混合后端时标题为 Fleet 并按 Claude/Codex 报数、行内标后端。
   手动开/关/看状态：`scripts/cc-fleet-panel-open` / `--close` / `--status`；比例与方向见 `commands.md`。
 
 ## 权限和完成

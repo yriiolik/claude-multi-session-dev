@@ -358,9 +358,41 @@ function readOnlySnapshot(coord, opts = {}) {
 // 所以派发时主动登记一行，面板只读注册表。条目里的 coord 目录没了就自动剔除。
 // ---------------------------------------------------------------------------
 
+// 默认与 RQ 序号池同目录（CC_FLEET_HOME，缺省 ~/.claude/fleet）：测试整轮改 CC_FLEET_HOME 就不会碰真实注册表。
 function registryPath() {
   return process.env.CC_FLEET_PANEL_REGISTRY
-    || path.join(process.env.HOME || os.homedir(), ".claude", "fleet", "codex-coords.json");
+    || path.join(process.env.CC_FLEET_HOME || path.join(process.env.HOME || os.homedir(), ".claude", "fleet"), "codex-coords.json");
+}
+
+function sleepMs(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+// 注册表是所有主 session 与面板共用的一个 JSON，登记与剔除失效条目都是读-改-写。不加锁时两个主 session
+// 同时派发、或面板剔除恰好撞上登记，后写的会覆盖先写的——那个任务组就从面板上消失了。
+// 用 mkdir 原子锁串行化；持锁进程崩溃留下的锁超过 staleMs 回收。
+function withRegistryLock(fn, { waitMs = 5000, staleMs = 10000 } = {}) {
+  const lock = `${registryPath()}.lock`;
+  fs.mkdirSync(path.dirname(lock), { recursive: true });
+  const deadline = Date.now() + waitMs;
+  for (;;) {
+    try {
+      fs.mkdirSync(lock);
+      break;
+    } catch (e) {
+      if (e.code !== "EEXIST") throw e;
+      try {
+        if (Date.now() - fs.statSync(lock).mtimeMs > staleMs) { fs.rmdirSync(lock); continue; }
+      } catch {}
+      if (Date.now() > deadline) throw new Error(`面板注册表锁等待超时: ${lock}`);
+      sleepMs(10 + Math.floor(Math.random() * 30));
+    }
+  }
+  try {
+    return fn();
+  } finally {
+    try { fs.rmdirSync(lock); } catch {}
+  }
 }
 
 function readRegistry() {
@@ -380,38 +412,83 @@ function writeRegistry(coords) {
   fs.renameSync(tmp, file);
 }
 
-// 幂等登记。并发派发已被派发脚本的目录锁串行化，这里再做一次 read-modify-write 收敛即可。
+// 幂等登记。派发脚本的目录锁只串行化同一 RQ，跨 RQ / 跨主 session 靠注册表锁。
 function registerCoord(coord, rq, extra = {}) {
   if (!coord) return readRegistry();
   const abs = path.resolve(coord);
   const now = Math.floor(Date.now() / 1000);
-  const coords = readRegistry().filter((c) => c && c.coord);
-  const found = coords.find((c) => path.resolve(c.coord) === abs);
-  if (found) {
-    found.rq = rq || found.rq;
-    found.lastSeen = now;
-    Object.assign(found, extra);
-  } else {
-    coords.push({ coord: abs, rq: rq || path.basename(abs), firstSeen: now, lastSeen: now, ...extra });
-  }
-  writeRegistry(coords);
-  return coords;
+  return withRegistryLock(() => {
+    const coords = readRegistry().filter((c) => c && c.coord);
+    const found = coords.find((c) => path.resolve(c.coord) === abs);
+    if (found) {
+      found.rq = rq || found.rq;
+      found.lastSeen = now;
+      Object.assign(found, extra);
+    } else {
+      coords.push({ coord: abs, rq: rq || path.basename(abs), firstSeen: now, lastSeen: now, ...extra });
+    }
+    writeRegistry(coords);
+    return coords;
+  });
 }
 
-// 读注册表并剔除已消失的目录（worktree 被清理、仓库被删等）。
+function isDir(p) {
+  try {
+    return fs.statSync(p).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+// 读注册表并剔除已消失的目录（worktree 被清理、仓库被删等）。剔除在锁内重读再写，不会吞掉刚登记的条目。
 function listCoords({ prune = true } = {}) {
   const coords = readRegistry().filter((c) => c && c.coord);
-  const alive = coords.filter((c) => {
-    try {
-      return fs.statSync(c.coord).isDirectory();
-    } catch {
-      return false;
-    }
-  });
+  const alive = coords.filter((c) => isDir(c.coord));
   if (prune && alive.length !== coords.length) {
-    try { writeRegistry(alive); } catch {}
+    try {
+      withRegistryLock(() => {
+        const fresh = readRegistry().filter((c) => c && c.coord);
+        const keep = fresh.filter((c) => isDir(c.coord));
+        if (keep.length !== fresh.length) writeRegistry(keep);
+      }, { waitMs: 500 });
+    } catch {}
   }
   return alive;
+}
+
+// 自动发现：注册表靠「init / 派发时主动登记」，漏登记的任务组（老版本脚本、登记失败、手工建的协调目录）
+// 永远上不了面板。所以面板顺带扫**已知仓库**（known 里协调目录所在的 `<common-dir>/fleet`）下的 v2 协调目录，
+// 只收 sinceSec 之后名册目录有写入的——历史 RQ 不会回到面板上，也不满盘扫。
+function discoverCoords(known, { sinceSec = 0 } = {}) {
+  const roots = new Set();
+  for (const k of known || []) {
+    if (!k || !k.coord) continue;
+    const parent = path.dirname(path.resolve(k.coord));
+    if (path.basename(parent) === "fleet") roots.add(parent);
+  }
+  const out = [];
+  for (const root of roots) {
+    let names;
+    try {
+      names = fs.readdirSync(root);
+    } catch {
+      continue;
+    }
+    for (const n of names) {
+      const coord = path.join(root, n);
+      let fleet;
+      try {
+        fleet = JSON.parse(fs.readFileSync(path.join(coord, "fleet.json"), "utf8"));
+      } catch {
+        continue;
+      }
+      let mtime = 0;
+      try { mtime = Math.floor(fs.statSync(path.join(coord, "v2")).mtimeMs / 1000); } catch {}
+      if (!mtime || mtime < sinceSec) continue;
+      out.push({ coord, rq: (fleet && fleet.rq) || n, discovered: true });
+    }
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -508,24 +585,45 @@ function resolveOwnerName(owner) {
 // 回退推断：owner.meta 出现之前派发的历史 RQ 没有归属记录。协调目录的 task.meta 里有派发时的
 // cwd，拿它去活着的 claude session 注册表里找同 cwd 的会话。同 cwd 多开时可能猜错，所以调用方
 // 要把来源标成 inferred，不要当成确凿信息。
-function inferOwnerByCwd(coord) {
-  const task = parseEnv(path.join(coord, "task.meta"));
-  const cwd = task.cwd;
-  if (!cwd) return null;
+function liveClaudeSessions() {
   const dir = path.join(process.env.HOME || os.homedir(), ".claude", "sessions");
   let files;
   try {
     files = fs.readdirSync(dir).filter((f) => /^\d+\.json$/.test(f));
   } catch {
-    return null;
+    return [];
   }
-  const hits = [];
+  const out = [];
   for (const f of files) {
     try {
       const reg = JSON.parse(fs.readFileSync(path.join(dir, f), "utf8"));
-      if (reg && reg.cwd === cwd && reg.name) hits.push(reg);
+      if (reg) out.push(reg);
     } catch {}
   }
+  return out;
+}
+
+// v2 协调目录的 fleet.json 在 init 时记下了主 session 身份（Claude 的 session id / Codex 的 thread id）。
+// 按 id 反查活着的 Claude 会话拿实时名字——同一仓库同时开着两个编排主 session 时，按 cwd 只能猜中一个。
+// Codex 主端或主 session 已退出时查不到，返回 null 交给调用方兜底。
+function ownerFromFleet(coord) {
+  let owner;
+  try {
+    owner = JSON.parse(fs.readFileSync(path.join(coord, "fleet.json"), "utf8")).owner;
+  } catch {
+    return null;
+  }
+  if (!owner || !owner.id || owner.identitySource !== "session") return null;
+  const reg = liveClaudeSessions().find((r) => r.sessionId === owner.id && r.name);
+  if (!reg) return null;
+  return { pid: reg.pid || 0, sessionId: reg.sessionId, name: reg.name, cwd: reg.cwd || "", host: owner.host || "" };
+}
+
+function inferOwnerByCwd(coord) {
+  const task = parseEnv(path.join(coord, "task.meta"));
+  const cwd = task.cwd;
+  if (!cwd) return null;
+  const hits = liveClaudeSessions().filter((reg) => reg.cwd === cwd && reg.name);
   if (!hits.length) return null;
   // 忙着的优先（多半就是正在盯这批 worker 的那个），否则取最近启动的
   hits.sort((a, b) => {
@@ -704,8 +802,11 @@ module.exports = {
   registryPath,
   readRegistry,
   writeRegistry,
+  withRegistryLock,
   registerCoord,
   listCoords,
+  discoverCoords,
+  ownerFromFleet,
   claudeSessionRegistry,
   detectOwner,
   ownerMetaPath,

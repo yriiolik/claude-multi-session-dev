@@ -41,8 +41,10 @@ class FleetTests(unittest.TestCase):
  def setUp(self):
   self.tmp=tempfile.TemporaryDirectory(prefix='fleet-v2-'); self.root=pathlib.Path(self.tmp.name)
   self.repo=self.root/'repo with spaces';self.repo.mkdir()
-  # CC_FLEET_PANEL=0：测试绝不去动真实 Ghostty / 真实面板注册表；面板路径由 test_app_server_dispatch_opens_ghostty_panel 用假脚本单独测。
-  self.env=dict(os.environ,FAKE_DB=str(self.root/'db.json'),CLAUDE_FLEET_CONFIG=str(self.root/'missing.json'),CODEX_MULTI_SESSION_CONFIG=str(self.root/'absent-route.json'),CC_FLEET_PANEL='0')
+  # CC_FLEET_PANEL=0：测试绝不去动真实 Ghostty；init/dispatch 总会登记面板注册表，一律指到临时文件。
+  # 面板路径由 test_app_server_dispatch_opens_ghostty_panel 用假脚本单独测。
+  self.env=dict(os.environ,FAKE_DB=str(self.root/'db.json'),CLAUDE_FLEET_CONFIG=str(self.root/'missing.json'),CODEX_MULTI_SESSION_CONFIG=str(self.root/'absent-route.json'),CC_FLEET_PANEL='0',
+                CC_FLEET_PANEL_REGISTRY=str(self.root/'coords.json'))
   for n in ('claude','app-call'):
    p=self.root/n;p.write_text(FAKE);p.chmod(0o755)
   self.env.update(CLAUDE_CLI_PATH=str(self.root/'claude'),CODEX_APP_CALL_BIN=str(self.root/'app-call'))
@@ -104,14 +106,25 @@ class FleetTests(unittest.TestCase):
   self.assertEqual(out['panel'],dict(registered=True,panelOpened=True));self.assertEqual(len(log.read_text().splitlines()),2)
   self.assertEqual(out['claudeProfile'],dict(model='claude-opus-5',effort='high'))
   self.assertEqual(json.loads((c2/'v2'/'ui.json').read_text())['claudeProfile'],dict(model='claude-opus-5',effort='high'))
-  # 全局开关 0 时不碰面板
+  # 全局开关 0 只是不开分屏：登记照做，别的主 session 已开的全局面板仍看得到这个任务组
   env0,log0=self.panel_env('0');c3,_,_=self.setup_worker(module='svc');out=self.cli('dispatch','--coord',c3,'--module','svc',env=env0)
-  self.assertIsNone(out['panel']);self.assertEqual(len(log0.read_text().splitlines()),2)
+  self.assertEqual(out['panel'],dict(registered=True,panelOpened=None));self.assertEqual(len(log0.read_text().splitlines()),2)
   c5,_,_=self.setup_worker(backend='claude',module='web');out=self.cli('dispatch','--coord',c5,'--module','web',env=env0)
-  self.assertIsNone(out['panel']);self.assertEqual(len(log0.read_text().splitlines()),2)
+  self.assertEqual(out['panel'],dict(registered=True,panelOpened=None));self.assertEqual(len(log0.read_text().splitlines()),2)
+  reg=[x['coord'] for x in json.loads((self.root/'coords.json').read_text())['coords']]
+  self.assertIn(str(c3),reg);self.assertIn(str(c5),reg)
   # 面板脚本失败只在输出里标 False，派发本身仍是 running
   (self.root/'panel-open').write_text('#!/bin/sh\nexit 7\n');c4,_,_=self.setup_worker(module='job');out=self.cli('dispatch','--coord',c4,'--module','job',env=env)
   self.assertEqual(out['state'],'running');self.assertEqual(out['panel'],dict(registered=True,panelOpened=False))
+ def test_init_registers_panel_for_every_transport(self):
+  # 建组即登记：native（不走 panel_attach）与关掉分屏的 CLI 路径都能进全局注册表；不开任何分屏
+  env,log=self.panel_env('0')
+  for host,backend in [('codex-app','codex'),('claude-code','claude'),('claude-code','codex')]:
+   with self.subTest(host=host,backend=backend):
+    f=self.cli('init','--cwd',self.repo,'--host',host,'--owner-id','main-123',env=env)
+    reg=[(x['coord'],x['rq']) for x in json.loads((self.root/'coords.json').read_text())['coords']]
+    self.assertIn((f['coord'],f['rq']),reg)
+  self.assertFalse(log.exists())
  def test_duplicate_dispatch_and_module_rejected(self):
   c,d,_=self.setup_worker();self.cli('dispatch','--coord',c,'--module','api')
   self.cli('dispatch','--coord',c,'--module','api',ok=False)

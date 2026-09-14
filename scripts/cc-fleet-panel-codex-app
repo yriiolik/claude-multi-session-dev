@@ -653,10 +653,18 @@ function renderList(model, ui) {
 
   for (const g of model.groups) {
     lines.push("");
-    // 组标题：主 session 名字（谁派的） + RQ + 仓库 + 完成度
+    // 组标题：主 session 名字（谁派的） + RQ + 仓库 + 完成度。名字**完整显示、绝不截断**（面板是窄分屏，
+    // 截断后同前缀的几个任务组分不清）：一行放得下就与右侧同行；放不下名字独占一行（超长按列宽折行），
+    // RQ / 完成度挪到下一行右对齐。
     const right = `${g.rq}${g.repo ? ` · ${g.repo}` : ""}  ${g.done}/${g.jobs.length} 完成`;
-    const left = truncate(g.title, Math.max(10, width - dispWidth(right) - 4));
-    lines.push(`${C.bold(left)}${C.dim(" ".repeat(Math.max(1, width - dispWidth(left) - dispWidth(right))) + right)}`);
+    const title = String(g.title).replace(/[\r\n\t]+/g, " ");
+    if (dispWidth(title) + 2 + dispWidth(right) <= width) {
+      lines.push(`${C.bold(title)}${C.dim(" ".repeat(width - dispWidth(title) - dispWidth(right)) + right)}`);
+    } else {
+      for (const l of wrap(title, width)) lines.push(C.bold(l));
+      const r = truncate(right, width);
+      lines.push(C.dim(" ".repeat(Math.max(0, width - dispWidth(r))) + r));
+    }
 
     let lastBucket = "";
     for (const job of g.jobs) {
@@ -804,7 +812,8 @@ const ui = {
   detailLines: null,
   detailKey: "",
   frame: 0,
-  width: process.stdout.columns || 100,
+  // 非 TTY（--once / 管道）读不到列数时按 CC_FLEET_PANEL_WIDTH 排版，测试靠它模拟窄分屏
+  width: process.stdout.columns || Number(process.env.CC_FLEET_PANEL_WIDTH) || 100,
   height: process.stdout.rows || 30,
 };
 

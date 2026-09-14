@@ -126,15 +126,15 @@ Codex worker 是 app-server 里的 thread，**永远不会出现在 `claude agen
 主 session 派的）、在当前 Ghostty 窗口右侧分屏拉起 `cc-fleet-panel-codex-app`。面板是**全局**的——
 跨 session、跨仓库派发的 worker 都汇总在同一块屏上；全部收工后面板自行退出、分屏随之关闭。
 
-面板按**任务组（RQ）**分组，组标题就是发起这批 worker 的主 session 名字，组内只分未完成 / 已完成：
+面板按**任务组（RQ）**分组，组标题就是发起这批 worker 的主 session 名字，组内只分未完成（仍在跑：执行中 / 待输入）/ 已完成（其余一切，没落回执的状态词单独标出、排在栏首）：
 
 ```
 多会话Codex虚拟OMS上线前检查清单                RQ-2026-0813-002 · qzc  1/6 完成
   未完成
    ✳ ↳outbound     执行中 $ bash scripts/run-vitest.sh src/modules/inbound/…   10m
    ⏳ ↳inbound      待输入 等待 approval / 输入                                 10m
-   ! ↳scan-perm    需核验 空闲但未落回执                                        22m
   已完成
+   ! ↳scan-perm    需核验 空闲但未落回执                                        22m
    ✓ ↳scan-limits  已回执 🧾 scan-limits 完成 — 只读横向排查完毕，产出 7 项发现  10m
 ```
 

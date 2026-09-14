@@ -15,7 +15,7 @@
 派发成功后与 Codex app-server 路径一样登记面板注册表、在 Ghostty 右侧分屏拉起只读面板（见下一节）。
 面板对 Claude worker 的状态读 `claude agents --json --all`（每轮刷新只调一次，无 Claude worker 不调），
 「最近动作」与详情时间线读会话 transcript `$CLAUDE_CONFIG_DIR/projects/<cwd 转写>/<sessionId>.jsonl`，
-找不到时降级为 `claude logs`。`done` 只代表会话空闲，无回执照样显示「需核验」、归在未完成。
+找不到时降级为 `claude logs`。`done` 只代表会话空闲，无回执照样显示「需核验」（归已完成栏、排在栏首，不当交付、不触发自动关闭）。
 
 **运行中回话的有限兼容层**：当前检查到的公开 CLI 没有独立 live send/steer 命令，因此 v2 继续调用
 原有 `cc-fleet-reply --short` 的私有 reply 协议。其余生命周期已不再直接访问 daemon 状态文件。

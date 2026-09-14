@@ -76,7 +76,7 @@ claude 进程自注册）+ `~/.claude/daemon/roster.json`（daemon 托管的 PTY
 worker 是谁派的）→ 在当前 Ghostty 窗口右侧分屏拉起面板。用法与按键见 `commands.md`。
 
 **组织方式**：按**任务组（RQ）**分组，组标题是发起这批 worker 的主 session 名字；组内只分
-未完成 / 已完成两栏，各 worker 的状态差异由行首标记与状态词表达（执行中的标记是动画）。
+未完成（仍在跑：执行中 / 待输入）/ 已完成（其余一切）两栏，各 worker 的状态差异由行首标记与状态词表达（执行中的标记是动画）。
 
 设计上的硬约束：
 
@@ -85,7 +85,7 @@ worker 是谁派的）→ 在当前 Ghostty 窗口右侧分屏拉起面板。用
    共用 `scripts/lib/codex-app-jobs.js` 的纯函数，两边对同一 worker 的答案必然一致。
 2. **全局**。worker 是跨 session、跨仓库派发的，面板读全局注册表
    （`~/.claude/fleet/codex-coords.json`）而不是某个 cwd 的 `.git/fleet`。
-3. **「空闲 ≠ 完成」照旧**。thread idle 但没落 `result:` 回执的状态词是**需核验**，归在**未完成**栏，
+3. **「空闲 ≠ 完成」照旧**。thread idle 但没落 `result:` 回执的状态词是**需核验**，归在已完成栏但排在栏首、单独标出（不在跑了≠交付），
    **也不触发自动关闭**——那正是最需要你看一眼的状态。
 4. **自动关闭**只在「见过活跃 worker → 现在全部收工」时触发，跨 session 的新派发会重置计时。
    全绿收工才关；有需核验/异常就一直留着（要强制关加 `--close-on-attention`）。

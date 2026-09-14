@@ -12,10 +12,11 @@
 //      刷屏级写入，还会和编排者的 status 调用互相打架。状态判定复用 lib/codex-app-jobs.js 的纯函数。
 //   2. **全局视角**。worker 是跨 session、跨仓库派发的，面板读全局注册表而不是某个 cwd 的 .git/fleet。
 //   3. **"空闲 ≠ 完成"**。Codex 的 turn 跑完就 idle，只有 summary 首行是 `result:` 才算真交付。
-//      idle-without-receipt 记作「需核验」，归在**未完成**里，也不触发自动关闭。
+//      idle-without-receipt 记作「需核验」，状态词与标记单独标出，排在已完成栏最前，也不触发自动关闭。
 //
 // 组织方式：按**任务组（RQ）**分组，组标题是发起这批 worker 的主 session 名字；组内只分
-// 未完成 / 已完成两栏，各 worker 的具体状态由行首标记表达（执行中的标记是动画）。
+// 未完成（仍在跑：执行中 / 待输入）/ 已完成（其余一切：已回执、需核验、失败、已停止…）两栏，
+// 各 worker 的具体状态由行首标记与状态词表达（执行中的标记是动画）。
 //
 // 交互：↑↓/jk 选择 · →/l/Enter 进详情 · ←/h/Esc 返回 · r 刷新 · q 退出。
 
@@ -195,32 +196,31 @@ const C = opt.plain
 
 // ---------------------------------------------------------------- 状态语义
 
-// 组内只分未完成 / 已完成两栏（bucket），具体状态差异靠行首标记 + 文案表达。
-// 唯一不能含糊的是 needs-check：thread 空闲但没落 `result:` 回执——它算**未完成**。
+// 组内只分未完成 / 已完成两栏（bucket）：**只有还在跑的**（执行中；待输入是活着的会话在等审批）算未完成，
+// 其余一切都归已完成。已完成不等于交付成功——没落回执的（需核验/失败/已停止/状态未知）带 attention，
+// 状态词与标记单独标出、排在已完成栏最前，并阻止面板自动关闭。rank 决定栏内顺序。
 const SPINNER = ["·", "✢", "✳", "∗", "✻", "✽"];
 
 function classify(job) {
   switch (job.state) {
     case "running":
-      return { bucket: "pending", tone: "cyan", mark: null, label: "执行中" };
+      return { bucket: "pending", attention: false, rank: 0, tone: "cyan", mark: null, label: "执行中" };
     case "blocked":
-      return { bucket: "pending", tone: "yellow", mark: "⏳", label: "待输入" };
+      return { bucket: "pending", attention: false, rank: 1, tone: "yellow", mark: "⏳", label: "待输入" };
     case "done":
       return job.receipt
-        ? { bucket: "done", tone: "green", mark: "✓", label: "已回执" }
-        : { bucket: "pending", tone: "yellow", mark: "!", label: "需核验" };
+        ? { bucket: "done", attention: false, rank: 9, tone: "green", mark: "✓", label: "已回执" }
+        : { bucket: "done", attention: true, rank: 2, tone: "yellow", mark: "!", label: "需核验" };
     case "failed":
-      return { bucket: "pending", tone: "red", mark: "✗", label: "失败" };
+      return { bucket: "done", attention: true, rank: 3, tone: "red", mark: "✗", label: "失败" };
     case "stopped":
-      return { bucket: "pending", tone: "red", mark: "⊘", label: "已停止" };
+      return { bucket: "done", attention: true, rank: 4, tone: "red", mark: "⊘", label: "已停止" };
     case "lost":
-      return { bucket: "pending", tone: "red", mark: "?", label: "元数据缺失" };
+      return { bucket: "done", attention: true, rank: 5, tone: "red", mark: "?", label: "元数据缺失" };
     default:
-      return { bucket: "pending", tone: "yellow", mark: "?", label: "状态未知" };
+      return { bucket: "done", attention: true, rank: 6, tone: "yellow", mark: "?", label: "状态未知" };
   }
 }
-
-const STATE_ORDER = ["running", "blocked", "unknown", "done", "failed", "stopped", "lost"];
 
 function fmtAge(sec) {
   if (!Number.isFinite(sec) || sec < 0) return "-";
@@ -406,9 +406,7 @@ function collect() {
     }
     group.jobs.sort((a, b) => {
       if (a.cls.bucket !== b.cls.bucket) return a.cls.bucket === "pending" ? -1 : 1;
-      const sa = STATE_ORDER.indexOf(a.state);
-      const sb = STATE_ORDER.indexOf(b.state);
-      if (sa !== sb) return sa - sb;
+      if (a.cls.rank !== b.cls.rank) return a.cls.rank - b.cls.rank;
       return (b.ts || 0) - (a.ts || 0);
     });
     groups.push(group);
@@ -816,7 +814,7 @@ let allDoneSince = 0;
 const startedAt = Date.now();
 
 const anyActive = (m) => m.jobs.some((j) => jobsLib.ACTIVE_STATES.has(j.state));
-const anyAttention = (m) => m.jobs.some((j) => j.cls.bucket === "pending" && !jobsLib.ACTIVE_STATES.has(j.state));
+const anyAttention = (m) => m.jobs.some((j) => j.cls.attention);
 
 // 自动关闭：只有「见过活跃 worker」之后才可能触发，避免面板刚被派发脚本拉起、
 // 第一个 thread 还没建好就自己关掉。跨 session 的新派发会重新写进注册表，
@@ -948,6 +946,7 @@ if (opt.json) {
       name: j.displayName,
       state: j.state,
       bucket: j.cls.bucket,
+      attention: j.cls.attention ? 1 : 0,
       label: j.cls.label,
       receipt: j.receipt ? 1 : 0,
       thread_id: j.thread_id || j.id || "",

@@ -150,8 +150,9 @@ assert_contains "$OUT" "fake logs $SHORT" "降级视图展示 claude logs 输出
 CASE="Claude 空闲 ≠ 完成"
 set_claude_state "$SHORT" done
 P="$("$PANEL" --json)"
-assert_eq "$(printf '%s' "$P" | jq_ 'j.jobs.find(x=>x.module==="ui").label')" "需核验" "agents done 但没回执 → 需核验，仍算未完成"
-assert_eq "$(printf '%s' "$P" | jq_ 'j.jobs.find(x=>x.module==="ui").bucket')" "pending" "需核验归在未完成"
+assert_eq "$(printf '%s' "$P" | jq_ 'j.jobs.find(x=>x.module==="ui").label')" "需核验" "agents done 但没回执 → 需核验，不当交付"
+assert_eq "$(printf '%s' "$P" | jq_ 'j.jobs.find(x=>x.module==="ui").bucket')" "done" "不在跑了 → 归已完成栏"
+assert_eq "$(printf '%s' "$P" | jq_ 'j.jobs.find(x=>x.module==="ui").attention')" "1" "需核验带 attention"
 ATT="$(jq_ 'j.attempt' < "$C/v2/ui.json")"
 printf '{"version":2,"rq":"RQ-panel-v2-e2e","module":"ui","attempt":"%s","result":"done","summary":"ui 完成","tests":[{"command":"t","result":"passed","evidence":"e"}],"commit":""}\n' "$ATT" > "$C/ui.receipt.json"
 P="$("$PANEL" --json)"

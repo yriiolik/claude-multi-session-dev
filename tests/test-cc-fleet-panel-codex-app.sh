@@ -141,8 +141,8 @@ assert_eq "$(J "$OUT" 'j.groups[0].ownerSource')" "meta" "有 owner.meta 时来�
 assert_eq "$(J "$OUT" 'j.groups[1].title')" "出库单收货信息修复" "没有 owner.meta 时按 task.meta 的 cwd 推断"
 assert_eq "$(J "$OUT" 'j.groups[1].ownerSource')" "inferred" "推断出来的来源标为 inferred"
 assert_eq "$(J "$OUT" 'j.groups[0].modules.length')" "5" "worker 归到各自的任务组"
-assert_eq "$(J "$OUT" 'j.groups[0].done')" "1" "组内已完成计数"
-assert_eq "$(J "$OUT" 'j.groups[0].pending')" "4" "组内未完成计数"
+assert_eq "$(J "$OUT" 'j.groups[0].done')" "3" "组内已完成计数（已回执 + 需核验 + 失败）"
+assert_eq "$(J "$OUT" 'j.groups[0].pending')" "2" "组内未完成计数（执行中 + 待输入）"
 
 CASE="归属兜底"
 mv "$COORD_B/task.meta" "$COORD_B/task.meta.bak"
@@ -156,15 +156,17 @@ CASE="未完成/已完成"
 OUT="$(run_panel --json)"
 assert_eq "$(bucket_of "$OUT" running-mod)" "pending"   "执行中 → 未完成"
 assert_eq "$(bucket_of "$OUT" blocked-mod)" "pending"   "待输入 → 未完成"
-assert_eq "$(bucket_of "$OUT" failed-mod)"  "pending"   "失败 → 未完成"
+assert_eq "$(bucket_of "$OUT" failed-mod)"  "done"      "失败 → 已完成（不在跑了）"
 assert_eq "$(bucket_of "$OUT" done-mod)"    "done"      "有 result: 回执 → 已完成"
-# 这条是本技能最容易踩的坑：thread 空闲但没落回执，绝不能算完成
-assert_eq "$(bucket_of "$OUT" idle-mod)"    "pending"   "idle 且无回执 → 未完成（需核验）"
+# 只有还在跑的算未完成；thread 空闲但没落回执不在跑了，归已完成，但绝不能当成交付——状态词与 attention 单独标出
+assert_eq "$(bucket_of "$OUT" idle-mod)"    "done"      "idle 且无回执 → 已完成栏（需核验）"
 assert_eq "$(label_of "$OUT" idle-mod)"     "需核验"     "需核验的状态词要单独标出来"
+assert_eq "$(J "$OUT" '["idle-mod","failed-mod","done-mod","running-mod","blocked-mod"].map(m=>j.jobs.find(x=>x.module===m).attention).join()')" "1,1,0,0,0" "没落回执的终态带 attention，已回执与在跑的不带"
 assert_eq "$(label_of "$OUT" running-mod)"  "执行中"     "执行中的状态词"
 assert_eq "$(label_of "$OUT" blocked-mod)"  "待输入"     "待输入的状态词"
-# 未完成排在已完成前面
+# 未完成排在已完成前面；已完成栏里需要关注的排在已回执前面
 assert_eq "$(J "$OUT" 'j.jobs.findIndex(x=>x.module==="done-mod")>j.jobs.findIndex(x=>x.module==="running-mod")')" "true" "组内未完成排在已完成之前"
+assert_eq "$(J "$OUT" 'j.jobs.filter(x=>x.rq==="RQ-TEST-001").map(x=>x.module).join()')" "running-mod,blocked-mod,idle-mod,failed-mod,done-mod" "栏内顺序：执行中→待输入 | 需核验→失败→已回执"
 
 # ---------------------------------------------------------------- detail 列
 CASE="detail 列"
@@ -266,7 +268,7 @@ OUT="$(run_panel --once --plain)"
 assert_contains "$OUT" "Codex Fleet"              "有标题"
 assert_contains "$OUT" "虚拟OMS上线前检查清单"      "任务组标题是主 session 名字"
 assert_contains "$OUT" "RQ-TEST-001"             "组标题带 RQ"
-assert_contains "$OUT" "1/5 完成"                 "组标题带完成度"
+assert_contains "$OUT" "3/5 完成"                 "组标题带完成度（不在跑的都算完成）"
 assert_contains "$OUT" "未完成"                   "有未完成栏"
 assert_contains "$OUT" "已完成"                   "有已完成栏"
 assert_contains "$OUT" "↳running-mod"            "worker 行只留模块名（RQ 已在组标题）"

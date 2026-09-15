@@ -116,9 +116,10 @@
 - 实现完后跑**改动相关**的单测 + e2e，读结果，全绿再算完成。
 - 测试失败只许改代码，**禁止**降低断言/删用例/加 skip 来让它过。
 - 本模块的测试由你自己负责，主 session 不替你测。
-- **跑 e2e 前先抢串行锁**：`~/.claude/skills/multi-session-dev/scripts/cc-fleet-e2e-lock acquire {{COORD_DIR}} {{MODULE}}`，
-  跑完（不论过没过）立刻 `… release {{COORD_DIR}} {{MODULE}}`。同一 RQ 里多个 worker 并行跑 e2e 会撞共享 dev DB +
-  shared/dist（实测假失败 6 → 44 条）。抢不到就等；等超时写回执「需主 session 裁决」，⛔ 不许绕过锁硬跑。
+- **跑 e2e 前先抢 e2e 锁**：在被测项目目录下执行 `~/.claude/skills/multi-session-dev/scripts/cc-fleet-e2e-lock acquire {{COORD_DIR}} {{MODULE}}`，
+  跑完（不论过没过）立刻 `… release {{COORD_DIR}} {{MODULE}}`。锁自动选模式：项目根有 `.e2e-isolated`（e2e 每轮独立临时库）
+  → **共享**，worker 之间不互等；没有声明、或你改了声明里列出的文件（如 `schema.prisma`）→ **独占**，同一 RQ 一次只放一个
+  （共享 dev DB / 共享生成产物会互相覆盖，实测假失败 6 → 44 条）。抢不到就等；等超时写回执「需主 session 裁决」，⛔ 不许绕过锁硬跑。
 - **长任务心跳**：若你用 nohup / 后台起了要跑十几分钟以上的任务（全量 e2e、发布），等它期间每 ≤3 分钟
   `touch {{COORD_DIR}}/{{MODULE}}.alive` 一次（如 `while kill -0 $PID 2>/dev/null; do touch …; sleep 120; done &`）。
   主 session 的 watch 靠这个文件知道你还活着；不 touch 会被判「静默结束」而失明。

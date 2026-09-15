@@ -233,12 +233,13 @@ cc-fleet-summary <RQ>
 - `📄 结果文件 ✓/✗ <path>` —— 回执「测试结果文件」列的落盘路径是否存在；✗ 按未自测处理。
 - 缺 sha / 缺结果文件各有 ⚠ 提示：开发型模块必须补，只读角色可忽略。
 
-## e2e 串行锁 / 长任务心跳（worker 侧，preamble 已要求）
+## e2e 锁 / 长任务心跳（worker 侧，preamble 已要求）
 
 ```bash
-cc-fleet-e2e-lock acquire "$COORD" <module> [--wait 7200] [--stale 5400]   # 跑 e2e 前抢锁；持有超 stale 秒视为死锁强制回收
+cc-fleet-e2e-lock acquire "$COORD" <module> [--wait 7200] [--stale 5400] [--project-dir DIR] [--mode shared|exclusive]
+                                                                            # 跑 e2e 前抢锁；持有超 stale 秒视为死锁强制回收
 cc-fleet-e2e-lock release "$COORD" <module>                                 # 跑完立刻放（只放自己的）
-cc-fleet-e2e-lock status  "$COORD"
+cc-fleet-e2e-lock status  "$COORD"                                          # 独占持有者 + 共享持有者
 touch "$COORD/<module>.alive"      # 等 nohup 长任务期间每 ≤3 分钟一次；status 报 aliveAge、watch 视为在跑不判 💤
 ```
 退出码：0 成功 / 1 等锁超时（写「需主 session 裁决」，别硬跑）/ 3 release 时锁不是自己的。

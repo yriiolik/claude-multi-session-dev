@@ -42,7 +42,7 @@ git clone git@github.com:yriiolik/claude-multi-session-dev.git ~/.claude/skills/
 - `scripts/cc-codex-ensure` — **Codex 后端一站式就绪自愈**，由 `cc-dispatch-codex-app` 内部自动调用：拉起 app-server、收陈旧 pid、config.toml 变更后按需重启（有 worker 在跑则不打断）。正常情况零输出，所以派发前**不需要**先跑 doctor。
 - `scripts/cc-dispatch` 读 `~/.claude/multi-session-dev.json`（技能目录外、不入库）按 `--profile` 选配置块决定 Claude worker 的模型与思考深度：`worker`（普通模块，缺省 `claude-opus-5` + `high`）、`spike`（模式 C 打样先行段① 骨架 worker，缺省 `claude-fable-5-1` + `xhigh`），经 daemon 协议 `launch.args`/`respawnFlags` 下发，不走环境变量、不按任务卡动态判断。
 - `scripts/cc-fleet-summary` 收回执时对每份回执做机械核验：「关键 commit」是否真在 `fleet/<RQ>` 上（+ 改动统计）、「测试结果文件」是否存在——主 session 验收只读回执与结果文件，不读 diff。
-- `scripts/cc-fleet-e2e-lock` — 同一 RQ 内 worker 跑 e2e 的串行锁（mkdir 原子抢占、过期回收）；配合 `<COORD>/<module>.alive` 长任务心跳（`cc-fleet-status` 报 `aliveAge`，watch 不再把等 nohup 的 worker 判成静默）。
+- `scripts/cc-fleet-e2e-lock` — 同一 RQ 内 worker 跑 e2e 的锁（mkdir 原子抢占、过期回收）：项目根有 `.e2e-isolated`（e2e 每轮独立临时库）且未改其中列出的共享生成产物源文件时走**共享**模式互不等待，否则**独占**串行；配合 `<COORD>/<module>.alive` 长任务心跳（`cc-fleet-status` 报 `aliveAge`，watch 不再把等 nohup 的 worker 判成静默）。
 - `scripts/cc-codex-session-config` — 统一管理 Codex worker 路由；默认读取 `~/.codex/multi-session-dev.json`，只保存 provider/model 与认证环境变量名，不保存 key。
 - `scripts/cc-codex-doctor` — Codex/DeepSeek worker 后端逐项体检报告（人看的）；派发报「后端未就绪」时再跑。
 - `reference/` — 命令手册与模板：`commands.md`（每个场景的完整参数/退出码）、`codex-mode.md`（Codex 后端差异）、`PROTOCOL.md`、`dispatch-preamble.md`、`task-card-template.md`、`contract-first.md`、`doc-traceability.md`、`pitfalls.md` 等。

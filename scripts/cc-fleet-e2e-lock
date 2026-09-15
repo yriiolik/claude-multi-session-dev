@@ -1,17 +1,26 @@
 #!/usr/bin/env bash
-# cc-fleet-e2e-lock — 同一 RQ 下「跑 e2e 的 worker 一次只放一个」的串行锁（worker 在跑 e2e 前后调用）。
+# cc-fleet-e2e-lock — 同一 RQ 下 worker 跑 e2e 的锁（worker 在跑 e2e 前后调用），两种模式自动选择：
 #
-# 为什么需要它：多个 worker 并行跑 e2e 会撞共享 dev DB + shared/dist，实测假失败从 6 条炸到 44 条，
-#   然后各自回修一轮纯烧 token。主 session 派发时已尽量一次只放一个跑 e2e 的 worker，本脚本是机械兜底：
-#   worker 跑 e2e 之前先抢锁，抢不到就等；跑完（不论过没过）立刻放锁。
+#   独占（exclusive）：一次只放一个跑 e2e 的 worker。项目的 e2e 共用 dev DB 时必须如此——
+#     多个 worker 并行跑会互相清库，实测假失败从 6 条炸到 44 条，然后各自回修一轮纯烧 token。
+#   共享（shared）：项目根有 `.e2e-isolated` 声明（e2e 每轮独立临时库，如 supply-agent 的 factory / virtual-oms），
+#     worker 之间互不等待；只在有人持独占锁时让路。
 #
-# 实现：`mkdir <COORD>/e2e.lock` 原子抢占（目录存在即失败），锁内写 owner 文件记模块名 + 时间。
-#   过期抢占：持有超过 --stale 秒（默认 5400 = 90 分钟，覆盖 70 分钟全量 e2e）视为持有者已死，强制回收。
+# 模式判定（acquire 时，从 --project-dir（缺省当前目录）向上找到 git 根为止）：
+#   · 找不到 `.e2e-isolated` → 独占（与旧行为一致）；
+#   · 找到了 → 逐行比对其中列出的文件（如 packages/server/prisma/schema.prisma）与**主检出**同路径文件：
+#     全部一致 → 共享；任一不同 → 独占（改了表结构的 worktree 跑 e2e 会重新生成经 node_modules 软链
+#     共享的 Prisma client，覆盖别人正在用的那份）。
+#   · `--mode shared|exclusive` 或 FLEET_E2E_LOCK_MODE 可显式指定。
+#
+# 实现：独占 = `mkdir <COORD>/e2e.lock` 原子抢占；共享 = `<COORD>/e2e.shared/<module>` 登记文件。
+#   独占者先占住 e2e.lock（新来的共享者见到它就让路，防独占者饿死），再等已有共享者全部放锁。
+#   过期回收：持有超过 --stale 秒（默认 5400 = 90 分钟，覆盖 70 分钟全量 e2e）视为持有者已死。
 #
 # 用法（在 worker 内）：
-#   cc-fleet-e2e-lock acquire <COORD_DIR> <module> [--wait SEC] [--stale SEC]   # 抢锁；默认最多等 7200s
-#   cc-fleet-e2e-lock release <COORD_DIR> <module>                              # 放锁（只放自己持有的）
-#   cc-fleet-e2e-lock status  <COORD_DIR>                                       # 看谁持有
+#   cc-fleet-e2e-lock acquire <COORD_DIR> <module> [--wait SEC] [--stale SEC] [--project-dir DIR] [--mode M]
+#   cc-fleet-e2e-lock release <COORD_DIR> <module>     # 放锁（只放自己持有的）
+#   cc-fleet-e2e-lock status  <COORD_DIR>              # 看谁持有
 #
 # 退出码：0 成功 / 1 等锁超时 / 2 用法错 / 3 release 时锁不是自己的（不放，避免误放别人的锁）
 #
@@ -21,7 +30,7 @@ set -uo pipefail
 
 usage() {
   cat >&2 <<'EOF'
-用法: cc-fleet-e2e-lock acquire <COORD_DIR> <module> [--wait SEC] [--stale SEC]
+用法: cc-fleet-e2e-lock acquire <COORD_DIR> <module> [--wait SEC] [--stale SEC] [--project-dir DIR] [--mode shared|exclusive]
       cc-fleet-e2e-lock release <COORD_DIR> <module>
       cc-fleet-e2e-lock status  <COORD_DIR>
 EOF
@@ -33,6 +42,8 @@ MODULE=""
 WAIT="${FLEET_E2E_LOCK_WAIT:-7200}"
 STALE="${FLEET_E2E_LOCK_STALE:-5400}"
 POLL="${FLEET_E2E_LOCK_POLL:-20}"
+PROJECT_DIR="$PWD"
+MODE="${FLEET_E2E_LOCK_MODE:-}"
 
 case "${CMD}" in
   acquire|release) MODULE="${1:-}"; shift || true ;;
@@ -44,6 +55,8 @@ while [[ $# -gt 0 ]]; do
     --wait)  WAIT="${2:-}"; shift 2 || { usage; exit 2; } ;;
     --stale) STALE="${2:-}"; shift 2 || { usage; exit 2; } ;;
     --poll)  POLL="${2:-}"; shift 2 || { usage; exit 2; } ;;
+    --project-dir) PROJECT_DIR="${2:-}"; shift 2 || { usage; exit 2; } ;;
+    --mode) MODE="${2:-}"; shift 2 || { usage; exit 2; } ;;
     *) echo "未知参数: $1" >&2; usage; exit 2 ;;
   esac
 done
@@ -51,9 +64,11 @@ done
 if [[ "${CMD}" != "status" ]]; then
   [[ -n "${MODULE}" ]] || { usage; exit 2; }
 fi
+case "${MODE}" in ''|shared|exclusive) ;; *) echo "❌ --mode 只能是 shared / exclusive: ${MODE}" >&2; exit 2 ;; esac
 
 LOCK="${COORD}/e2e.lock"
 OWNER_FILE="${LOCK}/owner"
+SHARED="${COORD}/e2e.shared"
 
 now() { date +%s; }
 lock_owner() { [[ -f "${OWNER_FILE}" ]] && head -1 "${OWNER_FILE}" | cut -d' ' -f1 || echo "?"; }
@@ -68,22 +83,90 @@ try_take() {
   return 1
 }
 
-case "${CMD}" in
-  status)
-    if [[ -d "${LOCK}" ]]; then
-      echo "🔒 e2e 锁被 $(lock_owner) 持有 $(lock_age)s（${LOCK}）"
-    else
-      echo "🔓 e2e 锁空闲（${LOCK}）"
-    fi
-    exit 0 ;;
+# 共享持有者（排除 $1），顺手回收过期登记
+shared_holders() {
+  local f s out=""
+  [[ -d "${SHARED}" ]] || { echo ""; return; }
+  for f in "${SHARED}"/*; do
+    [[ -f "$f" ]] || continue
+    s="$(cut -d' ' -f2 "$f" 2>/dev/null)"; [[ "$s" =~ ^[0-9]+$ ]] || s=0
+    if (( $(now) - s >= STALE )); then rm -f "$f"; continue; fi
+    [[ "$(basename "$f")" == "${1:-}" ]] && continue
+    out="${out:+$out,}$(basename "$f")"
+  done
+  echo "$out"
+}
 
-  acquire)
-    deadline=$(( $(now) + WAIT ))
-    while :; do
-      try_take && { echo "✓ ${MODULE} 已持有 e2e 锁（${LOCK}）"; exit 0; }
-      # 已是自己持有（重入）→ 视为成功
-      if [[ "$(lock_owner)" == "${MODULE}" ]]; then echo "✓ ${MODULE} 已持有 e2e 锁（重入）"; exit 0; fi
-      # 过期抢占：持有者早该跑完，多半已死
+# 判定模式：输出 "<mode>\t<原因>"
+detect_mode() {
+  [[ -n "${MODE}" ]] && { printf '%s\t显式指定\n' "${MODE}"; return; }
+  local dir top marker="" proj rel main p
+  dir="$(cd "${PROJECT_DIR}" 2>/dev/null && pwd -P)" || { printf 'exclusive\t项目目录不存在\n'; return; }
+  top="$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null)" || { printf 'exclusive\t不在 git 仓库内\n'; return; }
+  while :; do
+    [[ -f "$dir/.e2e-isolated" ]] && { marker="$dir/.e2e-isolated"; break; }
+    [[ "$dir" == "$top" || "$dir" == "/" ]] && break
+    dir="$(dirname "$dir")"
+  done
+  [[ -n "$marker" ]] || { printf 'exclusive\t项目未声明 e2e 隔离（无 .e2e-isolated）\n'; return; }
+  proj="$(dirname "$marker")"
+  rel="$(git -C "$proj" rev-parse --show-prefix 2>/dev/null)"
+  main="$(cd "$proj" && cd "$(git rev-parse --git-common-dir)" && cd .. && pwd -P)"
+  while IFS= read -r p || [[ -n "$p" ]]; do
+    p="${p%%#*}"; p="$(printf '%s' "$p" | tr -d '[:space:]')"
+    [[ -n "$p" ]] || continue
+    if ! cmp -s "$proj/$p" "$main/$rel$p"; then
+      printf 'exclusive\t%s 与主检出不同（会覆盖共享的生成产物）\n' "$rel$p"; return
+    fi
+  done < "$marker"
+  printf 'shared\t%s e2e 每轮独立临时库\n' "${rel%/}"
+}
+
+acquire_shared() {
+  local reason="$1" deadline=$(( $(now) + WAIT ))
+  mkdir -p "${SHARED}"
+  while :; do
+    if [[ -d "${LOCK}" && "$(lock_age)" -ge "${STALE}" ]]; then
+      echo "⚠ e2e 独占锁被 $(lock_owner) 持有 $(lock_age)s ≥ stale=${STALE}，判持有者已死，强制回收" >&2
+      rm -rf "${LOCK}"
+    fi
+    if [[ ! -d "${LOCK}" ]]; then
+      printf '%s %s\n' "${MODULE}" "$(now)" > "${SHARED}/${MODULE}"
+      if [[ ! -d "${LOCK}" ]]; then echo "✓ ${MODULE} 以共享方式持有 e2e 锁（${reason}）"; exit 0; fi
+      rm -f "${SHARED}/${MODULE}"   # 登记瞬间有人占了独占位：让路
+    elif [[ "$(lock_owner)" == "${MODULE}" ]]; then
+      echo "✓ ${MODULE} 已持有 e2e 独占锁（重入，覆盖共享申请）"; exit 0
+    fi
+    if [[ "$(now)" -ge "$deadline" ]]; then
+      echo "❌ 等 e2e 锁超时（${WAIT}s），独占锁仍被 $(lock_owner) 持有 $(lock_age)s。别硬跑：写进回执「需主 session 裁决」。" >&2
+      exit 1
+    fi
+    sleep "${POLL}"
+  done
+}
+
+acquire_exclusive() {
+  # held：0 = 还没占到；1 = 本次新占（超时要撤回）；2 = 进来前就是自己的（重入，超时不撤）
+  local reason="$1" deadline=$(( $(now) + WAIT )) held=0 others
+  while :; do
+    if [[ "$held" == 0 ]]; then
+      if [[ -d "${LOCK}" && "$(lock_owner)" == "${MODULE}" ]]; then held=2
+      elif try_take; then held=1
+      fi
+    fi
+    if [[ "$held" != 0 ]]; then
+      [[ -f "${SHARED}/${MODULE}" ]] && rm -f "${SHARED}/${MODULE}"
+      others="$(shared_holders "${MODULE}")"
+      if [[ -z "$others" ]]; then
+        if [[ "$held" == 1 ]]; then echo "✓ ${MODULE} 已持有 e2e 锁（${LOCK}；独占：${reason}）"; else echo "✓ ${MODULE} 已持有 e2e 锁（重入）"; fi
+        exit 0
+      fi
+      if [[ "$(now)" -ge "$deadline" ]]; then
+        [[ "$held" == 1 ]] && rm -rf "${LOCK}"
+        echo "❌ 等 e2e 锁超时（${WAIT}s），仍有共享持有者 ${others} 在跑。别硬跑：写进回执「需主 session 裁决」。" >&2
+        exit 1
+      fi
+    else
       if [[ "$(lock_age)" -ge "${STALE}" ]]; then
         echo "⚠ e2e 锁被 $(lock_owner) 持有 $(lock_age)s ≥ stale=${STALE}，判持有者已死，强制回收" >&2
         rm -rf "${LOCK}"
@@ -93,16 +176,42 @@ case "${CMD}" in
         echo "❌ 等 e2e 锁超时（${WAIT}s），仍被 $(lock_owner) 持有 $(lock_age)s。别硬跑：写进回执「需主 session 裁决」。" >&2
         exit 1
       fi
-      sleep "${POLL}"
-    done ;;
+    fi
+    sleep "${POLL}"
+  done
+}
+
+case "${CMD}" in
+  status)
+    if [[ -d "${LOCK}" ]]; then
+      echo "🔒 e2e 锁被 $(lock_owner) 持有 $(lock_age)s（${LOCK}）"
+    else
+      echo "🔓 e2e 锁空闲（${LOCK}）"
+    fi
+    holders="$(shared_holders)"
+    [[ -n "$holders" ]] && echo "🔗 共享持有者：${holders}"
+    exit 0 ;;
+
+  acquire)
+    IFS=$'\t' read -r mode reason <<< "$(detect_mode)"
+    if [[ "$mode" == "shared" ]]; then acquire_shared "$reason"; else acquire_exclusive "$reason"; fi ;;
 
   release)
-    [[ -d "${LOCK}" ]] || { echo "✓ e2e 锁本就空闲"; exit 0; }
-    if [[ "$(lock_owner)" != "${MODULE}" ]]; then
+    released=0
+    if [[ -f "${SHARED}/${MODULE}" ]]; then
+      rm -f "${SHARED}/${MODULE}"; released=1
+      echo "✓ ${MODULE} 已释放共享 e2e 锁"
+    fi
+    if [[ -d "${LOCK}" ]]; then
+      if [[ "$(lock_owner)" == "${MODULE}" ]]; then
+        rm -rf "${LOCK}"
+        echo "✓ ${MODULE} 已释放 e2e 锁"
+        exit 0
+      fi
+      [[ "$released" == 1 ]] && exit 0
       echo "❌ e2e 锁由 $(lock_owner) 持有，不是 ${MODULE}，不放（避免误放别人的锁）" >&2
       exit 3
     fi
-    rm -rf "${LOCK}"
-    echo "✓ ${MODULE} 已释放 e2e 锁"
+    [[ "$released" == 1 ]] || echo "✓ e2e 锁本就空闲"
     exit 0 ;;
 esac

@@ -72,11 +72,18 @@ Codex CLI 没有 App 原生任务工具时自动走 app-server；不要把工具
    拉起只读面板 `cc-fleet-panel-codex-app`，两种后端的子 session 按任务组同屏展示；面板是全机一块，多个编排主 session 并行时所有任务组都在里面（`init` 即登记，
    `CC_FLEET_PANEL=0` 只是本 session 不开分屏，登记照做）；
    编排判断仍只看 `status` 与回执。
-6. Codex App 原生 worker 用 `wait_threads` + cursor 等待；跨客户端可订阅 Codex events，或使用
-   有界 `cc-fleet wait`。Claude 主端存在 Monitor 才用它挂有界等待；没有推醒机制时继续主端工具等待，
-   不结束响应后声称后台会自动通知。用户明确要求稍后跟进时才按宿主能力设置自动跟进。
+6. **⛔ 不许空手结束响应**：只要还有已派发未终态的 worker，结束本轮响应前必须挂上能把你唤醒的等待。
+   没有任何东西会替你兜底——worker 的主动推送只是快报，会因主端改名/已退出而静默失败，Codex worker
+   根本没有这条通道；写一句「等 m3 和 m7 完成后再派」就交回控制权，等于停在那里直到用户开口。
+   Claude Code 主端：`Bash(run_in_background)` 跑 `cc-fleet await`，进程退出即把通知投递回主 session；
+   Codex App 原生 worker 用 `wait_threads` + cursor；跨客户端可订阅 Codex events 或重复有界 `cc-fleet wait`。
+   `await` 在被盯模块状态变化、或 running 却长时间无可观测活动（stalled）时退出；醒来先 `status` 再决定。
+   它只盯挂起那一刻还在跑的模块，**每次新派发后重挂一次**。用户要求稍后跟进时才另设自动跟进。
 7. `status` 从协调目录或本轮临时 inbox 读取回执，`collect` 核验后收存到持久协调目录。`status` 验证回执身份和开发 commit 是否在集成分支；空闲/turn 完成只是运行状态，**不等于任务交付**。
    无回执、未知状态、审批等待均返回需关注，不能死等或擅自判 done。`read` 查看最后回复/日志后纠偏。
+   `running` 只是后端自述，会话已退出后它还会那么说（worker 末条消息没打 `result:` 时尤其如此）。
+   `attention=stalled`（久无可观测活动）多半就是这种僵尸 running：**reply 会被静默吞掉**。先 `read` /
+   核对 worktree HEAD 证实，再按需开 fix 卡接手，⛔ 不要对已结束的会话反复 reply。
 8. 用 `reply` 生成新 attempt，避免上一轮 done 回执冒充新一轮完成；原生路径按输出调用宿主消息工具。
    接口超时显示 launch-uncertain 时先 `reconcile`，不直接再派。换后端/重新实现用新 fix 模块卡。
 9. **测试范围分工（默认，用户无需提醒）**：开发 worker 只跑**自己改动相关**的最小 e2e（任务卡「E2E 范围」

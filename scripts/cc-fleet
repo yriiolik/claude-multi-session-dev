@@ -9,6 +9,7 @@ import re, shlex, subprocess, sys, tempfile, time, uuid
 ROOT = Path(__file__).resolve().parent
 HOSTS = ('codex-app', 'codex-cli', 'claude-code')
 TERMINAL = {'done', 'failed', 'blocked', 'stopped', 'needs-review', 'unknown', 'launch-uncertain'}
+STALE_AFTER = int(os.environ.get('CC_FLEET_STALE_AFTER', '600'))  # running with no observable activity
 
 def run(argv, cwd=None, timeout=45, check=True, input=None, env=None):
     p = subprocess.run([str(x) for x in argv], cwd=cwd, input=input, text=True, env=env,
@@ -312,7 +313,7 @@ def dispatch(a):
             hits=[j for j in claude_jobs() if j.get('name')==d['name'] and Path(j.get('cwd','/')).resolve()==Path(workdir(d)).resolve()]
             if len(hits)!=1 or not hits[0].get('id'):
                 raise RuntimeError('launch outcome uncertain; inspect claude agents --json --all; do not redispatch')
-            j=hits[0]; d.update(shortId=j['id'],sessionId=j.get('sessionId'),state='running')
+            j=hits[0]; d.update(shortId=j['id'],sessionId=j.get('sessionId'),state='running',activeSince=time.time())
         else:
             routing=route(meta(c)); d['routing']=routing
             # Apply fleet permission preference explicitly at thread and turn boundaries.
@@ -331,12 +332,12 @@ def dispatch(a):
             if routing.get('reasoningEffort'): turn['effort']=routing['reasoningEffort']
             if routing.get('providerType')=='deepseek': turn.update(serviceTier=None,summary='none')
             turn.update(permission_params(d, turn=True))
-            res=call('turn/start',turn); d.update(state='running',turnId=res['turn']['id'],startedAt=time.time())
+            res=call('turn/start',turn); d.update(state='running',turnId=res['turn']['id'],startedAt=time.time(),activeSince=time.time())
         # Preserve a concurrently written bind/worktree update.
         d=update(c,m,**{k:v for k,v in d.items() if k not in ('module','worktree','branch')})
         # 记录先落盘再开面板：面板第一次扫描就能看到这个 worker。
         d=sidebar_attach(c,d)
-        emit(dict(d,panel=panel_attach(c,d)))
+        emit(dict(d,panel=panel_attach(c,d),nextWake=wake_hint(c)))
     except Exception:
         update(c,m,state='launch-uncertain')
         raise
@@ -385,16 +386,53 @@ def receipt(c,d):
                 return dict(result='needs-review',summary='commit not landed on integration branch')
     return r
 
-def status_one(c,d,jobs=None):
+def mtime(p):
+    try: return Path(p).stat().st_mtime
+    except (OSError, TypeError): return 0.0
+
+def last_activity(c,d):
+    """Filesystem proof of life. Backend status words keep saying 'working' after a session
+    already exited (a worker whose final message lacked `result:` never flips to done), so a
+    running claim is only trusted while something it would have touched is still moving.
+    The roster record itself is excluded: reply() writes it, which would fake activity."""
+    m=d['module']; ts=[mtime(c/(m+x)) for x in ('.alive','.summary.md','.receipt.json','.prompt.md')]
+    if d.get('worktree'):
+        ts.append(mtime(Path(d['worktree'])/'.git'))
+        with contextlib.suppress(Exception):
+            ts.append(float(git(d['worktree'],'log','-1','--format=%ct')))
+    if d.get('backend')=='claude' and d.get('shortId'):
+        j=Path.home()/'.claude'/'jobs'/d['shortId']; ts.append(mtime(j/'state.json'))
+        with contextlib.suppress(Exception):
+            ts.append(mtime(json.loads((j/'state.json').read_text()).get('linkScanPath')))
+    with contextlib.suppress(Exception):
+        ts.append(mtime(inbox(c,d)))
+    return max(ts)
+
+def stale_check(c,d,out,stale_after):
+    """Annotate a running module that has shown no observable activity for too long."""
+    launched=out.pop('_launchedAt',0.0)
+    if out['state']!='running' or stale_after<=0: return out
+    seen=max(last_activity(c,d), float(d.get('activeSince') or d.get('startedAt') or 0), launched)
+    out['lastActivityAt']=seen or None
+    out['idleFor']=int(time.time()-seen) if seen else None
+    if seen and out['idleFor']>stale_after:
+        out['attention']='stalled'
+        out['attentionHint']=('backend still claims running but nothing moved for '
+                              f"{out['idleFor']}s; verify with read/worktree HEAD before replying "
+                              '(an exited session accepts no reply)')
+    return out
+
+def status_one(c,d,jobs=None,stale_after=0):
     out={k:d.get(k) for k in ('module','backend','transport','sessionId','shortId','state','worktree')}
     try:
         r=receipt(c,d)
         if r: out.update(state=r['result'],receipt=r); return out
         if d['state'] in ('prepared','setting-up','launching','launch-uncertain','stopped'): return out
         if d['backend']=='claude':
-            j=next((x for x in jobs if x.get('id')==d['shortId']),None)
+            j=next((x for x in (claude_jobs() if jobs is None else jobs) if x.get('id')==d['shortId']),None)
             if j is None: out['state']='unknown'; return out
             st=j.get('state'); out['backendState']=st; out['waitingFor']=j.get('waitingFor')
+            out['_launchedAt']=float(j.get('startedAt') or 0)/1000  # ms; floor for staleness
             out['state']={'done':'needs-review','failed':'failed','blocked':'blocked','stopped':'stopped','working':'running'}.get(st,'unknown')
         else:
             t=call('thread/read',dict(threadId=d['sessionId'],includeTurns=True))['thread']
@@ -406,18 +444,20 @@ def status_one(c,d,jobs=None):
                 out['state']='failed' if turns[-1]['status']=='failed' else 'stopped'
     except Exception as e:
         out.update(state='unknown',error=type(e).__name__)
-    return out
+    return stale_check(c,d,out,stale_after)
 
-def statuses(c):
+def statuses(c,stale_after=STALE_AFTER):
     ds=[json.loads(p.read_text()) for p in sorted((c/'v2').glob('*.json'))]
     jobs=[]
     if any(d['backend']=='claude' for d in ds):
         try: jobs=claude_jobs()
         except Exception: jobs=[]
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-        return list(pool.map(lambda d:status_one(c,d,jobs),ds))
+        return list(pool.map(lambda d:status_one(c,d,jobs,stale_after),ds))
 
-def status(a): emit({'jobs':statuses(coord(a.coord))})
+def status(a):
+    rows=statuses(coord(a.coord),a.stale_after)
+    emit({'jobs':rows,'stalled':[r['module'] for r in rows if r.get('attention')=='stalled']})
 
 def read(a):
     c=coord(a.coord); d=load(c,a.module); r=receipt(c,d)
@@ -429,6 +469,11 @@ def reply(a):
     c=coord(a.coord); d=load(c,a.module); text=Path(a.text_file).read_text()
     if not text.strip(): raise ValueError('empty reply')
     if not d.get('sessionId') and not d.get('shortId'): raise ValueError('session not registered')
+    cur=status_one(c,dict(d),stale_after=STALE_AFTER)
+    if cur.get('attention')=='stalled' and not a.force:
+        raise ValueError(f"module idle for {cur['idleFor']}s while claiming running; the session may "
+                         'have ended and would swallow this reply. Check read/worktree HEAD first, '
+                         'then use --force or dispatch a fix module instead')
     # Archive old receipts before a new attempt so stale done cannot win over resumed work.
     with lock(c,a.module):
         d=load(c,a.module); old=c/(a.module+'.receipt.json')
@@ -458,7 +503,9 @@ def reply(a):
                 if routing.get('providerType')=='deepseek': params.update(serviceTier=None,summary='none')
                 params.update(permission_params(d, turn=True))
                 call('turn/start',params)
-        emit(update(c,a.module,state='running'))
+        # activeSince anchors staleness: an exited session accepts the reply silently, so if
+        # nothing moves after this stamp, status/await surface it instead of claiming running.
+        emit(dict(update(c,a.module,state='running',activeSince=time.time()),nextWake=wake_hint(c)))
     except Exception:
         update(c,a.module,state='launch-uncertain'); raise
 
@@ -482,6 +529,43 @@ def wait(a):
         if remaining<=0: emit({'reason':'timeout','jobs':rows}); return
         time.sleep(min(a.interval,remaining))
 
+def wake_hint(c):
+    """Emitted on every dispatch/reply: the controller must not end its turn empty-handed."""
+    return (f'{ROOT/"cc-fleet"} await --coord {shlex.quote(str(c))}'
+            '  # 结束响应前用 run_in_background 挂上，否则没有任何东西会叫醒你')
+
+def pending(rows):
+    """Modules actually dispatched and not settled yet; 'prepared' is not dispatched."""
+    return [r for r in rows if r['state'] not in TERMINAL and r['state']!='prepared']
+
+def await_(a):
+    """Long-lived wake-up for the controlling session: block until a watched module changes
+    state, then exit so the host delivers the exit notification back to the main session."""
+    if not 60<=a.timeout<=86400: raise ValueError('--timeout must be 60..86400 seconds')
+    if not 5<=a.interval<=300: raise ValueError('--interval must be 5..300 seconds')
+    c=coord(a.coord)
+    targets={x for x in re.split(r'[,\s]+',a.modules or '') if x}
+    rows=[r for r in statuses(c,a.stale_after) if not targets or r['module'] in targets]
+    base={r['module']:r['state'] for r in pending(rows)}
+    if not base:
+        emit({'reason':'nothing-to-await','label':a.label,'jobs':rows}); return
+    end=time.monotonic()+a.timeout
+    while True:
+        time.sleep(max(1,min(a.interval,end-time.monotonic())))
+        rows=[r for r in statuses(c,a.stale_after) if r['module'] in base]
+        seen={r['module'] for r in rows}
+        changed=[{'module':r['module'],'from':base[r['module']],'to':r['state'],
+                  'summary':(r.get('receipt') or {}).get('summary')}
+                 for r in rows if r['state']!=base[r['module']]]
+        changed+=[{'module':m,'from':base[m],'to':'gone','summary':None} for m in sorted(base.keys()-seen)]
+        stalled=[r['module'] for r in rows if r.get('attention')=='stalled']
+        if changed or stalled:
+            emit({'reason':'state-changed' if changed else 'stalled','label':a.label,
+                  'changed':changed,'stalled':stalled,
+                  'stillPending':[r['module'] for r in pending(rows)],'jobs':rows}); return
+        if time.monotonic()>=end:
+            emit({'reason':'timeout','label':a.label,'waitedSeconds':a.timeout,'jobs':rows}); sys.exit(3)
+
 def collect(a):
     c=coord(a.coord); d=load(c,a.module); r=receipt(c,d)
     if not r or r['result']=='needs-review': raise ValueError('no verified receipt to collect')
@@ -499,14 +583,18 @@ def reconcile(a):
     if d['backend']=='claude':
         hits=[j for j in claude_jobs() if j.get('name')==d['name'] and Path(j.get('cwd','/')).resolve()==Path(workdir(d)).resolve()]
         if len(hits)!=1: raise ValueError('cannot uniquely reconcile worker; inspect public session list')
-        j=hits[0]; emit(update(c,a.module,shortId=j['id'],sessionId=j.get('sessionId'),state='running'))
+        # Finding the record only proves the worker exists. Its real state decides: a session
+        # that already ended must not be reported running (replies to it are silently lost).
+        j=hits[0]; d=update(c,a.module,shortId=j['id'],sessionId=j.get('sessionId'),state='running')
+        emit(update(c,a.module,state=status_one(c,d,[j])['state']))
     else:
         sid=a.session_id or d.get('sessionId')
         if not sid: raise ValueError('supply --session-id from the verified Codex task list')
         t=call('thread/read',dict(threadId=sid,includeTurns=False))['thread']
         if d['transport']!='native' and Path(t.get('cwd','/')).resolve()!=Path(workdir(d)).resolve():
             raise ValueError('thread cwd does not match prepared worktree')
-        emit(sidebar_attach(c,update(c,a.module,sessionId=sid,state='running')))
+        d=update(c,a.module,sessionId=sid,state='running')
+        emit(sidebar_attach(c,update(c,a.module,state=status_one(c,d)['state'])))
 
 def events(a):
     c=coord(a.coord); d=load(c,a.module)
@@ -522,9 +610,17 @@ def parser():
     p=argparse.ArgumentParser(description=__doc__); s=p.add_subparsers(dest='cmd',required=True)
     q=s.add_parser('init'); q.add_argument('--cwd',required=True); q.add_argument('--host',choices=HOSTS,required=True)
     q.add_argument('--owner-id'); q.add_argument('--base'); q.add_argument('--rq'); q.set_defaults(fn=init)
-    for cmd,fn in [('prepare',prepare),('dispatch',dispatch),('register',register),('bind',bind),('status',status),('read',read),('reply',reply),('stop',stop),('wait',wait),('reconcile',reconcile),('events',events),('collect',collect)]:
+    for cmd,fn in [('prepare',prepare),('dispatch',dispatch),('register',register),('bind',bind),('status',status),('read',read),('reply',reply),('stop',stop),('wait',wait),('await',await_),('reconcile',reconcile),('events',events),('collect',collect)]:
         q=s.add_parser(cmd); q.add_argument('--coord',required=True); q.set_defaults(fn=fn)
-        if cmd not in ('status','wait'): q.add_argument('--module',required=True,type=name)
+        if cmd not in ('status','wait','await'): q.add_argument('--module',required=True,type=name)
+        if cmd in ('status','await'):
+            q.add_argument('--stale-after',type=int,default=STALE_AFTER,metavar='SECONDS',
+                           help='flag a running module with no observable activity for this long (0 disables)')
+        if cmd=='await':
+            q.add_argument('--modules',help='comma/space separated subset; default: everything still running')
+            q.add_argument('--label',help='note echoed back on wake-up so the controller regains context')
+            q.add_argument('--timeout',type=int,default=1800,metavar='60..86400')
+            q.add_argument('--interval',type=int,default=20,metavar='5..300')
         if cmd=='prepare':
             q.add_argument('--permissions',choices=('full','inherit'),default='full',help='worker permissions (default: full); inherit preserves backend configuration')
             q.add_argument('--backend',choices=('codex','claude'),help='default follows host: claude-code -> claude, codex-* -> codex')
@@ -537,7 +633,9 @@ def parser():
         if cmd=='reconcile': q.add_argument('--session-id')
         if cmd=='events': q.add_argument('--timeout',type=int,choices=range(1,56),default=50,metavar='1..55')
         if cmd=='bind': q.add_argument('--worktree',required=True)
-        if cmd=='reply': q.add_argument('--text-file',required=True)
+        if cmd=='reply':
+            q.add_argument('--text-file',required=True)
+            q.add_argument('--force',action='store_true',help='reply even when the module looks stalled')
         if cmd=='wait':
             q.add_argument('--timeout',type=int,choices=range(0,56),default=50,metavar='0..55'); q.add_argument('--interval',type=int,choices=range(2,31),default=5,metavar='2..30')
     return p

@@ -12,6 +12,7 @@
 "$FLEET" dispatch --coord "$COORD" --module ui
 "$FLEET" status --coord "$COORD"
 "$FLEET" wait --coord "$COORD" --timeout 50
+"$FLEET" await --coord "$COORD" --label '等 m3 回修、m7 完成'   # 长驻唤醒，配 run_in_background
 "$FLEET" read --coord "$COORD" --module api
 "$FLEET" collect --coord "$COORD" --module api
 "$FLEET" reply --coord "$COORD" --module api --text-file /absolute/correction.md
@@ -69,8 +70,41 @@ verify/integ 的 commit 必须是实际验收 SHA，且与工作树 HEAD 和当�
 ```
 
 events 的 turn-completed 只触发收回执，不直接判业务完成。连接断开用 status 补查；订阅会加载 thread，
-只读 UI 面板禁止使用 events。wait 是每5秒补查的有界降级路径，不会替主端建立持久唤醒。
+只读 UI 面板禁止使用 events。wait 是每5秒补查的有界降级路径（≤55 秒），不会替主端建立持久唤醒。
 主端需要持续监督时重复有界等待并回应用户，不做高频 read_thread 轮询。
+
+## await：主 session 的持久唤醒（SKILL.md §6 硬纪律）
+
+`wait` 撑不过一轮响应，而 worker 的主动推送只是快报（主端改名/已退出即静默失败，Codex worker 没有这条
+通道）。**Claude Code 主端结束响应前，只要还有未终态 worker，就用 `Bash(run_in_background)` 挂一个**：
+
+```bash
+"$FLEET" await --coord "$COORD" --modules m3,m7 --label '等 m3 回修、m7 完成' --timeout 1800
+```
+
+进程退出时宿主把通知投递回主 session，无需轮询，也不依赖 worker 是否记得推送。语义：
+
+- 进入时拍一次基线，**只盯当时已派发且未终态的模块**（`prepared` 不算；`--modules` 可限定子集）。
+  基线里没有活着的模块时立即返回 `nothing-to-await`——所以增量派发场景不会像 `wait` 那样秒退。
+- 退出条件：被盯模块状态变化（`state-changed`，带 from/to 与回执 summary）、出现 stalled（`stalled`）、
+  或超时（`timeout`，退出码 3）。`stillPending` 告诉你还剩谁在跑。
+- `--timeout` 60..86400（默认 1800）、`--interval` 5..300（默认 20）。**派了新卡要重挂**，一次只挂一个。
+- 醒来后先 `status` 再决策，别拿 await 的快照当交付依据。
+
+## stalled：识破「僵尸 running」
+
+后端状态字会在会话结束后继续说 running（worker 末条消息没打 `result:` 时 daemon 就把它钉在 `working`），
+此时 `reply` 发出去无人接收、`status` 永远 running，主端死等。`status` / `await` 因此不只看状态字，还查
+**文件系统层面的活动证据**：worktree 的 git 活动与 HEAD 提交时间、`<coord>/<module>.alive` 心跳、回执/
+临时回执、Claude 后端的 job `state.json` 与 transcript mtime，以及最近一次 dispatch/reply 时刻（`activeSince`）。
+
+`running` 且这些证据全都超过 `--stale-after`（默认 600 秒，`CC_FLEET_STALE_AFTER` 可改，0 关闭）没动过
+→ 标 `attention=stalled`，`status` 顶层给 `stalled` 列表，`await` 据此唤醒主端。**state 本身不改**，
+stalled 只是「该去看一眼」。核实手段：`read` 看最后回复/日志、比对 worktree HEAD 有没有动。
+
+`reply` 对 stalled 模块**直接拒绝**并提示核实，确认会话还活着才用 `--force`；会话确已结束就开 fix 卡接手
+（新模块名如 `m1-fix1`），⛔ 不要对死会话反复 reply。`reconcile` 同理只认后端真实状态：找到 job 记录只能
+证明 worker 存在，`done` 的会话按 `needs-review` 报，不再硬写 running。
 
 `stop` 中断 worker，保留会话和 worktree；不会删除分支或成果。没有运行 turn 的 Codex 任务只登记 stopped。
 

@@ -43,6 +43,7 @@ git clone git@github.com:yriiolik/claude-multi-session-dev.git ~/.claude/skills/
 - `scripts/cc-dispatch` 读 `~/.claude/multi-session-dev.json`（技能目录外、不入库）按 `--profile` 选配置块决定 Claude worker 的模型与思考深度：`worker`（普通模块，缺省 `claude-opus-5` + `high`）、`spike`（模式 C 打样先行段① 骨架 worker，缺省 `claude-fable-5-1` + `xhigh`），经 daemon 协议 `launch.args`/`respawnFlags` 下发，不走环境变量、不按任务卡动态判断。
 - `scripts/cc-fleet-summary` 收回执时对每份回执做机械核验：「关键 commit」是否真在 `fleet/<RQ>` 上（+ 改动统计）、「测试结果文件」是否存在——主 session 验收只读回执与结果文件，不读 diff。
 - `scripts/cc-fleet-e2e-lock` — 同一 RQ 内 worker 跑 e2e 的锁（mkdir 原子抢占、过期回收）：项目根有 `.e2e-isolated`（e2e 每轮独立临时库）且未改其中列出的共享生成产物源文件时走**共享**模式互不等待，否则**独占**串行；配合 `<COORD>/<module>.alive` 长任务心跳（`cc-fleet-status` 报 `aliveAge`，watch 不再把等 nohup 的 worker 判成静默）。
+- `scripts/cc-fleet` 的 `await` / `status --stale-after` — **主 session 不再"停住"的两条防线**：`await` 是长驻唤醒，配 `Bash(run_in_background)` 挂起，被盯模块状态一变（或久无动静）即退出，由宿主把通知投递回主 session，不依赖 worker 是否记得主动推送；`stalled` 标记则识破「会话已结束、后端状态字还在说 running」的僵尸（worker 末条消息漏打 `result:` 时必然发生），`reply` 遇到它直接拒绝以免指令被静默吞掉。详见 `reference/v2-commands.md`。
 - `scripts/cc-fleet-e2e-scope` — 把「这轮跑哪些 e2e」从全量收敛到改动相关的最小集合：`suggest` 按改动文件反查候选 spec（剔除无区分度的过宽词干、受 ≤6 个预算截断，并按项目出 factory 的 `--project=… --no-deps` / virtual-oms 的 `--shards …`）、`record` 登记 worker 实际跑过的范围、`plan` 供主端合成一次性回归集合并判断是否该升级全量。规则见 `reference/delivery-quality.md` §6。
 - `scripts/cc-codex-session-config` — 统一管理 Codex worker 路由；默认读取 `~/.codex/multi-session-dev.json`，只保存 provider/model 与认证环境变量名，不保存 key。
 - `scripts/cc-codex-doctor` — Codex/DeepSeek worker 后端逐项体检报告（人看的）；派发报「后端未就绪」时再跑。

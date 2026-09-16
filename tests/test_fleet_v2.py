@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import json, os, pathlib, shutil, subprocess, tempfile, unittest
+import json, os, pathlib, shutil, subprocess, tempfile, time, unittest
 
 ROOT=pathlib.Path(__file__).resolve().parents[1]
 FLEET=ROOT/'scripts/cc-fleet'
@@ -316,5 +316,62 @@ class FleetTests(unittest.TestCase):
   c2,_,_=self.setup_worker(backend='claude',role='verify',module='ver');p2=(c2/'ver.prompt.md').read_text()
   self.assertNotIn('cc-fleet-land',p2);self.assertIn('真实页面',p2)
   c3,_,_=self.setup_worker(host='codex-app',module='nat');self.assertIn('git switch --detach',(c3/'nat.prompt.md').read_text())
+
+ # --- 主 session 唤醒与"僵尸 running"兜底 ---------------------------------
+ def stale_worker(self,backend='codex'):
+  """已派发、后端仍自称活跃、但没有任何可观测活动的 worker。"""
+  c,d,_=self.setup_worker(backend=backend);self.cli('dispatch','--coord',c,'--module','api')
+  time.sleep(2.2);return c,d  # > --stale-after 1，idleFor 取整后才真的超阈值
+ def test_status_flags_running_without_activity_as_stalled(self):
+  c,_=self.stale_worker()
+  fresh=self.cli('status','--coord',c);self.assertEqual(fresh['stalled'],[])  # 默认 600s 内不误报
+  out=self.cli('status','--coord',c,'--stale-after','1')
+  self.assertEqual(out['jobs'][0]['state'],'running')  # 后端状态字保持不变
+  self.assertEqual(out['stalled'],['api']);self.assertEqual(out['jobs'][0]['attention'],'stalled')
+  self.assertGreaterEqual(out['jobs'][0]['idleFor'],1)
+ def test_activity_clears_stale_flag(self):
+  c,_=self.stale_worker()
+  (c/'api.alive').write_text('heartbeat')  # worker 心跳即视为在跑
+  self.assertEqual(self.cli('status','--coord',c,'--stale-after','1')['stalled'],[])
+ def test_reply_refuses_stalled_session_unless_forced(self):
+  c,_=self.stale_worker();t=self.root/'fix.md';t.write_text('继续修 UC-A2')
+  env=dict(self.env,CC_FLEET_STALE_AFTER='1')
+  r=self.cli('reply','--coord',c,'--module','api','--text-file',t,ok=False,env=env)
+  self.assertIn('swallow this reply',r.stderr)
+  out=self.cli('reply','--coord',c,'--module','api','--text-file',t,'--force',env=env)
+  self.assertEqual(out['state'],'running');self.assertGreater(out['activeSince'],0)
+ def test_reconcile_reports_backend_state_not_a_hardcoded_running(self):
+  c,_=self.stale_worker(backend='claude')
+  db=self.db();db['jobs'][0]['state']='done';(self.root/'db.json').write_text(json.dumps(db))
+  # 会话已结束：reconcile 过去硬写 running，主 session 因此死等并对着死会话 reply。
+  self.assertEqual(self.cli('reconcile','--coord',c,'--module','api')['state'],'needs-review')
+ def test_await_wakes_on_state_change(self):
+  c,d=self.stale_worker()
+  p=subprocess.Popen([str(FLEET),'await','--coord',str(c),'--interval','5','--timeout','60','--label','等 api 回执'],
+                     env=self.env,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+  try:
+   time.sleep(1);self.receipt(c,d,commit=self.base)  # worker 落回执 = 完成
+   out,err=p.communicate(timeout=40)
+  except subprocess.TimeoutExpired:
+   p.kill();self.fail('await 没有在 worker 落回执后退出')
+  self.assertEqual(p.returncode,0,err);j=json.loads(out)
+  self.assertEqual(j['reason'],'state-changed');self.assertEqual(j['label'],'等 api 回执')
+  self.assertEqual(j['changed'],[dict(module='api',**{'from':'running','to':'done','summary':'finished'})])
+  self.assertEqual(j['stillPending'],[])
+ def test_await_wakes_on_stall_and_skips_settled_modules(self):
+  c,d=self.stale_worker();self.receipt(c,d)
+  self.assertEqual(self.cli('await','--coord',c)['reason'],'nothing-to-await')  # 已结束的不等
+  c2,_=self.stale_worker()
+  j=self.cli('await','--coord',c2,'--stale-after','1','--interval','5','--timeout','60')
+  self.assertEqual(j['reason'],'stalled');self.assertEqual(j['stalled'],['api'])
+ def test_dispatch_and_reply_point_at_the_wake_hint(self):
+  # 派发/追加指令的输出里必须带着"该挂什么"，主端不靠记性遵守 SKILL.md §6。
+  c,_,_=self.setup_worker();out=self.cli('dispatch','--coord',c,'--module','api')
+  for k in ('await --coord','run_in_background'):self.assertIn(k,out['nextWake'])
+  t=self.root/'more.md';t.write_text('补一条指令')
+  self.assertIn('await --coord',self.cli('reply','--coord',c,'--module','api','--text-file',t)['nextWake'])
+ def test_await_rejects_out_of_range_bounds(self):
+  c,_=self.stale_worker()
+  self.cli('await','--coord',c,'--timeout','30',ok=False);self.cli('await','--coord',c,'--interval','1',ok=False)
 
 if __name__=='__main__':unittest.main(verbosity=2)

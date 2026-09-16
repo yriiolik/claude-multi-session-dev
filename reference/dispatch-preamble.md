@@ -183,8 +183,8 @@
    是否成功，这一步都必须做**——主 session 判断你完成与否靠 daemon 状态，读你改了什么就靠这条消息。
    ⭐ **这条最后消息必须以一行 `result:` 开头**（`result:` 顶格、后跟一句自洽的完成结论）。daemon 的
    状态分类器**只认你最后一条消息的文本**来决定把你标成 `done` 还是 `working`——打了 `result:` 才会翻
-   `done`；若最后一条是叙述/半截话（没有 `result:`），你会**一直停在 `working`**，主 session 要么死等、
-   要么靠 watch 的"持续 idle 静默"兜底才发现你其实早完了——别让它走兜底。
+   `done`；若最后一条是叙述/半截话（没有 `result:`），你会**一直停在 `working`**——会话都退出了后端还在
+   说你在跑，主 session 只能死等，或等 `stalled` 兜底（默认久无动静才判）才发现你其实早完了。别让它走兜底。
    - 没做完而需要人/主 session 介入：用 `needs input:` 顶格开头（会被标 `blocked`，主 session 来处理）。
    - 结构性失败/任务无法完成：用 `failed:` 顶格开头（会被标 `failed/error`，主 session 来回修）。
 

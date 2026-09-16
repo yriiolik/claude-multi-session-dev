@@ -308,8 +308,11 @@ class FleetTests(unittest.TestCase):
  def test_preamble_is_role_and_transport_specific(self):
   c,d,_=self.setup_worker(backend='claude');p=(c/'api.prompt.md').read_text()
   self.assertIn('cc-fleet-land',p);self.assertIn(d['attempt'],p);self.assertIn('CLAUDE.md / AGENTS.md',p);self.assertNotIn('git switch --detach',p)
-  # 绝对路径归一为 P 后比较：旧版前缀约 1740 字，精简后约 1140–1210 字；防止退回旧体量
-  import re;self.assertLess(len(re.sub(r"/[^\s；，。（）\"']+",'P',p.split('\n任务卡：\n')[0])),1300)
+  # 绝对路径归一为 P 后比较：旧版前缀约 1740 字；防止退回旧体量。
+  # 2026-09-16 上调 1300→1500：新增「e2e 只跑改动相关最小集合、不跑全量」纪律约 150 字（约束本身是需求，
+  # 不能为过线删掉）；护栏仍远低于旧体量 1740，developer 前缀实测约 1447。
+  import re;self.assertLess(len(re.sub(r"/[^\s；，。（）\"']+",'P',p.split('\n任务卡：\n')[0])),1500)
+  self.assertIn('不跑项目全量 e2e 入口',p)
   c2,_,_=self.setup_worker(backend='claude',role='verify',module='ver');p2=(c2/'ver.prompt.md').read_text()
   self.assertNotIn('cc-fleet-land',p2);self.assertIn('真实页面',p2)
   c3,_,_=self.setup_worker(host='codex-app',module='nat');self.assertIn('git switch --detach',(c3/'nat.prompt.md').read_text())

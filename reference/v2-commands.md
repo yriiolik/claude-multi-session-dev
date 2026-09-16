@@ -29,7 +29,9 @@ git 根到启动目录路径上的 CLAUDE.md / AGENTS.md（2026-09-11 实测；�
 
 `prepare --transport auto` 根据明确 host/backend 选择路径，不靠环境变量猜宿主。可强制
 `--transport app-server` / `claude-bg` / `native`（原生仅 Codex App + Codex）。`--role` 为
-`developer`（默认）、`scout`、`integ`、`verify`。非开发角色不合回业务代码。
+`developer`（默认）、`scout`、`integ`、`verify`、`regression`。非开发角色不合回业务代码。
+`regression` 是全 RQ 唯一跑成批 e2e 的角色（开发卡各自只跑改动相关的最小集合），范围用
+`cc-fleet-e2e-scope plan` 合成后写进任务卡；规则见 delivery-quality.md §6。
 
 `prepare` 只创建任务元数据/prompt/worktree，不调用模型；`dispatch` 才启动 worker，且只接受 prepared。
 未知启动结果保留 worktree，禁止自动重试创建。修复可用新模块名 `api-fix1`；同模块追加指令用 reply。

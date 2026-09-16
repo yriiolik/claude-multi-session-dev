@@ -1,0 +1,331 @@
+#!/usr/bin/env bash
+# cc-fleet-e2e-scope — 把「这轮跑哪些 e2e」从"全量"收敛到"改动相关的最小集合"。
+#
+# 为什么要这个脚本：仓库里没有「改动文件 → 相关 spec」的正向映射，worker 判断不了范围就一律跑全量入口；
+#   一轮全量几十分钟、吃满 CPU，还在 e2e 锁下把同 RQ 其它 worker 全堵住排队，整轮编排慢一倍。
+#   规矩是：**开发 worker 只跑自己改动相关的最小集合，跨模块全量回归由主 session 最后统一派一张卡跑一次。**
+#
+# 子命令：
+#   suggest  （worker 侧）按本次改动文件反查候选 spec，按相关度排序、受预算上限截断，并给出项目适配的命令
+#   record   （worker 侧）登记本轮实际跑过的范围 → <COORD>/e2e-scope/<module>.txt
+#   plan     （主 session 侧）汇总各 worker 登记 ∪ 集成分支 diff 反推 → 一次性回归集合 + 是否该升级全量
+#
+# 用法：
+#   cc-fleet-e2e-scope suggest [--project-dir DIR] [--base REF] [--max N] [--quiet]
+#   cc-fleet-e2e-scope record  <COORD_DIR> <module> <spec|组名> [...] [--minutes N] [--cmd "实际命令"]
+#   cc-fleet-e2e-scope plan    <COORD_DIR> [--project-dir DIR] [--base REF] [--max N]
+#
+# 约定：--base 缺省取 $FLEET_BASE_BRANCH（派发时注入的集成分支）；plan 另会读 <COORD>/task.meta 的 base_branch。
+#   预算上限 --max 缺省 6（$FLEET_E2E_MAX_SPECS 可改），plan 用 0 表示不截断。
+#   建议只是建议：命中靠文件名/内容词干匹配，worker 仍须按自己对改动的理解裁一遍（删无关的，别加全量）。
+#
+# 退出码：0 正常 / 2 用法错 / 3 环境不满足（不是 git 仓库 / 找不到项目根）
+
+set -uo pipefail
+
+MAX_DEFAULT="${FLEET_E2E_MAX_SPECS:-6}"
+
+usage() {
+  cat >&2 <<'EOF'
+用法: cc-fleet-e2e-scope suggest [--project-dir DIR] [--base REF] [--max N] [--quiet]
+      cc-fleet-e2e-scope record  <COORD_DIR> <module> <spec...> [--minutes N] [--cmd "命令"]
+      cc-fleet-e2e-scope plan    <COORD_DIR> [--project-dir DIR] [--base REF] [--max N]
+EOF
+}
+
+# ── 通用：从 DIR 向上找项目根（含 package.json 且有 tests/ 或 scripts/run-tests.sh），不越过 git 根 ──
+find_project_root() {
+  local d gitroot
+  d="$(cd "$1" 2>/dev/null && pwd)" || return 1
+  gitroot="$(git -C "$d" rev-parse --show-toplevel 2>/dev/null)" || gitroot=""
+  while [ -n "$d" ] && [ "$d" != "/" ]; do
+    if [ -f "$d/package.json" ] && { [ -d "$d/tests" ] || [ -f "$d/scripts/run-tests.sh" ]; }; then
+      printf '%s\n' "$d"; return 0
+    fi
+    [ -n "$gitroot" ] && [ "$d" = "$gitroot" ] && break
+    d="$(dirname "$d")"
+  done
+  return 1
+}
+
+# ── 改动文件：base...HEAD 的提交 + 工作树未提交 + 未跟踪，全部限定在项目根内、输出相对项目根 ──
+changed_files() {
+  local root="$1" base="$2"
+  {
+    if [ -n "$base" ] && git -C "$root" rev-parse --verify --quiet "$base" >/dev/null 2>&1; then
+      git -C "$root" diff --name-only --relative "$base"...HEAD -- . 2>/dev/null
+    fi
+    git -C "$root" diff --name-only --relative HEAD -- . 2>/dev/null
+    git -C "$root" ls-files --others --exclude-standard -- . 2>/dev/null
+  } | LC_ALL=C sort -u | command grep -v -E '^$'
+}
+
+# ── 只留代码/配置文件提词干：文档、截图、测试报告的文件名会灌进一堆用例 ID 当噪声词干 ──
+code_files_only() {
+  command grep -E '\.(ts|tsx|js|jsx|mjs|cjs|vue|prisma|sql)$' \
+  | command grep -v -E '(^|/)(docs|\.workflow|test-results|node_modules|dist)/'
+}
+
+# ── 词干：模块目录段 + 文件基名（驼峰转 kebab、去常见后缀、去停用词、长度≥4）──
+stems_from_files() {
+  awk '
+    { p=$0
+      if (match(p, /modules\/[^\/]+/))  print substr(p, RSTART+8, RLENGTH-8)
+      if (match(p, /pages\/[^\/]+/))    print substr(p, RSTART+6, RLENGTH-6)
+      if (match(p, /services\/[^\/]+/)) print substr(p, RSTART+9, RLENGTH-9)
+      n=split(p, a, "/"); b=a[n]
+      sub(/\.[A-Za-z0-9]+$/, "", b)
+      sub(/\.(service|controller|router|routes|repo|repository|dto|types|store|hook|hooks|util|utils|spec|test)$/, "", b)
+      print b
+    }' \
+  | sed -E 's/([a-z0-9])([A-Z])/\1-\2/g; s/_/-/g' \
+  | tr 'A-Z' 'a-z' \
+  | sed -E 's/\.(spec|test)$//; s/^-+//; s/-+$//' \
+  | command grep -E -v '^(index|main|app|types?|utils?|const|consts|config|common|shared|helpers?|lib|core|server|web|client|schema|package-lock|package)$' \
+  | awk 'length($0) >= 4' \
+  | LC_ALL=C sort -u
+}
+
+# ── 剔除过宽词干：命中 spec 太多的词干（如项目名 factory）没有区分度，留着只会把候选撑回全量 ──
+drop_broad_stems() {
+  local stems_file="$1" names_file="$2" keep="$3" drop="$4" limit="$5" s n
+  : > "$keep"; : > "$drop"
+  while IFS= read -r s; do
+    [ -z "$s" ] && continue
+    n="$(command grep -c -F -- "$s" "$names_file" 2>/dev/null)" || n=0
+    if [ "${n:-0}" -gt "$limit" ]; then printf '%s(%s个)\n' "$s" "$n" >> "$drop"
+    else printf '%s\n' "$s" >> "$keep"; fi
+  done < "$stems_file"
+}
+
+# ── 同理筛内容匹配用的词干：`auth`/`user` 这类几乎每个 spec 内容里都有，拿来匹配等于把全量当候选 ──
+narrow_content_stems() {
+  local stems_file="$1" specs_all="$2" out="$3" limit="$4" s n
+  : > "$out"
+  while IFS= read -r s; do
+    [ -z "$s" ] && continue
+    n="$(tr '\n' '\0' < "$specs_all" | xargs -0 command grep -l -i -F -- "$s" 2>/dev/null | wc -l | tr -d ' ')"
+    [ "${n:-0}" -le "$limit" ] && printf '%s\n' "$s" >> "$out"
+  done < "$stems_file"
+}
+
+# ── 打分：本次直接改到的 spec +10，文件名命中词干 +3，内容命中窄词干 +1（每个 spec 只计一次）──
+score_specs() {
+  local root="$1" stems_file="$2" e2e_dir="$3" changed_specs="${4:-/dev/null}" cstems="${5:-}" re spec rel base score hit
+  re=""
+  [ -n "$cstems" ] && [ -s "$cstems" ] && re="$(tr '\n' '|' < "$cstems" | sed -E 's/\|$//')"
+  while IFS= read -r spec; do
+    base="$(basename "$spec")"; base="${base%.spec.ts}"; base="${base%.spec.js}"
+    rel="${spec#$root/}"
+    score=0; hit=""
+    if command grep -q -F -- "$rel" "$changed_specs" 2>/dev/null; then score=$((score + 10)); hit="本次改到"; fi
+    while IFS= read -r s; do
+      [ -z "$s" ] && continue
+      case "$base" in *"$s"*) score=$((score + 3)); hit="$hit $s" ;; esac
+    done < "$stems_file"
+    if [ -n "$re" ] && command grep -q -i -E -- "$re" "$spec" 2>/dev/null; then
+      score=$((score + 1)); [ -z "$hit" ] && hit=" (仅内容命中)"
+    fi
+    [ "$score" -gt 0 ] && printf '%s\t%s\t%s\n' "$score" "${spec#$root/}" "${hit# }"
+  done < <(find "$e2e_dir" -type f \( -name '*.spec.ts' -o -name '*.spec.js' \) 2>/dev/null | LC_ALL=C sort)
+}
+
+# ── 项目适配：候选 spec → 该项目真正能"只跑这些"的命令 ──
+suggest_command() {
+  local root="$1"; shift
+  local specs="$*"
+  [ -z "$specs" ] && { echo "  （无候选：手工指定，或问主 session 要范围）"; return; }
+  if [ -f "$root/scripts/e2e-shards.mjs" ]; then          # virtual-oms：分片声明是唯一事实源
+    local shards="" sh
+    while IFS= read -r sh; do
+      [ -z "$sh" ] && continue
+      for sp in $specs; do
+        if node "$root/scripts/e2e-shards.mjs" specs "$sh" 2>/dev/null | command grep -q -- "$(basename "$sp")"; then
+          case " $shards " in *" $sh "*) ;; *) shards="$shards $sh" ;; esac
+        fi
+      done
+    done < <(node "$root/scripts/e2e-shards.mjs" list 2>/dev/null | awk '{print $1}')
+    if [ -n "$shards" ]; then
+      echo "  bash scripts/run-all-tests.sh --no-unit --shards $(echo "$shards" | tr ' ' ',' | sed -E 's/^,|,$//g')"
+      echo "  ⚠ 分片是最小可跑单位（片内串行）；⛔ 不许裸跑 scripts/run-tests.sh（会打在开发库上）"
+      return
+    fi
+  fi
+  if [ -f "$root/playwright.config.ts" ] && command grep -q "dependencies:" "$root/playwright.config.ts" 2>/dev/null; then
+    # config 里 testMatch 写的是 JS 正则字面量（/factory-shipment-plan[^/]*\.spec\.ts/），
+    # 所以按正则求值反查每个 spec 属于哪个 project，而不是拿文件名做子串匹配。
+    local groups
+    groups="$(awk -v files="$specs" '
+      BEGIN { n = split(files, F, " ") }
+      /name: *.(group-|setup)/ { if (match($0, /(group-[A-Za-z0-9._-]+|setup)/)) cur = substr($0, RSTART, RLENGTH); next }
+      cur == "" { next }
+      /\.spec/ {
+        line = $0
+        gsub(/\[\^\/\]/, "[^~]", line)               # 字符类里的斜杠会干扰下面取正则字面量
+        if (!match(line, /\/[^ \/]+\//)) next
+        pat = substr(line, RSTART + 1, RLENGTH - 2)
+        if (pat ~ /\(\?/) next                       # JS 先行断言，POSIX awk 求值会直接 fatal
+        op = gsub(/\(/, "(", pat); cl = gsub(/\)/, ")", pat)
+        if (op != cl) next                           # 括号不平衡的（多半截到了注释）同样会 fatal
+        for (i = 1; i <= n; i++) {
+          b = F[i]; sub(/.*\//, "", b)
+          if (b != "" && b ~ pat) print cur
+        }
+      }' "$root/playwright.config.ts" | LC_ALL=C sort -u | command grep -v '^setup$' | tr '\n' ' ')"
+    if [ -n "$groups" ]; then
+      local args=""; for g in $groups; do args="$args --project=$g"; done
+      echo "  bash scripts/run-tests.sh --project=setup$args --no-deps"
+      echo "  ⚠ 本项目命令行文件过滤**不作用于依赖组**：只跑一条链必须 --project=… --no-deps（并显式带 setup）"
+      echo "  · 若上游数据不足导致失败，回执写明缺什么，⛔ 别靠跑整条链/全量凑数据"
+      return
+    fi
+  fi
+  if [ -f "$root/scripts/run-tests.sh" ]; then
+    local port=""
+    command grep -q -E '必填|--port.*(必须|required)' "$root/scripts/run-tests.sh" 2>/dev/null && port=" --port <空闲端口>"
+    echo "  bash scripts/run-tests.sh$port $specs"
+  else
+    echo "  npx playwright test $specs"
+  fi
+}
+
+cmd_suggest() {
+  local pdir="$PWD" base="${FLEET_BASE_BRANCH:-}" max="$MAX_DEFAULT" quiet=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --project-dir) pdir="${2:-}"; shift 2 || { usage; exit 2; } ;;
+      --base) base="${2:-}"; shift 2 || { usage; exit 2; } ;;
+      --max) max="${2:-}"; shift 2 || { usage; exit 2; } ;;
+      --quiet) quiet=1; shift ;;
+      *) echo "未知参数: $1" >&2; usage; exit 2 ;;
+    esac
+  done
+  local root; root="$(find_project_root "$pdir")" || { echo "❌ 找不到项目根（需含 package.json 且有 tests/ 或 scripts/run-tests.sh）：$pdir" >&2; exit 3; }
+  git -C "$root" rev-parse --git-dir >/dev/null 2>&1 || { echo "❌ 不是 git 仓库：$root" >&2; exit 3; }
+
+  local tmp; tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' RETURN
+  changed_files "$root" "$base" > "$tmp/files"
+  local nfiles; nfiles="$(wc -l < "$tmp/files" | tr -d ' ')"
+  if [ "$nfiles" -eq 0 ]; then
+    echo "⚠ 相对 base「${base:-（未给 --base，只看了工作树未提交改动）}」没有改动文件——无从推导范围。"
+    echo "  给对 --base（派发时的集成分支 fleet/<RQ>，环境变量 \$FLEET_BASE_BRANCH），或手工指定 spec。"
+    return 0
+  fi
+  code_files_only < "$tmp/files" > "$tmp/files.code"
+  command grep -E '\.spec\.(ts|js)$' "$tmp/files" > "$tmp/files.spec" 2>/dev/null || : > "$tmp/files.spec"
+  stems_from_files < "$tmp/files.code" > "$tmp/stems.raw"
+
+  # 只认真的装着 spec 的目录：光有 tests/（纯单测项目，如 product-center / wms-mock）不算有 e2e
+  local e2e_dir=""
+  for c in "$root/tests/e2e" "$root/e2e" "$root/tests"; do
+    [ -d "$c" ] || continue
+    [ -n "$(find "$c" -type f \( -name '*.spec.ts' -o -name '*.spec.js' \) 2>/dev/null | head -1)" ] && { e2e_dir="$c"; break; }
+  done
+  if [ -z "$e2e_dir" ]; then
+    echo "ℹ 本项目没有 e2e 目录（如 product-center / wms-mock）：只跑改动相关单测即可"
+    echo "  npx vitest related --run \$(git diff --name-only --relative ${base:-HEAD})"
+    return 0
+  fi
+  find "$e2e_dir" -type f \( -name '*.spec.ts' -o -name '*.spec.js' \) 2>/dev/null | LC_ALL=C sort > "$tmp/specs.all"
+  sed 's#.*/##' "$tmp/specs.all" > "$tmp/specs.names"
+  local nspecs limit; nspecs="$(wc -l < "$tmp/specs.all" | tr -d ' ')"
+  limit=$((nspecs / 8)); [ "$limit" -lt 8 ] && limit=8
+  drop_broad_stems "$tmp/stems.raw" "$tmp/specs.names" "$tmp/stems" "$tmp/stems.drop" "$limit"
+  narrow_content_stems "$tmp/stems" "$tmp/specs.all" "$tmp/stems.content" "$limit"
+  score_specs "$root" "$tmp/stems" "$e2e_dir" "$tmp/files.spec" "$tmp/stems.content" \
+    | LC_ALL=C sort -t"$(printf '\t')" -k1,1nr -k2,2 > "$tmp/scored"
+
+  local total; total="$(wc -l < "$tmp/scored" | tr -d ' ')"
+  if [ "$quiet" -eq 0 ]; then
+    echo "改动文件 $nfiles 个（其中代码 $(wc -l < "$tmp/files.code" | tr -d ' ') 个）→ 词干: $(tr '\n' ' ' < "$tmp/stems")"
+    [ -s "$tmp/stems.drop" ] && echo "已忽略过宽词干（命中 >$limit 个 spec，没有区分度）: $(tr '\n' ' ' < "$tmp/stems.drop")"
+    echo "候选 spec $total 个 / 全项目 $nspecs 个（预算上限 ${max}；⛔ 超了也不许改跑全量）"
+    echo
+  fi
+  local keep; keep="$total"; [ "$max" -gt 0 ] && [ "$total" -gt "$max" ] && keep="$max"
+  echo "建议本轮跑（按相关度）："
+  head -n "$keep" "$tmp/scored" | awk -F"\t" '{printf "  %s\t（命中 %s）\n", $2, $3}'
+  local picked; picked="$(head -n "$keep" "$tmp/scored" | cut -f2 | tr '\n' ' ')"
+  if [ "$total" -gt "$keep" ]; then
+    echo
+    echo "超预算未列入 → 写进回执「建议纳入回归」，交主 session 的回归卡统一跑（共 $((total - keep)) 个，列前 20）："
+    tail -n +"$((keep + 1))" "$tmp/scored" | head -20 | awk -F"\t" '{printf "  %s\n", $2}'
+  fi
+  echo
+  echo "建议命令（跑前先抢 e2e 锁 cc-fleet-e2e-lock acquire）："
+  suggest_command "$root" $picked
+}
+
+cmd_record() {
+  local coord="${1:-}" module="${2:-}"; shift 2 2>/dev/null || { usage; exit 2; }
+  [ -n "$coord" ] && [ -n "$module" ] || { usage; exit 2; }
+  local minutes="" runcmd="" specs=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --minutes) minutes="${2:-}"; shift 2 || { usage; exit 2; } ;;
+      --cmd) runcmd="${2:-}"; shift 2 || { usage; exit 2; } ;;
+      *) specs="$specs $1"; shift ;;
+    esac
+  done
+  [ -n "${specs// /}" ] || { echo "❌ 至少给一个 spec / 组名" >&2; usage; exit 2; }
+  mkdir -p "$coord/e2e-scope" || { echo "❌ 写不进 $coord/e2e-scope" >&2; exit 3; }
+  local f="$coord/e2e-scope/$module.txt"
+  {
+    printf '# module=%s at=%s' "$module" "$(date '+%Y-%m-%d %H:%M:%S')"
+    [ -n "$minutes" ] && printf ' minutes=%s' "$minutes"
+    [ -n "$runcmd" ] && printf ' cmd=%s' "$runcmd"
+    printf '\n'
+    for s in $specs; do printf '%s\n' "$s"; done
+  } >> "$f"
+  echo "✅ 已登记 $module 的 e2e 范围 → $f"
+}
+
+cmd_plan() {
+  local coord="${1:-}"; shift 2>/dev/null || { usage; exit 2; }
+  [ -n "$coord" ] && [ -d "$coord" ] || { echo "❌ COORD_DIR 不存在: $coord" >&2; exit 3; }
+  local pdir="$PWD" base="" max=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --project-dir) pdir="${2:-}"; shift 2 || { usage; exit 2; } ;;
+      --base) base="${2:-}"; shift 2 || { usage; exit 2; } ;;
+      --max) max="${2:-}"; shift 2 || { usage; exit 2; } ;;
+      *) echo "未知参数: $1" >&2; usage; exit 2 ;;
+    esac
+  done
+  [ -z "$base" ] && [ -f "$coord/task.meta" ] && base="$(awk -F= '/^base_branch=/{print $2}' "$coord/task.meta" | head -1)"
+
+  echo "═══ 回归范围合成（RQ 协调目录：${coord}）═══"
+  echo
+  echo "① 各 worker 已自测过的范围（来自 record 登记）："
+  if [ -d "$coord/e2e-scope" ] && [ -n "$(ls -A "$coord/e2e-scope" 2>/dev/null)" ]; then
+    cat "$coord"/e2e-scope/*.txt 2>/dev/null | command grep -v '^#' | LC_ALL=C sort -u | sed 's/^/  /'
+  else
+    echo "  （无登记 —— worker 没按规矩 record；回归集合只能靠 ② 的 diff 反推，范围可能偏大）"
+  fi
+  echo
+  echo "② 集成分支相对 base「${base:-未知}」的改动反推（不截断）："
+  cmd_suggest --project-dir "$pdir" --base "$base" --max "$max" --quiet | sed 's/^/  /'
+  echo
+  echo "③ 是否升级为全量回归（默认否——只跑上面合成的集合）："
+  local root hits=""
+  root="$(find_project_root "$pdir")" || root="$pdir"
+  if [ -n "$base" ]; then
+    hits="$(changed_files "$root" "$base" | command grep -E 'schema\.prisma|prisma/migrations/|seed|middleware|auth|guard|interceptor|app\.module|global|\.env' || true)"
+  fi
+  if [ -n "$hits" ]; then
+    echo "  ⚠ 命中「公共基座」改动，建议升级为全量，并在状态索引写明理由："
+    printf '%s\n' "$hits" | sed 's/^/    /'
+  else
+    echo "  未命中公共基座（schema/迁移/seed/中间件/鉴权/全局配置）→ **不要**跑全量，跑合成集合即可。"
+  fi
+  echo "  另外两种必须全量的情形：本轮要合回共享分支并发布（项目规范要求发布前全量回归）；"
+  echo "  改动跨 ≥3 个模块且互相有数据流。除此之外一律只跑合成集合。"
+}
+
+CMD="${1:-}"; shift 2>/dev/null || true
+case "$CMD" in
+  suggest) cmd_suggest "$@" ;;
+  record)  cmd_record "$@" ;;
+  plan)    cmd_plan "$@" ;;
+  *) usage; exit 2 ;;
+esac

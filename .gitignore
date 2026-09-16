@@ -15,3 +15,6 @@ tmp/
 
 # 任务隔离工作树（Claude Code / git worktree）
 .claude/worktrees/
+
+# Python 测试缓存
+__pycache__/

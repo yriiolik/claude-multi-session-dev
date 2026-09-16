@@ -146,6 +146,22 @@ def preamble(c,d):
             duty+=('在含全部改动的集成版本上用真实页面先连续跑核心主流程，再逐项验证适用分支/异常、幂等和事务；'
                    'API/单测或 mock 自家业务 API 不能替代页面验收，纯接口/CLI 需求记录不适用理由；'
                    '逐例记录操作、结果、截图或 trace 路径、基线 SHA/环境。')
+        if role=='regression':
+            duty+=('本 RQ 的成批 e2e 只由你这一张卡跑一次（开发 worker 各自只跑了改动相关的几条）：'
+                   '在集成基线上持独占 e2e 锁，按任务卡给定的回归集合一次跑完，结果落盘文件；'
+                   '任务卡没写「全量」就不要自行跑项目全量入口，失败逐条回报现象指向哪个模块。')
+    # 测试范围纪律：worker 各跑一遍全量是多 session 最大的隐性成本（几十分钟 + 吃满 CPU + e2e 锁下互相排队）。
+    cq=shlex.quote(str(c)); mq=d['module']
+    scope_bin=shlex.quote(str(ROOT/'cc-fleet-e2e-scope')); lock_bin=shlex.quote(str(ROOT/'cc-fleet-e2e-lock'))
+    if role=='scout': testing=''
+    elif role=='regression':
+        testing=(f'跑前 {lock_bin} acquire {cq} {mq} --mode exclusive、跑完 release；按任务卡给定的回归集合一次跑完并落盘结果，'
+                 f'任务卡没写「全量」就不跑项目全量入口。\n')
+    else:
+        testing=(f'测试只跑本卡改动相关的最小集合（范围见任务卡「E2E 范围」，缺则 {scope_bin} suggest 推导后裁剪；'
+                 f'≤6 spec 且 ≤15 分钟，超预算的写进 risks 交回归卡）；⛔ 不跑项目全量 e2e 入口，'
+                 f'跨模块回归由主 session 统一派 regression 卡跑一次。跑 e2e 前后 {lock_bin} acquire/release {cq} {mq}，'
+                 f'跑完 {scope_bin} record {cq} {mq} <spec…> 登记范围。\n')
     return f'''⟦FLEET-WORKER⟧ rq={rq} module={d['module']} role={role} backend={d['backend']}
 你是独立 worker：不加载 multi-session-dev 编排技能、不再派发 worker，只做任务卡授权的范围。主 session：{fleet['owner']['id']}。
 协调目录 {c}；任务身份 {d['attempt']}（回执 attempt 须一致）；集成分支 {fleet['integrationBranch']}。
@@ -153,7 +169,7 @@ def preamble(c,d):
 开工先运行 {shlex.quote(str(ROOT/'cc-fleet'))} bind --coord {shlex.quote(str(c))} --module {d['module']} --worktree "$PWD"；协调目录只读致失败时不阻断，回执里写真实 worktree。
 规则以启动目录适用的 CLAUDE.md / AGENTS.md 为准（客户端已按目录自动加载）；AGENTS.md 只是指针时按指针读取对应文件；任务涉及其他子项目时先读该子目录的规则文件。
 {duty}
-禁止 reset --hard、推远端、合回共享分支、删除或清理 worktree；范围/权限问题写 blocked 回执并说明所需输入。
+{testing}禁止 reset --hard、推远端、合回共享分支、删除或清理 worktree；范围/权限问题写 blocked 回执并说明所需输入。
 开工及压缩恢复后先读任务卡引用的原始需求、用户用例、契约（及本次参考资料）；实现/验收卡缺用例或必需输入时报告缺项，不自行缩减需求。
 失败如实写 tests.result=failed 且 result=failed/blocked，不藏进 risks、不改 not-run、不删断言；只做了计划不能报 done。
 完成时把下列 JSON 原子写到 {c/(d['module']+'.receipt.json')}（临时文件+rename）；该目录不可写就 mkdir -p 后改写 {inbox(c,d)}，任一成功即可；最后回复同一 JSON。
@@ -351,9 +367,9 @@ def receipt(c,d):
             return dict(result='needs-review',summary='missing verification evidence')
         if any(not isinstance(t,dict) or t.get('result') not in ('passed','not-run') or not t.get('evidence') for t in r['tests']):
             return dict(result='needs-review',summary='invalid or failed verification evidence')
-        if d['role'] in ('verify','integ') and any(t.get('result')!='passed' for t in r['tests']):
+        if d['role'] in ('verify','integ','regression') and any(t.get('result')!='passed' for t in r['tests']):
             return dict(result='needs-review',summary='acceptance has unexecuted verification')
-        if d['role'] in ('verify','integ'):
+        if d['role'] in ('verify','integ','regression'):
             sha=r.get('commit','')
             if not re.fullmatch('[a-f0-9]{40,64}',sha):
                 return dict(result='needs-review',summary='missing tested commit')
@@ -514,7 +530,7 @@ def parser():
             q.add_argument('--backend',choices=('codex','claude'),help='default follows host: claude-code -> claude, codex-* -> codex')
             q.add_argument('--transport',default='auto',choices=('auto','native','app-server','claude-bg'))
             q.add_argument('--subdir',help='worker start dir relative to repo root (default: subdir of init --cwd; "" for repo root)')
-            q.add_argument('--task',required=True); q.add_argument('--role',default='developer',choices=('developer','scout','verify','integ'))
+            q.add_argument('--task',required=True); q.add_argument('--role',default='developer',choices=('developer','scout','verify','integ','regression'))
         if cmd=='dispatch': q.add_argument('--profile',default='worker')
         if cmd=='register':
             g=q.add_mutually_exclusive_group(required=True); g.add_argument('--session-id'); g.add_argument('--client-thread-id'); q.add_argument('--host-id',default='local')

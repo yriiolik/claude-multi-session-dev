@@ -244,6 +244,25 @@ touch "$COORD/<module>.alive"      # 等 nohup 长任务期间每 ≤3 分钟一
 ```
 退出码：0 成功 / 1 等锁超时（写「需主 session 裁决」，别硬跑）/ 3 release 时锁不是自己的。
 
+## e2e 范围收敛（worker 侧 suggest/record，主端侧 plan）
+
+开发 worker **不跑全量**（一轮几十分钟、吃满 CPU、锁下还堵住别人），只跑改动相关的最小集合；
+跨模块回归由主端在模块全部落地后统一派一张回归卡跑一次。规则见 `delivery-quality.md` §6。
+
+```bash
+# worker：推导本轮该跑哪些 spec（按改动文件反查，剔除无区分度的过宽词干，受预算上限截断）
+cc-fleet-e2e-scope suggest [--project-dir DIR] [--base fleet/<RQ>] [--max 6] [--quiet]
+# worker：跑完登记实际范围（可多次追加），主端据此合成回归集合、避免重复跑
+cc-fleet-e2e-scope record "$COORD" <module> <spec|组名>... [--minutes N] [--cmd "实际命令"]
+# 主端：合成一次性回归集合 = 各 worker 登记 ∪ 集成分支 diff 反推，并给出是否该升级全量的判据
+cc-fleet-e2e-scope plan "$COORD" [--project-dir DIR] [--base REF] [--max 0]
+```
+- `--base` 缺省取 `$FLEET_BASE_BRANCH`；`plan` 另会读 `<COORD>/task.meta` 的 `base_branch`。
+- 建议命令按项目适配：factory 出 `--project=setup --project=group-… --no-deps`（该项目文件过滤不作用于依赖组），
+  virtual-oms 出 `run-all-tests.sh --no-unit --shards …`（分片是最小可跑单位），其余出 spec 路径列表。
+- 输出是**建议**：靠文件名/内容词干匹配，worker 仍要按自己对改动的理解裁一遍（删无关的，⛔ 别反向加成全量）。
+- 退出码：0 正常 / 2 用法错 / 3 环境不满足（非 git 仓库、找不到项目根、COORD 不存在）。
+
 ## worker 落地（worker 自己跑，不是主 session）
 
 ```bash

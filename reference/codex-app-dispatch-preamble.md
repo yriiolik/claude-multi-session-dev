@@ -48,6 +48,8 @@
 - 契约设计型（module 名带 `-contract`）：只产出契约文件到 `{{COORD_DIR}}/contracts/`，不实现业务逻辑。
 - 探查型 scout：只读不改，只回报结论。
 - 联调 / 验收型（module=`integ`/`verify`）：只读集成分支并跑集成/e2e，不改业务代码。
+- 回归型（module=`regression`）：全 RQ 只有你这张卡跑成批 e2e，按任务卡给定的回归集合一次跑完，
+  持独占 e2e 锁、只读集成基线；任务卡没写「全量」就不自行跑项目全量入口。
 
 ## worktree 与分支铁律
 
@@ -107,10 +109,19 @@ git -C "$(git rev-parse --show-toplevel)" reset --hard "{{INT_BRANCH}}"
 - 未在任务卡“登记散点授权”里列出的范围外文件一律不碰。
 - 发现必须改范围外内容时停下来，在回执里写清缺口和所需裁决。
 
-## 自测
+## 自测（范围最小化——⛔ 你不跑全量）
 
 - 实现完后跑改动相关单测 + e2e；失败就修代码，禁止删断言、降断言或 skip 测试来过。
 - 联调 / 验收 worker 只执行测试并报告结果，不改业务代码。
+- ⛔ **禁止执行项目全量 e2e 入口**（不带文件/组参数的 `run-tests.sh`、`playwright test`、`npm run test:e2e`）。
+  全量一轮几十分钟且在 e2e 锁下堵住同 RQ 其它 worker；跨模块全量回归由主 session 完成后统一派卡跑一次。
+  唯一例外：任务卡「E2E 范围」显式写了全量并附理由。整包单测同理，只跑覆盖改动文件的那几个。
+- 范围怎么定：① 任务卡「E2E 范围」列了就严格照跑；② 没列则用
+  `~/.claude/skills/multi-session-dev/scripts/cc-fleet-e2e-scope suggest --base "{{INT_BRANCH}}"` 推导候选再自行裁剪；
+  ③ 硬上限 ≤6 个 spec 文件且单轮 ≤15 分钟，超了只跑最能证伪本次改动的几个，其余写进回执「建议纳入回归」；
+  ④ 有依赖链/分组的项目用 `--no-deps` 只跑目标组；⑤ 跑完用
+  `… /cc-fleet-e2e-scope record {{COORD_DIR}} {{MODULE}} <spec…>` 登记实际范围，供主 session 合成回归集合。
+- 判断不了范围就在回执里问主 session，别用跑全量代替思考。
 
 ## 完成回执
 
@@ -139,6 +150,8 @@ result: {{MODULE}} 完成 — <一句话结论：做了什么、自测是否全�
 - 向下 trace（启下）: <设计要点 + 测试用例>
 - 已知缺陷/风险/未尽事项: <没有就写“无”>
 - 自测结果: <命令与结果；没跑说明原因>
+- e2e 范围与耗时: <实际跑的 spec/组 + 墙钟分钟 + 范围来源；⛔ 不得为全量>
+- 建议纳入回归: <相关但超预算没跑的 spec/场景；没有写“无”>
 - 需主 session 裁决: <没有就写“无”>
 - worktree 隔离: <当前 worktree / 是否对齐 {{INT_BRANCH}} / 是否已 cc-fleet-land；Codex App 模式保留 worktree>
 - 集成分支落地: <已落地到 {{INT_BRANCH}}，落地后 sha；未碰共享分支>

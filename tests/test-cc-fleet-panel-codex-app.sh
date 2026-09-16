@@ -88,12 +88,14 @@ mk_worker "$COORD" done-mod    t-receipt RQ-TEST-001
 printf 'result: 库存模块已完成，单测 42 通过\nnotes: 已合回集成分支\n' > "$COORD/done-mod.summary.md"
 mk_worker "$COORD_B" other-mod t-b1 RQ-TEST-002
 
-# 任务组一：派发时记下了主 session（owner.meta）
-cat > "$HOME_DIR/.claude/sessions/4242.json" <<'EOF'
-{"pid":4242,"sessionId":"sess-aaaa","cwd":"/work/repoA","name":"虚拟OMS上线前检查清单","kind":"bg","status":"busy"}
+# 任务组一：派发时记下了主 session（owner.meta）。主 session 须是真实存活的进程（借本脚本的 pid）：
+# 面板会隐藏主 session 已退出的任务组，不存在的假 pid 会被判成已退出。
+OWNER_PID=$$
+cat > "$HOME_DIR/.claude/sessions/$OWNER_PID.json" <<EOF
+{"pid":$OWNER_PID,"sessionId":"sess-aaaa","cwd":"/work/repoA","name":"虚拟OMS上线前检查清单","kind":"bg","status":"busy"}
 EOF
-cat > "$COORD/owner.meta" <<'EOF'
-owner_pid=4242
+cat > "$COORD/owner.meta" <<EOF
+owner_pid=$OWNER_PID
 owner_session_id=sess-aaaa
 owner_name=派发当时的旧标题
 owner_cwd=/work/repoA

@@ -125,6 +125,19 @@ class FleetTests(unittest.TestCase):
     reg=[(x['coord'],x['rq']) for x in json.loads((self.root/'coords.json').read_text())['coords']]
     self.assertIn((f['coord'],f['rq']),reg)
   self.assertFalse(log.exists())
+ def test_init_owner_from_claude_code_session_env(self):
+  # Claude Code 注入的是 CLAUDE_CODE_SESSION_ID；取不到就只能生成假 controller id，面板判不了主 session 是否已退出
+  base={k:v for k,v in self.env.items() if k not in ('CLAUDE_CODE_SESSION_ID','CLAUDE_SESSION_ID','CODEX_THREAD_ID')}
+  cases=[('claude-code',dict(CLAUDE_CODE_SESSION_ID='sid-code'),'sid-code','session'),
+         ('claude-code',dict(CLAUDE_SESSION_ID='sid-old'),'sid-old','session'),
+         ('codex-app',dict(CLAUDE_CODE_SESSION_ID='sid-code'),None,'generated-controller')]
+  for host,extra,want,src in cases:
+   with self.subTest(host=host,extra=extra):
+    f=self.cli('init','--cwd',self.repo,'--host',host,env=dict(base,**extra))
+    owner=json.loads((pathlib.Path(f['coord'])/'fleet.json').read_text())['owner']
+    self.assertEqual(owner['identitySource'],src)
+    if want: self.assertEqual(owner['id'],want)
+    else: self.assertTrue(owner['id'].startswith('controller-'))
  def test_duplicate_dispatch_and_module_rejected(self):
   c,d,_=self.setup_worker();self.cli('dispatch','--coord',c,'--module','api')
   self.cli('dispatch','--coord',c,'--module','api',ok=False)

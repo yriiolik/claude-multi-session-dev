@@ -120,7 +120,8 @@ def init(a):
     try: git(repo,'branch','fleet/'+rq,sha)
     except Exception:
         c.rmdir(); raise
-    owner_id=a.owner_id or os.environ.get('CODEX_THREAD_ID' if a.host.startswith('codex') else 'CLAUDE_SESSION_ID')
+    # Claude Code 注入的是 CLAUDE_CODE_SESSION_ID；只认 CLAUDE_SESSION_ID 会让主 session 身份一直取不到、面板判不了主 session 是否已退出
+    owner_id=a.owner_id or (os.environ.get('CODEX_THREAD_ID') if a.host.startswith('codex') else (os.environ.get('CLAUDE_CODE_SESSION_ID') or os.environ.get('CLAUDE_SESSION_ID')))
     identity_source='session' if owner_id else 'generated-controller'
     owner_id=owner_id or ('controller-'+uuid.uuid4().hex)
     d=dict(version=2,rq=rq,repo=str(repo),commonDir=str(common),subdir=subdir,base=base,baseCommit=sha,

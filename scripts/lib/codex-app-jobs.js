@@ -619,6 +619,42 @@ function ownerFromFleet(coord) {
   return { pid: reg.pid || 0, sessionId: reg.sessionId, name: reg.name, cwd: reg.cwd || "", host: owner.host || "" };
 }
 
+function pidAlive(pid) {
+  if (!pid) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return e.code === "EPERM";
+  }
+}
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// 主 session 是否**确定**已经不在了。面板据此不再展示它派发的任务组。
+// 只在能下定论时返回 true：
+//   · fleet.json 记的是 Claude 真实 session id（UUID），活着的会话注册表里找不到它（注册文件在、进程已死也算不在）；
+//   · 旧式 owner.meta 记了 pid，而该 pid 已退出，或已被别的会话复用。
+// Codex 主端、手填 / 生成的非 UUID id、没有归属记录的历史 RQ 都判不了，一律按「还在」处理，宁可多留不误删。
+function ownerGone(coord, { sessions } = {}) {
+  let fleetOwner = null;
+  try {
+    fleetOwner = JSON.parse(fs.readFileSync(path.join(coord, "fleet.json"), "utf8")).owner || null;
+  } catch {}
+  if (fleetOwner && fleetOwner.identitySource === "session" && UUID_RE.test(String(fleetOwner.id || ""))
+      && String(fleetOwner.host || "").startsWith("claude")) {
+    const live = (sessions || liveClaudeSessions()).find((r) => r.sessionId === fleetOwner.id);
+    return !live || (live.pid ? !pidAlive(live.pid) : false);
+  }
+  const meta = readOwnerMeta(coord);
+  if (meta.pid) {
+    if (!pidAlive(meta.pid)) return true;
+    const reg = claudeSessionRegistry(meta.pid);
+    return !!(meta.sessionId && reg && reg.sessionId && reg.sessionId !== meta.sessionId);
+  }
+  return false;
+}
+
 function inferOwnerByCwd(coord) {
   const task = parseEnv(path.join(coord, "task.meta"));
   const cwd = task.cwd;
@@ -807,6 +843,8 @@ module.exports = {
   listCoords,
   discoverCoords,
   ownerFromFleet,
+  ownerGone,
+  liveClaudeSessions,
   claudeSessionRegistry,
   detectOwner,
   ownerMetaPath,

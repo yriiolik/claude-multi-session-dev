@@ -50,6 +50,7 @@ const opt = {
   spin: true,
   targetRatio: Number(process.env.CC_FLEET_PANEL_RATIO) || 0,
   discover: process.env.CC_FLEET_PANEL_DISCOVER !== "0",
+  includeGone: process.env.CC_FLEET_PANEL_INCLUDE_GONE === "1",
 };
 
 function usage() {
@@ -77,7 +78,8 @@ function usage() {
   --keys a,b,c           先按一串键再渲染（配合 --once，测试用）
   --codex-bin PATH       指定 Codex CLI
   --no-start-app-server  只连已有 app-server
-  --no-discover          只看注册表，不自动发现已知仓库里漏登记的近期任务组（CC_FLEET_PANEL_DISCOVER=0 同效）`);
+  --no-discover          只看注册表，不自动发现已知仓库里漏登记的近期任务组（CC_FLEET_PANEL_DISCOVER=0 同效）
+  --include-gone         主 session 已退出的任务组也照常展示（默认隐藏，仍有执行中 worker 的除外；CC_FLEET_PANEL_INCLUDE_GONE=1 同效）`);
 }
 
 for (let i = 2; i < process.argv.length; i++) {
@@ -102,6 +104,7 @@ for (let i = 2; i < process.argv.length; i++) {
   else if (a === "--start-app-server") opt.startAppServer = true;
   else if (a === "--no-start-app-server") opt.startAppServer = false;
   else if (a === "--no-discover") opt.discover = false;
+  else if (a === "--include-gone") opt.includeGone = true;
   else if (a === "-h" || a === "--help") { usage(); process.exit(0); }
   else { console.error(`unknown flag: ${a}`); usage(); process.exit(5); }
 }
@@ -152,6 +155,27 @@ function truncate(str, max) {
     w += cw;
   }
   return `${out}…`;
+}
+
+// 按显示宽度裁剪一行**带 ANSI 的**文本。列表的每一行都必须过这一关：只要有一行比面板宽，
+// 终端就会自动折行，总行数超过屏高后整屏上滚，最上面的标题和任务组就被顶出屏幕。
+function clipAnsi(str, max) {
+  const s = String(str);
+  if (dispWidth(s.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "")) <= max) return s;
+  let out = "";
+  let w = 0;
+  for (let i = 0; i < s.length;) {
+    const m = s.slice(i).match(/^\x1b\[[0-9;?]*[A-Za-z]/);
+    if (m) { out += m[0]; i += m[0].length; continue; }
+    const ch = String.fromCodePoint(s.codePointAt(i));
+    const cw = charWidth(ch.codePointAt(0));
+    if (w + cw > max) break;
+    out += ch;
+    w += cw;
+    i += ch.length;
+  }
+  // 截断处可能落在某个着色段中间，补一个 reset，免得颜色 / 反色漏到下一行
+  return opt.plain ? out : `${out}\x1b[0m`;
 }
 
 function padTo(str, width) {
@@ -355,6 +379,9 @@ function collect() {
   let claudeUnavailable = false;
   // 一轮刷新共用一次 `claude agents` 调用；没有 Claude worker 就不会调
   const claudeAgents = jobsLib.lazyClaudeAgents();
+  // 主 session 存活判定一轮共用一次会话注册表扫描
+  const sessions = jobsLib.liveClaudeSessions();
+  let hiddenGone = 0;
 
   for (const c of activeCoords()) {
     const snap = jobsLib.readOnlySnapshot(c.coord, {
@@ -377,6 +404,13 @@ function collect() {
     if (snap.appUnavailable) appUnavailable = true;
     if (snap.claudeUnavailable) claudeUnavailable = true;
     if (!snap.jobs.length) continue;
+    // 主 session 已经不在了：这批任务没人收尾，不再占面板。但还有 worker 在跑的照常展示，
+    // 否则孤儿 worker 会在面板上凭空消失、没人知道它还在烧资源。
+    const ownerGone = jobsLib.ownerGone(c.coord, { sessions });
+    if (ownerGone && !opt.includeGone && !snap.jobs.some((j) => jobsLib.ACTIVE_STATES.has(j.state))) {
+      hiddenGone += 1;
+      continue;
+    }
 
     const { title, owner, ownerSource } = groupTitle(c.coord);
     const group = {
@@ -385,6 +419,7 @@ function collect() {
       title,
       owner,
       ownerSource,
+      ownerGone,
       repo: repoOf(c.coord),
       jobs: [],
       pending: 0,
@@ -427,6 +462,7 @@ function collect() {
     done: jobs.filter((j) => j.cls.bucket === "done").length,
     appUnavailable,
     claudeUnavailable,
+    hiddenGone,
   };
 }
 
@@ -630,6 +666,7 @@ function renderList(model, ui) {
   const parts = [];
   if (model.pending) parts.push(C.cyan(`${model.pending} 未完成`));
   if (model.done) parts.push(C.green(`${model.done} 已完成`));
+  if (model.hiddenGone) parts.push(C.dim(`已隐藏 ${model.hiddenGone} 个主 session 已退出的任务组`));
   lines.push(parts.length ? parts.join(C.dim(" · ")) : C.dim("暂无 worker"));
   if (model.appUnavailable) lines.push(C.red("⚠ app-server 不可达；未落回执的线程状态读不到"));
   if (model.claudeUnavailable) lines.push(C.red("⚠ claude agents 读取失败；未落回执的 Claude worker 状态读不到"));
@@ -646,7 +683,8 @@ function renderList(model, ui) {
     Math.max(14, ...model.jobs.map((j) => dispWidth(j.displayName))),
     Math.floor(width * 0.3)
   );
-  const stateW = 6;
+  // 状态词宽度不一（「已回执」6 列、「状态未知」8 列、「元数据缺失」10 列），按在场最宽的排，写死会让长的那几行溢出折行
+  const stateW = Math.max(6, ...model.jobs.map((j) => dispWidth(j.cls.label)));
   const ageW = 5;
   const backendW = mixed ? 7 : 0;
   const detailW = Math.max(10, width - 5 - nameW - backendW - stateW - ageW - 4);
@@ -673,6 +711,7 @@ function renderList(model, ui) {
         lines.push(C.dim(`  ${lastBucket === "pending" ? "未完成" : "已完成"}`));
       }
       const selected = model.jobs[ui.cursor] === job;
+      if (selected) ui.cursorLine = lines.length;
       const name = padTo(truncate(job.displayName, nameW), nameW);
       const label = padTo(job.cls.label, stateW);
       const detail = padTo(truncate(job.detail || "", detailW), detailW);
@@ -690,6 +729,22 @@ function renderList(model, ui) {
   lines.push("");
   lines.push(C.dim("↑↓ 选择 · → 进详情 · ← 返回 · r 刷新 · q 退出"));
   return lines;
+}
+
+// 列表比屏幕高时，前两行（总标题 + 计数）常驻，其余按光标滚动；每行裁到面板宽，杜绝终端自动折行。
+function fitList(lines, ui) {
+  const clipped = lines.map((l) => clipAnsi(l, ui.width));
+  // --once 默认整屏输出；给了 CC_FLEET_PANEL_HEIGHT 才按屏高截视窗（测试靠它模拟矮分屏）
+  if (clipped.length <= ui.height || (opt.once && !process.env.CC_FLEET_PANEL_HEIGHT)) return clipped;
+  const head = clipped.slice(0, 2);
+  const body = clipped.slice(2);
+  const avail = Math.max(1, ui.height - head.length);
+  const cur = Math.max(0, (ui.cursorLine || 0) - head.length);
+  let off = Math.max(0, Math.min(ui.listOffset || 0, body.length - avail));
+  if (cur < off) off = Math.max(0, cur - 2); // 往上滚时带出组标题 / 栏名
+  else if (cur >= off + avail) off = cur - avail + 1;
+  ui.listOffset = off;
+  return [...head, ...body.slice(off, off + avail)];
 }
 
 function renderDetail(model, ui) {
@@ -812,9 +867,11 @@ const ui = {
   detailLines: null,
   detailKey: "",
   frame: 0,
+  cursorLine: 0,
+  listOffset: 0,
   // 非 TTY（--once / 管道）读不到列数时按 CC_FLEET_PANEL_WIDTH 排版，测试靠它模拟窄分屏
   width: process.stdout.columns || Number(process.env.CC_FLEET_PANEL_WIDTH) || 100,
-  height: process.stdout.rows || 30,
+  height: process.stdout.rows || Number(process.env.CC_FLEET_PANEL_HEIGHT) || 30,
 };
 
 let model = collect();
@@ -863,7 +920,8 @@ function draw() {
   ui.width = process.stdout.columns || ui.width;
   ui.height = process.stdout.rows || ui.height;
   clampCursor();
-  paint(ui.view === "detail" ? renderDetail(model, ui) : renderList(model, ui), ui);
+  const lines = ui.view === "detail" ? renderDetail(model, ui) : fitList(renderList(model, ui), ui);
+  paint(lines.map((l) => clipAnsi(l, ui.width)), ui);
 }
 
 // ---------------------------------------------------------------- 按键
@@ -933,6 +991,7 @@ if (opt.json) {
     done: model.done,
     appUnavailable: model.appUnavailable,
     claudeUnavailable: model.claudeUnavailable,
+    hiddenGone: model.hiddenGone,
     title: fleetTitle(model),
     backends: backendCounts(model),
     view: ui.view,
@@ -944,6 +1003,7 @@ if (opt.json) {
       repo: g.repo,
       ownerPid: g.owner?.pid || 0,
       ownerSource: g.ownerSource,
+      ownerGone: g.ownerGone,
       pending: g.pending,
       done: g.done,
       modules: g.jobs.map((j) => j.module),

@@ -119,6 +119,10 @@ stalled 只是「该去看一眼」。核实手段：`read` 看最后回复/日�
   两种后端同屏，幂等复用）。**登记不受它影响**：`init` 与 `dispatch` 总会把协调目录登记进全局注册表，
   别的主 session 已开着的面板照样显示本任务组；面板还会自动发现已知仓库里漏登记的近期 v2 任务组
   （`--no-discover` / `CC_FLEET_PANEL_DISCOVER=0` 关）。混合后端时标题为 Fleet 并按 Claude/Codex 报数、行内标后端。
+  主 session 确定已退出（fleet.json 记的 Claude 会话 UUID 已不在活会话里，或 owner.meta 的 pid 已退出）且
+  没有执行中 worker 的任务组不再展示，计数行提示隐藏了几个（`--include-gone` / `CC_FLEET_PANEL_INCLUDE_GONE=1` 全显示）；
+  Codex 主端与非 UUID 的 owner id 判不了，照常展示。`init` 未传 `--owner-id` 时 Claude 主端读 `CLAUDE_CODE_SESSION_ID`。
+  列表每行裁到面板宽，超出屏高时标题常驻、视窗跟随光标。
   手动开/关/看状态：`scripts/cc-fleet-panel-open` / `--close` / `--status`；比例与方向见 `commands.md`。
 
 ## 权限和完成

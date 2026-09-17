@@ -13,7 +13,7 @@ if pathlib.Path(sys.argv[0]).name=='claude':
  if a[:3]==['agents','--json','--all']: print(json.dumps(db['jobs']));sys.exit()
  if '--bg' in a:
   n=a[a.index('--name')+1];i=f'{len(db["jobs"])+1:08x}'
-  db['jobs'].append(dict(id=i,sessionId='sid-'+i,name=n,cwd=os.getcwd(),state='working'))
+  db['jobs'].append(dict(id=i,sessionId='sid-'+i,name=n,cwd=os.getcwd(),state='working',pid=4242,status='busy'))
   save();print('arbitrary localized launch output');sys.exit()
  if a[0]=='stop':
   next(j for j in db['jobs'] if j['id']==a[1])['state']='stopped';save();sys.exit()
@@ -44,7 +44,7 @@ class FleetTests(unittest.TestCase):
   # CC_FLEET_PANEL=0：测试绝不去动真实 Ghostty；init/dispatch 总会登记面板注册表，一律指到临时文件。
   # 面板路径由 test_app_server_dispatch_opens_ghostty_panel 用假脚本单独测。
   self.env=dict(os.environ,FAKE_DB=str(self.root/'db.json'),CLAUDE_FLEET_CONFIG=str(self.root/'missing.json'),CODEX_MULTI_SESSION_CONFIG=str(self.root/'absent-route.json'),CC_FLEET_PANEL='0',
-                CC_FLEET_PANEL_REGISTRY=str(self.root/'coords.json'))
+                CC_FLEET_PANEL_REGISTRY=str(self.root/'coords.json'),CLAUDE_JOBS_DIR=str(self.root/'jobs'),CLAUDE_CODE_SESSION_ID='main-123')
   for n in ('claude','app-call'):
    p=self.root/n;p.write_text(FAKE);p.chmod(0o755)
   self.env.update(CLAUDE_CLI_PATH=str(self.root/'claude'),CODEX_APP_CALL_BIN=str(self.root/'app-call'))
@@ -374,8 +374,9 @@ class FleetTests(unittest.TestCase):
  def test_await_wakes_on_stall_and_skips_settled_modules(self):
   c,d=self.stale_worker();self.receipt(c,d)
   self.assertEqual(self.cli('await','--coord',c)['reason'],'nothing-to-await')  # 已结束的不等
-  c2,_=self.stale_worker()
-  j=self.cli('await','--coord',c2,'--stale-after','1','--interval','5','--timeout','60')
+  # 挂上时还在动、之后久无活动 → stalled 唤醒（挂上前就 stalled 的见 test_await_does_not_spin_on_known_stall）
+  c2,_,_=self.setup_worker();self.cli('dispatch','--coord',c2,'--module','api')
+  j=self.cli('await','--coord',c2,'--stale-after','3','--interval','5','--timeout','60')
   self.assertEqual(j['reason'],'stalled');self.assertEqual(j['stalled'],['api'])
  def test_dispatch_and_reply_point_at_the_wake_hint(self):
   # 派发/追加指令的输出里必须带着"该挂什么"，主端不靠记性遵守 SKILL.md §6。
@@ -386,5 +387,106 @@ class FleetTests(unittest.TestCase):
  def test_await_rejects_out_of_range_bounds(self):
   c,_=self.stale_worker()
   self.cli('await','--coord',c,'--timeout','30',ok=False);self.cli('await','--coord',c,'--interval','1',ok=False)
+
+ # --- Claude worker 会话已结束但 claude agents 仍报 working -----------------
+ def claude_worker(self,module='api',c=None):
+  if c is None:c,d,_=self.setup_worker(backend='claude',module=module)
+  else:d=self.cli('prepare','--coord',c,'--module',module,'--backend','claude','--task',self.task)
+  out=self.cli('dispatch','--coord',c,'--module',module);return c,d,out['shortId']
+ def job(self,short,**kw):
+  j=self.root/'jobs'/short;j.mkdir(parents=True,exist_ok=True)
+  st=dict(state='working',tempo='active',inFlight=dict(tasks=0),updatedAt=time.strftime('%Y-%m-%dT%H:%M:%S.000Z',time.gmtime()))
+  st.update(kw);(j/'state.json').write_text(json.dumps(st))
+ def agents(self,short,**kw):
+  db=self.db();j=next(x for x in db['jobs'] if x['id']==short)
+  for k,v in kw.items():
+   if v is None:j.pop(k,None)
+   else:j[k]=v
+  (self.root/'db.json').write_text(json.dumps(db))
+ def old(self,sec):return time.strftime('%Y-%m-%dT%H:%M:%S.000Z',time.gmtime(time.time()-sec))
+ def state_of(self,c):r=self.cli('status','--coord',c)['jobs'][0];return r['state'],r.get('attention')
+ def test_claude_state_json_terminal_beats_stale_agents_list(self):
+  c,_,s=self.claude_worker();self.job(s)
+  self.assertEqual(self.state_of(c),('running',None))
+  self.job(s,state='done',tempo='idle')  # 进程被回收后 claude agents 仍报 working（现场 d35a0e47）
+  self.assertEqual(self.state_of(c)[0],'needs-review')
+ def test_claude_process_gone_is_not_running(self):
+  c,_,s=self.claude_worker();self.job(s)
+  self.agents(s,pid=None,status=None)
+  self.assertEqual(self.state_of(c),('needs-review','process-exited'))
+ def test_claude_turn_ended_without_result_detected_after_grace(self):
+  c,_,s=self.claude_worker()
+  self.job(s,tempo='idle',updatedAt=self.old(5))
+  self.assertEqual(self.state_of(c),('running',None))  # 宽限期内不误判
+  self.job(s,tempo='idle',inFlight=dict(tasks=1),updatedAt=self.old(300))
+  self.assertEqual(self.state_of(c),('running',None))  # 在等自己的后台任务，会被唤醒
+  self.job(s,tempo='active',updatedAt=self.old(300))
+  self.assertEqual(self.state_of(c),('running',None))  # 正在生成
+  self.job(s,tempo='idle',updatedAt=self.old(300))
+  self.assertEqual(self.state_of(c),('needs-review','turn-ended-without-result'))
+ def run_await(self,c,*extra,env=None):
+  return subprocess.Popen([str(FLEET),'await','--coord',str(c),'--interval','5','--timeout','60',*extra],
+                          env=env or self.env,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+ def finish(self,p,limit=40):
+  try:out,err=p.communicate(timeout=limit)
+  except subprocess.TimeoutExpired:
+   p.kill();self.fail('await 没有及时退出')
+  self.assertEqual(p.returncode,0,err);return json.loads(out)
+ def test_await_wakes_quickly_when_claude_turn_ends_without_result(self):
+  c,_,s=self.claude_worker();self.job(s)
+  p=self.run_await(c);time.sleep(1)
+  t0=time.time();self.job(s,tempo='idle',updatedAt=self.old(120))
+  j=self.finish(p);self.assertLess(time.time()-t0,12)
+  self.assertEqual(j['changed'][0]['to'],'needs-review');self.assertEqual(j['changed'][0]['attention'],'turn-ended-without-result')
+ def test_await_picks_up_modules_dispatched_later(self):
+  c,_,s1=self.claude_worker('api');self.job(s1)
+  p=self.run_await(c);time.sleep(1)
+  _,_,s2=self.claude_worker('web',c=c);self.job(s2)
+  time.sleep(6);self.assertIsNone(p.poll(),'新派发不算状态变化')
+  self.job(s2,state='done',tempo='idle')
+  j=self.finish(p)
+  self.assertEqual([x['module'] for x in j['changed']],['web']);self.assertEqual(j['stillPending'],['api'])
+ def test_await_does_not_spin_on_known_stall(self):
+  c,d=self.stale_worker()
+  p=self.run_await(c,'--stale-after','1');time.sleep(7)
+  self.assertIsNone(p.poll(),'挂上前已 stalled 的模块不应让 await 秒退')
+  self.receipt(c,d,commit=self.base)
+  j=self.finish(p);self.assertEqual(j['reason'],'state-changed')
+ def test_await_single_instance_and_heartbeat(self):
+  c,_,s=self.claude_worker();self.job(s)
+  p=self.run_await(c);time.sleep(1.5)
+  hb=json.loads((c/'await.json').read_text());self.assertEqual((hb['pid'],hb['session'],hb['watching']),(p.pid,'main-123',['api']))
+  j=self.cli('await','--coord',c);self.assertEqual((j['reason'],j['pid']),('already-awaiting',p.pid))
+  self.job(s,state='done',tempo='idle');self.finish(p)
+  self.assertFalse((c/'await.json').exists(),'退出后清心跳')
+ def guard(self,**h):
+  h.setdefault('session_id','main-123');h.setdefault('cwd',str(self.repo))
+  r=subprocess.run([str(FLEET),'stop-guard'],input=json.dumps(h),env=self.env,text=True,capture_output=True)
+  self.assertEqual(r.returncode,0,r.stderr);return json.loads(r.stdout) if r.stdout.strip() else None
+ def test_stop_guard_blocks_unawaited_workers_only(self):
+  c,d,s=self.claude_worker();self.job(s)
+  b=self.guard();self.assertEqual(b['decision'],'block')
+  self.assertIn('await --coord',b['reason']);self.assertIn(str(c.name),b['reason'])
+  self.assertIsNone(self.guard(session_id='someone-else'))  # 不是本 session 派的
+  self.assertIsNone(self.guard(stop_hook_active=True))  # 已提醒过一次，防循环
+  self.assertIsNone(self.guard(session_id=''))
+  p=self.run_await(c);time.sleep(1.5)
+  self.assertIsNone(self.guard())  # 已挂 await
+  self.job(s,state='done',tempo='idle');self.finish(p)
+  self.assertIsNone(self.guard())  # 没有在跑的 worker
+ def test_stop_guard_never_breaks_on_bad_input(self):
+  r=subprocess.run([str(FLEET),'stop-guard'],input='not json',env=self.env,text=True,capture_output=True)
+  self.assertEqual((r.returncode,r.stdout),(0,''))
+
+ def test_stop_guard_matches_real_session_from_owner_meta(self):
+  # 现场 qzc：owner.id 记成 controller-bg-xxxx，真实 sessionId 只在面板写的 owner.meta 里
+  c,_,s=self.claude_worker();self.job(s)
+  (c/'owner.meta').write_text('owner_pid=1\nowner_session_id=real-sess-9\nowner_name=主\n')
+  self.assertEqual(self.guard(session_id='real-sess-9')['decision'],'block')
+ def test_await_timeout_is_quiet_success(self):
+  c,_,s=self.claude_worker();self.job(s)
+  r=subprocess.run([str(FLEET),'await','--coord',str(c),'--interval','30','--timeout','60'],env=self.env,text=True,capture_output=True,timeout=120)
+  self.assertEqual(r.returncode,0,r.stderr);j=json.loads(r.stdout)
+  self.assertEqual((j['wake'],j['stillPending']),('timeout',['api']));self.assertNotIn('jobs',j)
 
 if __name__=='__main__':unittest.main(verbosity=2)

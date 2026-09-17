@@ -78,10 +78,16 @@ Codex CLI 没有 App 原生任务工具时自动走 app-server；不要把工具
    Claude Code 主端：`Bash(run_in_background)` 跑 `cc-fleet await`，进程退出即把通知投递回主 session；
    Codex App 原生 worker 用 `wait_threads` + cursor；跨客户端可订阅 Codex events 或重复有界 `cc-fleet wait`。
    `await` 在被盯模块状态变化、或 running 却长时间无可观测活动（stalled）时退出；醒来先 `status` 再决定。
-   它只盯挂起那一刻还在跑的模块，**每次新派发后重挂一次**。用户要求稍后跟进时才另设自动跟进。
+   挂着期间新派发的模块自动纳入监视；同一主 session 重复挂会返回 `already-awaiting`，所以**每次派发/醒来后照挂不误**。
+   ⛔ 不要自写 `sleep`/`while true` 轮询代替 await，⛔ 不要把输出接 `| tail`（输出已精简成一行 `wake` 摘要）；
+   `timeout` 只是本次等待到点（退出码 0），用同一命令重挂。worker 还在跑时尽量别用 AskUserQuestion 阻塞自己。
+   Claude Code 装了 `cc-fleet stop-guard` Stop hook 时，漏挂会被拦下并给出要跑的命令——照做即可。
+   用户要求稍后跟进时才另设自动跟进。
 7. `status` 从协调目录或本轮临时 inbox 读取回执，`collect` 核验后收存到持久协调目录。`status` 验证回执身份和开发 commit 是否在集成分支；空闲/turn 完成只是运行状态，**不等于任务交付**。
    无回执、未知状态、审批等待均返回需关注，不能死等或擅自判 done。`read` 查看最后回复/日志后纠偏。
    `running` 只是后端自述，会话已退出后它还会那么说（worker 末条消息没打 `result:` 时尤其如此）。
+   Claude worker 的 status 已改以 job 的 `state.json` 与进程存活为准：进程没了（`process-exited`）或这一轮已停且
+   无后台任务超过 60 秒（`turn-ended-without-result`）直接报 `needs-review`，await 约 1–2 分钟内唤醒你，先 `read` 核实。
    `attention=stalled`（久无可观测活动）多半就是这种僵尸 running：**reply 会被静默吞掉**。先 `read` /
    核对 worktree HEAD 证实，再按需开 fix 卡接手，⛔ 不要对已结束的会话反复 reply。
 8. 用 `reply` 生成新 attempt，避免上一轮 done 回执冒充新一轮完成；原生路径按输出调用宿主消息工具。

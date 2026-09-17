@@ -10,6 +10,10 @@ ROOT = Path(__file__).resolve().parent
 HOSTS = ('codex-app', 'codex-cli', 'claude-code')
 TERMINAL = {'done', 'failed', 'blocked', 'stopped', 'needs-review', 'unknown', 'launch-uncertain'}
 STALE_AFTER = int(os.environ.get('CC_FLEET_STALE_AFTER', '600'))  # running with no observable activity
+# Claude worker 这一轮已停、无后台任务、state.json 超过该秒数未更新 → 判定会话已结束（末条漏打 result: 也算）。
+IDLE_GRACE = int(os.environ.get('CC_FLEET_IDLE_GRACE', '60'))
+JOBS_DIR = Path(os.environ.get('CLAUDE_JOBS_DIR', str(Path.home()/'.claude'/'jobs')))
+CLAUDE_STATES = {'done':'needs-review','failed':'failed','blocked':'blocked','stopped':'stopped','working':'running'}
 
 def run(argv, cwd=None, timeout=45, check=True, input=None, env=None):
     p = subprocess.run([str(x) for x in argv], cwd=cwd, input=input, text=True, env=env,
@@ -402,7 +406,7 @@ def last_activity(c,d):
         with contextlib.suppress(Exception):
             ts.append(float(git(d['worktree'],'log','-1','--format=%ct')))
     if d.get('backend')=='claude' and d.get('shortId'):
-        j=Path.home()/'.claude'/'jobs'/d['shortId']; ts.append(mtime(j/'state.json'))
+        j=JOBS_DIR/d['shortId']; ts.append(mtime(j/'state.json'))
         with contextlib.suppress(Exception):
             ts.append(mtime(json.loads((j/'state.json').read_text()).get('linkScanPath')))
     with contextlib.suppress(Exception):
@@ -423,6 +427,36 @@ def stale_check(c,d,out,stale_after):
                               '(an exited session accepts no reply)')
     return out
 
+def job_state(short):
+    with contextlib.suppress(Exception):
+        return json.loads((JOBS_DIR/short/'state.json').read_text())
+    return None
+
+def iso_ts(v):
+    with contextlib.suppress(Exception):
+        return datetime.datetime.fromisoformat(str(v).replace('Z','+00:00')).timestamp()
+    return 0.0
+
+def claude_ended(d,j,out):
+    """`claude agents` 的 state 在会话结束后可能一直停在 working（进程被回收后列表不刷新、末条漏打
+    `result:`），主端据此会死等到 stalled 兜底。job 自己的 state.json 与进程存活才是事实：
+    - state.json 已是终态 → 以它为准；
+    - 列表里没有 pid/status → 进程已退出；
+    - 本轮已停（tempo≠active）、无后台任务、state.json 超过 IDLE_GRACE 未更新 → 这一轮已结束且没人会再唤醒它。
+    后两种按 needs-review 报，交主端 read 核实，不再冒充 running。"""
+    js=job_state(d['shortId']) or {}
+    if CLAUDE_STATES.get(js.get('state')) not in (None,'running'):
+        out['state']=CLAUDE_STATES[js['state']]; out['backendState']=js['state']
+    if out['state']!='running': return
+    reason=None
+    if 'pid' not in j and 'status' not in j: reason='process-exited'
+    elif js and js.get('tempo')!='active' and not (js.get('inFlight') or {}).get('tasks') \
+            and time.time()-iso_ts(js.get('updatedAt'))>IDLE_GRACE:
+        reason='turn-ended-without-result'
+    if reason:
+        out.update(state='needs-review',attention=reason,
+                   attentionHint='worker 会话已不在工作（backend 仍报 working），先 read 核实结果再决定收回执或开 fix 卡')
+
 def status_one(c,d,jobs=None,stale_after=0):
     out={k:d.get(k) for k in ('module','backend','transport','sessionId','shortId','state','worktree')}
     try:
@@ -434,7 +468,8 @@ def status_one(c,d,jobs=None,stale_after=0):
             if j is None: out['state']='unknown'; return out
             st=j.get('state'); out['backendState']=st; out['waitingFor']=j.get('waitingFor')
             out['_launchedAt']=float(j.get('startedAt') or 0)/1000  # ms; floor for staleness
-            out['state']={'done':'needs-review','failed':'failed','blocked':'blocked','stopped':'stopped','working':'running'}.get(st,'unknown')
+            out['state']=CLAUDE_STATES.get(st,'unknown')
+            claude_ended(d,j,out)
         else:
             t=call('thread/read',dict(threadId=d['sessionId'],includeTurns=True))['thread']
             st=t.get('status',{}); st=st if isinstance(st,dict) else {'type':st}
@@ -539,33 +574,115 @@ def pending(rows):
     """Modules actually dispatched and not settled yet; 'prepared' is not dispatched."""
     return [r for r in rows if r['state'] not in TERMINAL and r['state']!='prepared']
 
+def owner_session():
+    return os.environ.get('CLAUDE_CODE_SESSION_ID') or os.environ.get('CLAUDE_SESSION_ID') or os.environ.get('CODEX_THREAD_ID') or ''
+
+def pid_alive(pid):
+    try: os.kill(int(pid),0); return True
+    except (OSError,ValueError,TypeError): return False
+
+def live_await(c):
+    """协调目录上仍在跑的 await（心跳文件 + 进程存活），Stop 守卫与单例判断共用。"""
+    with contextlib.suppress(Exception):
+        w=json.loads((c/'await.json').read_text())
+        if pid_alive(w.get('pid')) and time.time()-float(w.get('beatAt',0))<=2*float(w.get('interval',20))+30:
+            return w
+    return None
+
 def await_(a):
     """Long-lived wake-up for the controlling session: block until a watched module changes
-    state, then exit so the host delivers the exit notification back to the main session."""
+    state, then exit so the host delivers the exit notification back to the main session.
+    不带 --modules 时，挂起期间新派发的模块自动纳入监视（增量派发不必重挂）；同一主 session 只留一个。"""
     if not 60<=a.timeout<=86400: raise ValueError('--timeout must be 60..86400 seconds')
     if not 5<=a.interval<=300: raise ValueError('--interval must be 5..300 seconds')
-    c=coord(a.coord)
+    c=coord(a.coord); me=owner_session()
     targets={x for x in re.split(r'[,\s]+',a.modules or '') if x}
     rows=[r for r in statuses(c,a.stale_after) if not targets or r['module'] in targets]
     base={r['module']:r['state'] for r in pending(rows)}
     if not base:
         emit({'reason':'nothing-to-await','label':a.label,'jobs':rows}); return
-    end=time.monotonic()+a.timeout
-    while True:
-        time.sleep(max(1,min(a.interval,end-time.monotonic())))
-        rows=[r for r in statuses(c,a.stale_after) if r['module'] in base]
-        seen={r['module'] for r in rows}
-        changed=[{'module':r['module'],'from':base[r['module']],'to':r['state'],
-                  'summary':(r.get('receipt') or {}).get('summary')}
-                 for r in rows if r['state']!=base[r['module']]]
-        changed+=[{'module':m,'from':base[m],'to':'gone','summary':None} for m in sorted(base.keys()-seen)]
-        stalled=[r['module'] for r in rows if r.get('attention')=='stalled']
-        if changed or stalled:
-            emit({'reason':'state-changed' if changed else 'stalled','label':a.label,
-                  'changed':changed,'stalled':stalled,
-                  'stillPending':[r['module'] for r in pending(rows)],'jobs':rows}); return
-        if time.monotonic()>=end:
-            emit({'reason':'timeout','label':a.label,'waitedSeconds':a.timeout,'jobs':rows}); sys.exit(3)
+    other=live_await(c)
+    if other and not targets and not other.get('modules') and other.get('session')==me and other.get('pid')!=os.getpid():
+        # 已有同一主 session 的全量 await 在盯（它会自动纳入新模块），不再叠一个。
+        emit({'reason':'already-awaiting','label':a.label,'pid':other['pid'],'watching':other.get('watching')}); return
+    # 挂上那一刻已 stalled 的模块不再触发唤醒（否则醒来重挂即秒退空转），只等它们状态变化。
+    known_stalled={r['module'] for r in rows if r.get('attention')=='stalled'}
+    end=time.monotonic()+a.timeout; hb=c/'await.json'
+    def beat():
+        atomic(hb,dict(pid=os.getpid(),session=me,label=a.label,modules=sorted(targets),watching=sorted(base),
+                       interval=a.interval,startedAt=started,beatAt=time.time(),deadline=time.time()+end-time.monotonic()))
+    started=time.time(); beat()
+    import signal
+    signal.signal(signal.SIGTERM,lambda *_: sys.exit(143))  # 被宿主终止时也走 finally 清心跳
+    try:
+        while True:
+            time.sleep(max(1,min(a.interval,end-time.monotonic())))
+            rows=statuses(c,a.stale_after)
+            if not targets:
+                for r in pending(rows):
+                    if r['module'] not in base: base[r['module']]=r['state']  # 新派发的，纳入监视
+            rows=[r for r in rows if r['module'] in base]
+            seen={r['module'] for r in rows}
+            changed=[dict({'module':r['module'],'from':base[r['module']],'to':r['state'],
+                           'summary':(r.get('receipt') or {}).get('summary')},
+                          **({'attention':r['attention']} if r.get('attention') else {}))
+                     for r in rows if r['state']!=base[r['module']]]
+            changed+=[{'module':m,'from':base[m],'to':'gone','summary':None} for m in sorted(base.keys()-seen)]
+            stalled=[r['module'] for r in rows if r.get('attention')=='stalled' and r['module'] not in known_stalled]
+            if changed or stalled:
+                left=[r['module'] for r in pending(rows)]
+                head='; '.join(f"{x['module']} {x['from']}→{x['to']}" for x in changed)+(f"; stalled {','.join(stalled)}" if stalled else '')
+                emit({'wake':head.strip('; '),'reason':'state-changed' if changed else 'stalled','label':a.label,
+                      'changed':changed,'stalled':stalled,'stillPending':left,
+                      'next':'先 status 再决策'+('；stillPending 非空，结束响应前重新挂 await' if left else '')}); return
+            if time.monotonic()>=end:
+                # 超时只是本次等待结束：退出码 0（别被当失败），输出一行即可，原命令原样重挂。
+                emit({'wake':'timeout','reason':'timeout','label':a.label,'waitedSeconds':a.timeout,
+                      'stillPending':[r['module'] for r in pending(rows)],
+                      'next':'无变化；用同一命令重新挂 await（run_in_background），⛔ 不要改用自写轮询'}); return
+            beat()
+    finally:
+        with contextlib.suppress(Exception):
+            if json.loads(hb.read_text()).get('pid')==os.getpid(): hb.unlink()
+
+def owned_coords(session, cwd, max_age=7*86400):
+    """本 session 作为主端 init 的协调目录：面板注册表 ∪ cwd 所在仓库的 .git/fleet。"""
+    cands=set()
+    reg=Path(os.environ.get('CC_FLEET_PANEL_REGISTRY') or Path(os.environ.get('CC_FLEET_HOME') or Path.home()/'.claude'/'fleet')/'codex-coords.json')
+    with contextlib.suppress(Exception):
+        cands|={Path(x['coord']) for x in json.loads(reg.read_text()).get('coords',[])}
+    with contextlib.suppress(Exception):
+        common=Path(run(['git','-C',cwd,'rev-parse','--path-format=absolute','--git-common-dir'],timeout=5).stdout.strip())
+        cands|=set((common/'fleet').glob('*'))
+    out=[]
+    for c in sorted(cands):
+        with contextlib.suppress(Exception):
+            if time.time()-(c/'v2').stat().st_mtime>max_age and not (c/'await.json').exists(): continue
+            ids={json.loads((c/'fleet.json').read_text())['owner']['id']}
+            with contextlib.suppress(OSError):  # 面板登记时记下的真实主 session（owner.id 可能是 controller-*）
+                ids|={l.split('=',1)[1].strip() for l in (c/'owner.meta').read_text().splitlines() if l.startswith('owner_session_id=')}
+            if session in ids: out.append(c)
+    return out
+
+def stop_guard(a):
+    """Claude Code Stop hook：主端还有未终态 worker、却没挂 await 就想结束响应时拦下（SKILL.md §6 的强制版）。
+    任何异常一律放行，绝不因守卫自身故障卡住 session。"""
+    try:
+        h=json.loads(sys.stdin.read() or '{}')
+        session=h.get('session_id') or ''
+        if not session or os.environ.get('FLEET_ROLE')=='worker' or h.get('stop_hook_active'): return
+        miss=[]
+        for c in owned_coords(session, h.get('cwd') or os.getcwd()):
+            if live_await(c): continue
+            p=[r['module'] for r in pending(statuses(c))]
+            if p: miss.append((c,p))
+        if not miss: return
+        cmds='\n'.join(f'{ROOT/"cc-fleet"} await --coord {shlex.quote(str(c))} --label {shlex.quote("等 "+",".join(p))}' for c,p in miss)
+        print(json.dumps({'decision':'block','reason':
+            '多 session 编排：以下 worker 还在跑，但没有挂上能叫醒你的 await，结束响应后不会有任何东西通知你。'
+            '请用 Bash(run_in_background=true) 运行（每个协调目录一条，已挂的会自动复用），然后再结束响应：\n'+cmds},ensure_ascii=False))
+    except Exception as e:
+        print(f'cc-fleet stop-guard skipped: {type(e).__name__}: {e}',file=sys.stderr)
 
 def collect(a):
     c=coord(a.coord); d=load(c,a.module); r=receipt(c,d)
@@ -611,6 +728,7 @@ def parser():
     p=argparse.ArgumentParser(description=__doc__); s=p.add_subparsers(dest='cmd',required=True)
     q=s.add_parser('init'); q.add_argument('--cwd',required=True); q.add_argument('--host',choices=HOSTS,required=True)
     q.add_argument('--owner-id'); q.add_argument('--base'); q.add_argument('--rq'); q.set_defaults(fn=init)
+    s.add_parser('stop-guard',help='Claude Code Stop hook: block ending a turn while workers run unawaited').set_defaults(fn=stop_guard)
     for cmd,fn in [('prepare',prepare),('dispatch',dispatch),('register',register),('bind',bind),('status',status),('read',read),('reply',reply),('stop',stop),('wait',wait),('await',await_),('reconcile',reconcile),('events',events),('collect',collect)]:
         q=s.add_parser(cmd); q.add_argument('--coord',required=True); q.set_defaults(fn=fn)
         if cmd not in ('status','wait','await'): q.add_argument('--module',required=True,type=name)
@@ -620,7 +738,7 @@ def parser():
         if cmd=='await':
             q.add_argument('--modules',help='comma/space separated subset; default: everything still running')
             q.add_argument('--label',help='note echoed back on wake-up so the controller regains context')
-            q.add_argument('--timeout',type=int,default=1800,metavar='60..86400')
+            q.add_argument('--timeout',type=int,default=7200,metavar='60..86400')
             q.add_argument('--interval',type=int,default=20,metavar='5..300')
         if cmd=='prepare':
             q.add_argument('--permissions',choices=('full','inherit'),default='full',help='worker permissions (default: full); inherit preserves backend configuration')

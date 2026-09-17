@@ -84,16 +84,34 @@ events 的 turn-completed 只触发收回执，不直接判业务完成。连接
 
 进程退出时宿主把通知投递回主 session，无需轮询，也不依赖 worker 是否记得推送。语义：
 
-- 进入时拍一次基线，**只盯当时已派发且未终态的模块**（`prepared` 不算；`--modules` 可限定子集）。
-  基线里没有活着的模块时立即返回 `nothing-to-await`——所以增量派发场景不会像 `wait` 那样秒退。
-- 退出条件：被盯模块状态变化（`state-changed`，带 from/to 与回执 summary）、出现 stalled（`stalled`）、
-  或超时（`timeout`，退出码 3）。`stillPending` 告诉你还剩谁在跑。
-- `--timeout` 60..86400（默认 1800）、`--interval` 5..300（默认 20）。**派了新卡要重挂**，一次只挂一个。
+- 进入时拍一次基线，盯已派发且未终态的模块（`prepared` 不算；`--modules` 可限定子集）。不带 `--modules` 时，
+  挂着期间**新派发的模块自动纳入**（纳入本身不算变化）。基线里没有活着的模块时立即返回 `nothing-to-await`。
+- 退出条件：被盯模块状态变化（`state-changed`，带 from/to、回执 summary 与 attention）、**新出现**的 stalled
+  （`stalled`；挂上时已 stalled 的只等它状态变化，不会让 await 秒退空转）、或超时（`timeout`，退出码 0）。
+  输出首字段 `wake` 是一行摘要，`stillPending` 告诉你还剩谁在跑；不带整份 jobs，⛔ 不要接 `| tail`。
+- `--timeout` 60..86400（默认 7200）、`--interval` 5..300（默认 20）。
+- 单例：运行中写 `<coord>/await.json` 心跳（pid、主 session、watching、beatAt），退出时删除。同一主 session
+  已有全量 await 在跑时，再挂返回 `already-awaiting`（新模块由在跑的那个接管），所以派发/醒来后无脑重挂即可。
 - 醒来后先 `status` 再决策，别拿 await 的快照当交付依据。
+
+## stop-guard：漏挂 await 的强制兜底（Claude Code Stop hook）
+
+`~/.claude/settings.json` 的 `hooks.Stop` 配 `python3 <skill>/scripts/cc-fleet stop-guard`。每次主 session 要结束
+响应时：按 hook 的 `session_id` 找本 session 作为主端的协调目录（面板注册表 ∪ cwd 仓库 `.git/fleet`，身份认
+`fleet.json` 的 owner.id 或 `owner.meta` 的 owner_session_id），有未终态 worker 且没有活着的 `await.json` 心跳
+→ 返回 `decision=block`，reason 里给出要用 `run_in_background` 跑的 await 命令。自写轮询不算数。
+`stop_hook_active` 为真（已提醒过一次）、worker session（`FLEET_ROLE=worker`）、非主端 session 一律放行；
+守卫自身任何异常都放行，不会卡住 session。非编排 session 耗时约 60ms。
 
 ## stalled：识破「僵尸 running」
 
-后端状态字会在会话结束后继续说 running（worker 末条消息没打 `result:` 时 daemon 就把它钉在 `working`），
+**Claude worker 先看 job 事实**（`$CLAUDE_JOBS_DIR`，缺省 `~/.claude/jobs/<shortId>/state.json`）：`claude agents --json`
+在进程被回收后可能一直报 working（现场 d35a0e47：state.json 早已 done）。state.json 为终态 → 以它为准；列表项没有
+`pid`/`status` → 进程已退出（`attention=process-exited`）；`tempo≠active`、`inFlight.tasks=0` 且 `updatedAt` 超过
+`CC_FLEET_IDLE_GRACE`（默认 60 秒）→ 这一轮已结束且没有后台任务会再唤醒它（`attention=turn-ended-without-result`）。
+后两种报 `needs-review`，await 因此在 worker 停下后约 60–80 秒内唤醒主端。在等自己后台任务的 worker（tasks>0）不受影响。
+
+其余情况下，后端状态字会在会话结束后继续说 running（worker 末条消息没打 `result:` 时 daemon 就把它钉在 `working`），
 此时 `reply` 发出去无人接收、`status` 永远 running，主端死等。`status` / `await` 因此不只看状态字，还查
 **文件系统层面的活动证据**：worktree 的 git 活动与 HEAD 提交时间、`<coord>/<module>.alive` 心跳、回执/
 临时回执、Claude 后端的 job `state.json` 与 transcript mtime，以及最近一次 dispatch/reply 时刻（`activeSince`）。

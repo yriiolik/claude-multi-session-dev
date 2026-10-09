@@ -2,7 +2,7 @@
 """Cross-client fleet controller. Python stdlib; public CLIs, persistent receipts.
 Native Codex App operations are performed by the host, then registered here.
 """
-import argparse, concurrent.futures, contextlib, datetime, fcntl, json, os
+import argparse, concurrent.futures, contextlib, datetime, fcntl, glob, json, os, socket
 from pathlib import Path
 import re, shlex, subprocess, sys, tempfile, time, uuid
 
@@ -645,12 +645,18 @@ def await_(a):
         with contextlib.suppress(Exception):
             if json.loads(hb.read_text()).get('pid')==os.getpid(): hb.unlink()
 
+def fleet_home():
+    return Path(os.environ.get('CC_FLEET_HOME') or Path.home()/'.claude'/'fleet')
+
+def registry_coords():
+    reg=Path(os.environ.get('CC_FLEET_PANEL_REGISTRY') or fleet_home()/'codex-coords.json')
+    with contextlib.suppress(Exception):
+        return {Path(x['coord']) for x in json.loads(reg.read_text()).get('coords',[])}
+    return set()
+
 def owned_coords(session, cwd, max_age=7*86400):
     """本 session 作为主端 init 的协调目录：面板注册表 ∪ cwd 所在仓库的 .git/fleet。"""
-    cands=set()
-    reg=Path(os.environ.get('CC_FLEET_PANEL_REGISTRY') or Path(os.environ.get('CC_FLEET_HOME') or Path.home()/'.claude'/'fleet')/'codex-coords.json')
-    with contextlib.suppress(Exception):
-        cands|={Path(x['coord']) for x in json.loads(reg.read_text()).get('coords',[])}
+    cands=registry_coords()
     with contextlib.suppress(Exception):
         common=Path(run(['git','-C',cwd,'rev-parse','--path-format=absolute','--git-common-dir'],timeout=5).stdout.strip())
         cands|=set((common/'fleet').glob('*'))
@@ -683,6 +689,137 @@ def stop_guard(a):
             '请用 Bash(run_in_background=true) 运行（每个协调目录一条，已挂的会自动复用），然后再结束响应：\n'+cmds},ensure_ascii=False))
     except Exception as e:
         print(f'cc-fleet stop-guard skipped: {type(e).__name__}: {e}',file=sys.stderr)
+
+# ---- 主端兜底唤醒（rescue-owners）----
+# await 跑在主 session 自己的进程树里：主 session 被回收/重启/OOM，await 随之消失，之后 worker 交回执
+# 没有任何东西会通知主端（2026-10-08 RQ-20261008-193532 主端停摆 12 小时）。本命令由常驻 watchdog 周期调用，
+# 独立于主 session：发现「有 worker 新进入终态 + 主端没有活着的 await + 主端最后活动早于这次完成」，
+# 就把主 session 拉起（已被回收则经 daemon 以 resume 原地复活，保持同一 short/sessionId）并注入唤醒消息。
+RESCUE_COOLDOWN = int(os.environ.get('CC_FLEET_RESCUE_COOLDOWN', '300'))
+RESCUE_MAX_AGE = int(os.environ.get('CC_FLEET_RESCUE_MAX_AGE', str(3*86400)))
+UUID_RE = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
+
+def daemon_call(req, timeout=20):
+    """daemon control socket（协议见 reference/PROTOCOL.md）；公开 CLI 的 --bg --resume 会 fork 出新 sessionId，
+    主端身份就对不上了，所以复活与注入只能走这里。"""
+    socks=[os.environ['CC_FLEET_DAEMON_SOCK']] if os.environ.get('CC_FLEET_DAEMON_SOCK') else \
+        sorted(glob.glob(f'/tmp/cc-daemon-{os.getuid()}/*/control.sock'))
+    key=os.environ.get('CLAUDE_DAEMON_CONTROL_KEY') or os.environ.get('CLAUDE_BG_CONTROL_AUTH')
+    if not key:
+        with contextlib.suppress(OSError): key=(Path.home()/'.claude'/'daemon'/'control.key').read_text().strip()
+    last=None
+    for path in socks:
+        try:
+            with socket.socket(socket.AF_UNIX) as sk:
+                sk.settimeout(timeout); sk.connect(path)
+                sk.sendall((json.dumps(dict(proto=1,**({'auth':key} if key else {}),**req))+'\n').encode())
+                buf=b''
+                while b'\n' not in buf:
+                    chunk=sk.recv(65536)
+                    if not chunk: break
+                    buf+=chunk
+                return json.loads(buf.split(b'\n',1)[0])
+        except (OSError,ValueError) as e: last=e
+    raise RuntimeError(f'daemon unreachable: {last}')
+
+def owner_job(c):
+    """主端（仅 claude-code 主端）的 job：返回 (short, state.json)；找不到返回 (None, None)。"""
+    with contextlib.suppress(Exception):
+        if meta(c).get('owner',{}).get('host')!='claude-code': return None,None
+    ids=[meta(c).get('owner',{}).get('id') or '']
+    with contextlib.suppress(OSError):
+        ids+=[l.split('=',1)[1].strip() for l in (c/'owner.meta').read_text().splitlines() if l.startswith('owner_session_id=')]
+    # daemon 刚 kill/复活时会改写 state.json，可能读到半截文件：每个 id 多扫几轮再换下一个，免得认错主端。
+    for sid in [x for x in ids if UUID_RE.fullmatch(x or '')]:
+        for _ in range(3):
+            for f in [JOBS_DIR/sid[:8]/'state.json',*JOBS_DIR.glob('*/state.json')]:
+                with contextlib.suppress(OSError,ValueError):
+                    js=json.loads(f.read_text())
+                    if sid in (js.get('sessionId'),js.get('resumeSessionId')): return f.parent.name,js
+            time.sleep(0.3)
+    return None,None
+
+def transcript_last_event(path):
+    """transcript 尾部最后一条带 timestamp 的事件时刻；mtime 会被元数据整体重写刷新，不可用。"""
+    best=0.0
+    with contextlib.suppress(OSError), open(path,'rb') as f:
+        f.seek(0,2); f.seek(max(0,f.tell()-262144))
+        for m in re.finditer(rb'"timestamp"\s*:\s*"([^"]+)"',f.read()): best=max(best,iso_ts(m.group(1).decode()))
+    return best
+
+def settled_at(c,r):
+    """模块进入终态的大致时刻：回执文件 > worker job state.json updatedAt > 现在。"""
+    t=mtime(c/(r['module']+'.receipt.json'))
+    if not t and r.get('shortId'): t=iso_ts((job_state(r['shortId']) or {}).get('updatedAt'))
+    return t or time.time()
+
+def wake_text(c,fresh,left):
+    lines='；'.join(f"{r['module']} → {r['state']}"+(f"（{(r.get('receipt') or {}).get('summary','')[:80]}）" if r.get('receipt') else '') for r in fresh)
+    return (f"⟦fleet 自动唤醒⟧ {meta(c).get('rq','')}：{lines}。你（主 session）当时没有挂着 await——多半是被回收/重启过，"
+            f"所以没收到通知。请先 {ROOT/'cc-fleet'} status --coord {shlex.quote(str(c))} 核对回执，按既定流程继续编排"
+            +(f"；仍在跑：{','.join(left)}，结束响应前用 Bash(run_in_background=true) 重新挂 await。" if left else '。'))
+
+def revive(short,js):
+    """已被回收的主 session：经 daemon 以 resume 原地复活（同一 short、同一 sessionId、同一对话），等它就绪。"""
+    sid=js.get('resumeSessionId') or js.get('sessionId'); flags=list(js.get('respawnFlags') or [])
+    d=dict(proto=1,short=short,sessionId=sid,createdAt=int(time.time()*1000),source='respawn',cwd=js.get('cwd') or str(Path.home()),
+           launch=dict(mode='resume',sessionId=sid,fork=False,flagArgs=flags),agent=js.get('template') or 'claude',
+           isolation='none',respawnFlags=flags)
+    if js.get('name'): d['seed']=dict(intent=js.get('intent') or js['name'],name=js['name'])
+    r=daemon_call(dict(op='dispatch',d=d,timeoutMs=15000),timeout=30)
+    if not r.get('ok'): raise RuntimeError(f"revive {short} rejected: {r.get('code')} {r.get('error')}")
+    end=time.time()+float(os.environ.get('CC_FLEET_RESCUE_READY_WAIT','60'))
+    while time.time()<end:
+        h=daemon_call(dict(op='has',short=short))
+        if h.get('ready') or (h.get('alive') and h.get('ready') is None): return
+        time.sleep(2)
+    raise RuntimeError(f'revive {short}: not ready in time')
+
+def rescue_one(c,dry):
+    snapf=c/'owner-wake.json'; snap={}
+    with contextlib.suppress(Exception): snap=json.loads(snapf.read_text())
+    prev=snap.get('states')
+    if prev is not None and all(v in TERMINAL for v in prev.values()) and max(mtime(c),mtime(c/'v2'))<=snap.get('at',0):
+        return None                                   # 早已全部收尾、此后没动过：不必再查
+    rows=statuses(c); cur={r['module']:r['state'] for r in rows}
+    def save(**kw):
+        if not dry: atomic(snapf,dict(snap,states=cur,at=time.time(),**kw))
+    if prev is None or live_await(c): save(); return None   # 首次见到只记基线；有 await 在盯就交给它
+    newly=[r for r in rows if r['state'] in TERMINAL and prev.get(r['module'])!=r['state']]
+    if not newly: save(); return None
+    short,js=owner_job(c)
+    if not short: save(); return dict(coord=str(c),action='skip',reason='owner-not-claude-or-unknown')
+    last=transcript_last_event(js.get('linkScanPath') or '')
+    fresh=[r for r in newly if settled_at(c,r)>last]  # 不留容差：主端刚停几秒 worker 就完成也得叫
+    if not fresh: save(); return None                 # 主端在完成之后还活动过 = 已经看到了
+    live=next((j for j in (daemon_call(dict(op='list')).get('jobs') or []) if j.get('short')==short),None)
+    if live and live.get('tempo')=='active': return dict(coord=str(c),action='defer',reason='owner-busy',owner=short)
+    if time.time()-snap.get('wokeAt',0)<RESCUE_COOLDOWN: return dict(coord=str(c),action='defer',reason='cooldown',owner=short)
+    out=dict(coord=str(c),owner=short,modules=[r['module'] for r in fresh],revive=not live)
+    if dry: return dict(out,action='dry-run')
+    if not live: revive(short,js)
+    r=daemon_call(dict(op='reply',short=short,text=wake_text(c,fresh,[x['module'] for x in pending(rows)])))
+    if not r.get('ok'):
+        snap['wokeAt']=time.time(); atomic(snapf,dict(snap,at=snap.get('at',0)))   # 记冷却、不推进基线，下轮再试
+        raise RuntimeError(f"reply {short} rejected: {r.get('code')} {r.get('error')}")
+    save(wokeAt=time.time(),woke=out['modules']); return dict(out,action='woke')
+
+def rescue_owners(a):
+    """供 watchdog 周期调用：扫描注册表里近期的协调目录，叫醒没人在等的主 session。单例、任何单个目录出错不影响其余。"""
+    fleet_home().mkdir(parents=True,exist_ok=True)
+    with open(fleet_home()/'rescue-owners.lock','w') as lk:
+        try: fcntl.flock(lk,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except OSError: emit({'skipped':'another rescue-owners is running'}); return
+        cands=[coord(x) for x in a.coord] if a.coord else sorted(registry_coords())
+        res=[]
+        for c in cands:
+            try:
+                if not (c/'fleet.json').is_file() or time.time()-max(mtime(c),mtime(c/'v2'))>RESCUE_MAX_AGE: continue
+                r=rescue_one(c,a.dry_run)
+                if r: res.append(r)
+            except Exception as e:
+                res.append(dict(coord=str(c),action='error',error=f'{type(e).__name__}: {e}'))
+        emit({'at':datetime.datetime.now().isoformat(timespec='seconds'),'results':res})
 
 def collect(a):
     c=coord(a.coord); d=load(c,a.module); r=receipt(c,d)
@@ -729,6 +866,9 @@ def parser():
     q=s.add_parser('init'); q.add_argument('--cwd',required=True); q.add_argument('--host',choices=HOSTS,required=True)
     q.add_argument('--owner-id'); q.add_argument('--base'); q.add_argument('--rq'); q.set_defaults(fn=init)
     s.add_parser('stop-guard',help='Claude Code Stop hook: block ending a turn while workers run unawaited').set_defaults(fn=stop_guard)
+    q=s.add_parser('rescue-owners',help='watchdog 周期调用：worker 已结束而主 session 没挂 await（被回收/重启）时复活并唤醒主 session')
+    q.add_argument('--coord',action='append',help='只查这些协调目录（可重复）；默认扫描注册表')
+    q.add_argument('--dry-run',action='store_true',help='只报告将唤醒谁，不复活、不注入、不推进基线'); q.set_defaults(fn=rescue_owners)
     for cmd,fn in [('prepare',prepare),('dispatch',dispatch),('register',register),('bind',bind),('status',status),('read',read),('reply',reply),('stop',stop),('wait',wait),('await',await_),('reconcile',reconcile),('events',events),('collect',collect)]:
         q=s.add_parser(cmd); q.add_argument('--coord',required=True); q.set_defaults(fn=fn)
         if cmd not in ('status','wait','await'): q.add_argument('--module',required=True,type=name)

@@ -82,6 +82,9 @@ Codex CLI 没有 App 原生任务工具时自动走 app-server；不要把工具
    ⛔ 不要自写 `sleep`/`while true` 轮询代替 await，⛔ 不要把输出接 `| tail`（输出已精简成一行 `wake` 摘要）；
    `timeout` 只是本次等待到点（退出码 0），用同一命令重挂。worker 还在跑时尽量别用 AskUserQuestion 阻塞自己。
    Claude Code 装了 `cc-fleet stop-guard` Stop hook 时，漏挂会被拦下并给出要跑的命令——照做即可。
+   await 跑在主 session 自己的进程树里，主 session 被回收/重启时 await 一起消失。本机常驻 watchdog 不回收还有后台任务
+   （inFlight>0）的会话，并每分钟跑 `cc-fleet rescue-owners`：worker 进入终态而主端没人在等时，复活主 session
+   （同一 sessionId）并注入「⟦fleet 自动唤醒⟧」。收到它就照提示先 `status`、再继续编排、仍有 worker 在跑就重挂 await。
    用户要求稍后跟进时才另设自动跟进。
 7. `status` 从协调目录或本轮临时 inbox 读取回执，`collect` 核验后收存到持久协调目录。`status` 验证回执身份和开发 commit 是否在集成分支；空闲/turn 完成只是运行状态，**不等于任务交付**。
    无回执、未知状态、审批等待均返回需关注，不能死等或擅自判 done。`read` 查看最后回复/日志后纠偏。

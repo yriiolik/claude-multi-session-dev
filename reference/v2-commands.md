@@ -103,6 +103,29 @@ events 的 turn-completed 只触发收回执，不直接判业务完成。连接
 `stop_hook_active` 为真（已提醒过一次）、worker session（`FLEET_ROLE=worker`）、非主端 session 一律放行；
 守卫自身任何异常都放行，不会卡住 session。非编排 session 耗时约 60ms。
 
+## rescue-owners：主 session 被回收/重启后的兜底唤醒（watchdog 周期调用）
+
+await 是主 session 的子进程：主 session 被 watchdog 回收、daemon 重启或 OOM，await 跟着没了，之后 worker 交回执
+不会有任何东西通知主端（2026-10-08 现场：主端 20:08 被回收，core 20:43 完成，次日 09:07 才被人叫醒）。
+
+```bash
+"$FLEET" rescue-owners                 # 扫描面板注册表里 3 天内动过的协调目录
+"$FLEET" rescue-owners --coord "$COORD" --dry-run   # 只报告将唤醒谁，不复活、不注入、不推进基线
+```
+
+- 每个协调目录维护 `<coord>/owner-wake.json` 基线（各模块上次见到的状态）。首次见到只记基线；有活着的
+  `await.json` 心跳时只推进基线、交给 await。
+- 触发条件全满足才动手：有模块**新进入终态** ∧ 没有活着的 await ∧ 主端 transcript 最后一条事件**早于**该模块完成时刻
+  （回执 mtime，缺省取 worker job 的 `updatedAt`；主端事后还活动过 = 已经看到了，不打扰）∧ 主端是 claude-code。
+- 主端还在 daemon 列表里：`tempo=active` 时推迟到下一轮，空闲则直接 `reply`。已被回收：经 daemon `dispatch`
+  （`launch.mode=resume`，同一 short + sessionId + respawnFlags + 显示名）原地复活，就绪后再 `reply`。
+  ⛔ 不用公开 CLI 的 `claude --bg --resume`：它会 fork 出新 sessionId（实测 26db1f26→71417ba6），
+  `fleet.json`/`owner.meta` 里的主端身份就对不上了，Stop 守卫和 await 都会失效。
+- 同一协调目录两次唤醒至少间隔 `CC_FLEET_RESCUE_COOLDOWN`（默认 300 秒）；注入失败不推进基线，下轮重试。
+  全局 flock 单例（`$CC_FLEET_HOME/rescue-owners.lock`），单个目录出错不影响其余。
+- 测试用：`CC_FLEET_DAEMON_SOCK` 指定 control socket，`CLAUDE_DAEMON_CONTROL_KEY` 指定 key。
+- 真实 daemon e2e（不在 run-all 里，会起一个 haiku 后台会话）：`python3 tests/e2e-live-rescue-owners.py`。
+
 ## stalled：识破「僵尸 running」
 
 **Claude worker 先看 job 事实**（`$CLAUDE_JOBS_DIR`，缺省 `~/.claude/jobs/<shortId>/state.json`）：`claude agents --json`

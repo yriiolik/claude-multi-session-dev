@@ -489,4 +489,72 @@ class FleetTests(unittest.TestCase):
   self.assertEqual(r.returncode,0,r.stderr);j=json.loads(r.stdout)
   self.assertEqual((j['wake'],j['stillPending']),('timeout',['api']));self.assertNotIn('jobs',j)
 
+ # ---- rescue-owners：主 session 被回收/重启后，worker 结束仍能把它叫醒 ----
+ OWNER='4e94f70b-5158-4e9e-805b-0a8dba1eaaf4'
+ def fake_daemon(self,owner_live=None):
+  """最小 daemon：list/has/dispatch/reply；owner_live=None 表示主端已被回收（不在列表）。"""
+  import socket,threading
+  d=tempfile.mkdtemp(dir='/tmp',prefix='fd-');self.addCleanup(shutil.rmtree,d,True)
+  path=os.path.join(d,'c.sock');st=dict(live=owner_live,calls=[])
+  srv=socket.socket(socket.AF_UNIX);srv.bind(path);srv.listen(8);self.addCleanup(srv.close)
+  def serve():
+   while True:
+    try:cn,_=srv.accept()
+    except OSError:return
+    with cn:
+     buf=b''
+     while b'\n' not in buf:
+      x=cn.recv(65536)
+      if not x:break
+      buf+=x
+     q=json.loads(buf.split(b'\n')[0]);st['calls'].append(q);op=q['op']
+     if q.get('auth')!='k':r=dict(ok=False,code='EAUTH')
+     elif op=='list':r=dict(ok=True,jobs=[dict(short=self.OWNER[:8],**st['live'])] if st['live'] else [])
+     elif op=='has':r=dict(ok=True,alive=bool(st['live']),present=bool(st['live']),ready=bool(st['live']))
+     elif op=='dispatch':st['live']=dict(state='running',tempo='active');r=dict(ok=True,short=q['d']['short'])
+     elif op=='reply':r=dict(ok=True) if st['live'] else dict(ok=False,code='ENOJOB')
+     else:r=dict(ok=False,code='EUNKNOWN')
+     cn.sendall((json.dumps(r)+'\n').encode())
+  threading.Thread(target=serve,daemon=True).start()
+  return dict(self.env,CC_FLEET_DAEMON_SOCK=path,CLAUDE_DAEMON_CONTROL_KEY='k',CC_FLEET_HOME=str(self.root/'fh')),st
+ def owner_session(self,c,last_event_ago=3600):
+  (c/'owner.meta').write_text(f'owner_pid=1\nowner_session_id={self.OWNER}\nowner_name=主\n')
+  t=self.root/'owner.jsonl';t.write_text(json.dumps(dict(type='assistant',timestamp=self.old(last_event_ago)))+'\n')
+  self.job(self.OWNER[:8],sessionId=self.OWNER,state='done',tempo='idle',name='主 session',intent='做事',
+           cwd=str(self.repo),linkScanPath=str(t),respawnFlags=['--agent','claude','--name','主 session'],template='claude')
+ def rescue(self,env,*a):return self.cli('rescue-owners','--coord',*a,env=env)['results']
+ def test_rescue_revives_reaped_owner_and_wakes_it(self):
+  c,_,s=self.claude_worker();self.job(s);self.owner_session(c);env,st=self.fake_daemon()
+  self.assertEqual(self.rescue(env,c),[],'首次只记基线')
+  self.assertEqual(self.rescue(env,c),[],'worker 仍在跑，不打扰')
+  self.job(s,state='done',tempo='idle')
+  r=self.rescue(env,c)[0];self.assertEqual((r['action'],r['revive'],r['modules']),('woke',True,['api']))
+  dp=next(q for q in st['calls'] if q['op']=='dispatch')['d']
+  self.assertEqual((dp['short'],dp['sessionId'],dp['launch']),(self.OWNER[:8],self.OWNER,dict(mode='resume',sessionId=self.OWNER,fork=False,flagArgs=['--agent','claude','--name','主 session'])))
+  self.assertEqual(dp['seed']['name'],'主 session')
+  txt=next(q for q in st['calls'] if q['op']=='reply')['text'];self.assertIn('api → needs-review',txt);self.assertIn('status --coord',txt)
+  n=len(st['calls']);self.assertEqual(self.rescue(env,c),[],'同一次完成只叫一次');self.assertFalse([q for q in st['calls'][n:] if q['op'] in('dispatch','reply')])
+ def test_rescue_replies_to_live_idle_owner_without_revive(self):
+  c,_,s=self.claude_worker();self.job(s);self.owner_session(c);env,st=self.fake_daemon(dict(state='done',tempo='idle'))
+  self.rescue(env,c);self.job(s,state='done',tempo='idle')
+  r=self.rescue(env,c)[0];self.assertEqual((r['action'],r['revive']),('woke',False))
+  self.assertEqual([q['op'] for q in st['calls'] if q['op'] in('dispatch','reply')],['reply'])
+ def test_rescue_defers_busy_owner_and_dry_run_touches_nothing(self):
+  c,_,s=self.claude_worker();self.job(s);self.owner_session(c);env,st=self.fake_daemon(dict(state='working',tempo='active'))
+  self.rescue(env,c);self.job(s,state='done',tempo='idle')
+  self.assertEqual(self.rescue(env,c)[0]['reason'],'owner-busy')
+  st['live']=None;snap=(c/'owner-wake.json').read_text()
+  self.assertEqual(self.rescue(env,c,'--dry-run')[0]['action'],'dry-run')
+  self.assertEqual((c/'owner-wake.json').read_text(),snap);self.assertFalse([q for q in st['calls'] if q['op'] in('dispatch','reply')])
+ def test_rescue_skips_when_await_alive_or_owner_already_saw_it(self):
+  c,_,s=self.claude_worker();self.job(s);self.owner_session(c);env,st=self.fake_daemon()
+  self.rescue(env,c)
+  (c/'await.json').write_text(json.dumps(dict(pid=os.getpid(),beatAt=time.time(),interval=20)))
+  self.job(s,state='done',tempo='idle');self.assertEqual(self.rescue(env,c),[],'有 await 在盯，交给它')
+  (c/'await.json').unlink()
+  c2,_,s2=self.claude_worker('web');self.job(s2);self.owner_session(c2);self.rescue(env,c2)
+  self.job(s2,state='done',tempo='idle',updatedAt=self.old(600));self.owner_session(c2,last_event_ago=60)
+  self.assertEqual(self.rescue(env,c2),[],'主端在完成之后还活动过 = 已看到')
+  self.assertFalse([q for q in st['calls'] if q['op'] in('dispatch','reply')])
+
 if __name__=='__main__':unittest.main(verbosity=2)

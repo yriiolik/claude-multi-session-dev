@@ -147,3 +147,24 @@ RQ-2026-0824-001（发货单统一上报派生）走模式 A：提供方按契�
 对策：耦合强 / 接口牵涉 3 个以上模块 / 该组模块出过契约事故 → 走**模式 C 打样先行**（`contract-first.md` §二·五）：
 段① 一个 `--profile spike` worker 把契约、各模块接口骨架、默认关的接线开关、一条真跨模块集成 e2e 一起落到 `fleet/<RQ>`，
 矛盾在同一个脑子里、同一条 e2e 里炸出来；段② 才分头填实。模式 A 仍是默认，但段① 定稿前必须过 §五·五 字段级核对表。
+
+## 八、watchdog 回收了「正在等 worker」的主 session，worker 完成后无人唤醒（2026-10-08 实测）
+
+现场「WorkBuddy会话trace规范化标准定义」（`4e94f70b`，RQ-20261008-193532）：主 session 派完 core 后用
+`run_in_background` 挂上 `cc-fleet await` 并结束本轮。分类器读到它更早一轮的 `result:`，把 state 标成 `done`；
+`~/.claude/hooks/session-watchdog.pl` 的回收规则只看 `state=done ∧ tempo≠active ∧ 空闲 ≥600s`，于是 19:26、19:50、
+20:08 连续三次 kill 了它——被 kill 时 `state.json` 里 `inFlight.tasks=1`，正在跑的就是那条 await。core 20:43 完成，
+主端直到次日 09:07 用户打开它才继续，停摆 12 小时。
+
+**两层修复**：
+1. watchdog：`done` 但 `inFlight.tasks/queued>0`（在等自己的后台任务）不回收；空闲超过 `WATCHDOG_REAP_INFLIGHT_MAX`
+   （默认 3 小时，大于 await 默认 2 小时超时）才当残留常驻任务回收。
+2. 兜底：watchdog 每分钟跑 `cc-fleet rescue-owners`，worker 进入终态而主端没人在等时，经 daemon resume 原地复活
+   主 session 并注入唤醒（细节见 v2-commands.md「rescue-owners」）。
+
+**判据要点**：
+- 判断会话是否「还在等东西」看 `~/.claude/jobs/<short>/state.json` 的 `inFlight` 与 `fan[].label`，别看 `state`
+  （分类器会沿用上一轮的 `result:` 报 done）。
+- 已被 kill 的会话：daemon `reply` / `respawn-stale` 都返回 ENOJOB；`dispatch` + `launch.mode=resume` + 原 short/
+  sessionId 可原地复活，reply 会进入同一段对话。
+

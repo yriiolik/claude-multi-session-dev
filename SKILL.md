@@ -1,12 +1,12 @@
 ---
 name: multi-session-dev
 description: >-
-  在 Codex 或 Claude Code 主 session 中，按既有模块编排独立 Codex / Claude Code 子 session，
-  支持混合后端、契约先行、worktree 隔离、需求追溯、用例先行和页面验收。用于用户要求多 session、独立任务并行开发、
+  在 Codex 或 Claude Code 主 session 中，按可并行的业务结果编排独立 Codex / Claude Code 子 session（不能真并行时走
+  solo + 独立验收），依赖图自动接续，支持混合后端、契约先行、worktree 隔离、需求追溯、用例先行和页面验收。用于用户要求多 session、独立任务并行开发、
   fleet 编排或跨客户端调度；不用于普通单任务开发，不在 FLEET-WORKER 子 session 内再次编排。
 ---
 
-# 跨客户端多 session 编排 · v2.1
+# 跨客户端多 session 编排 · v2.2
 
 本技能共享一套流程，通过主端能力和 worker 后端选择执行方式。不要把 Claude 工具名、模型名或目录
 替换成 Codex 字样来移植技能。`multi-thread-dev` 是旧入口，统一使用这里的流程。
@@ -16,7 +16,8 @@ description: >-
 首条任务带 `⟦FLEET-WORKER⟧` / `⟦CODEX-THREAD-WORKER⟧` 或 `FLEET_ROLE=worker` 时，你是 worker：
 按任务卡开发、自测、回执，不加载编排流程或再开 worker。标题 `↳` 只是展示，寻址用真实 ID。
 
-主 session 对需求完整性和最终业务闭环负责，承担拆解、定契约、派发、监控和裁定。模块业务代码交给独立 session；主端可以维护技能、
+主 session 对需求完整性和最终业务闭环负责，承担拆解、定契约、派发、监控和裁定。fanout 模式下业务代码交给独立 session，
+solo 模式（见「执行模式」）由主 session 自己在 `--self` worktree 开发、验收仍交独立 verify session；主端可以维护技能、
 协调文档、检查 Git 状态、审阅必要的 diff 和运行验收。纯探查优先使用可用的只读 subagent；
 没有相应工具时自行只读检查，不臆造 `Agent`、`ListAgents`、`Monitor` 或 `SendMessage`。
 开发 worker 是独立 session，不用内部 subagent 替代。
@@ -53,10 +54,24 @@ Codex CLI 没有 App 原生任务工具时自动走 app-server；不要把工具
 上下文恢复和页面验收证据。派发使用 [task-card-template.md](reference/task-card-template.md)。
 主端保留简短的持久化状态索引；压缩后、追加需求后和最终验收前重新核对原始需求与用例清单。
 
+## 执行模式：先判断能不能真并行（目的是质量不降、时间和 token 都省）
+
+2026-10 复盘 18 个 RQ：并行加速只有 1.17×（≥2 个 worker 同时在跑的时间多数 <25%），26% 墙钟花在主端交接；
+每张卡第一次改代码前就花掉自身 23.5% 的 token（冷启动），75/137 张卡是回修/回归/验收的后续卡。
+真正的质量收益来自**独立验收**（10/18 个 RQ 由它查出缺陷），而不是开发拆得多。所以先选模式：
+
+- **solo（默认）**：本轮能**同时**开工、写入范围不重叠的开发卡 < 2 张时。主 session 自己在
+  `prepare --module main --self` 建的 worktree 里开发、自测、`cc-fleet-land`；独立 `verify` 卡照派（与开发并行写验收脚本，
+  见下），回修由主 session 直接改。省掉主端编排和每张卡的冷启动，质量门槛不变。
+- **fanout**：≥2 张开发卡可以同时开工（契约已稳定、文件归属不重叠）时才扇出。拆卡依据是**可并行、可独立验收的业务结果**，
+  不按模块编号、前后端或文件数拆：同一业务结果跨前后端/多模块时放在一张卡里；"后端做完前端才能开始"的串行拆法
+  只增加冷启动和交接，⛔ 不要这样拆（契约能先定时用 contract-first 让两边同时开工）。
+- 两种模式都在开局一次排好**依赖图**（`prepare --after`、`queue-reply`），之后由编排器自动接续，主端只在失败、
+  需要裁定或整条流水线收尾时被唤醒。用户明确指定拆法/worker 数时服从。
+
 ## 一轮开发
 
-1. 读项目指导、原始需求及本次参考资料（如有），将每项行为映射到需求锚点、用例和负责人。
-   默认按既有模块分配，按可独立验收的业务结果调整大小；不机械按模块编号、文件数或前后端拆卡。
+1. 读项目指导、原始需求及本次参考资料（如有），将每项行为映射到需求锚点、用例和负责人；按上一节选模式、定卡。
    指定贯穿核心主流程的负责人和独立验收者；具体规则见 delivery-quality.md。
 2. 跨模块接口未稳定时，按 [contract-first.md](reference/contract-first.md) 先定契约，再并行实现，
    最后独立联调/验收。该文档里的旧派发命令以 v2 路由替代，业务分层原则继续保留。
@@ -66,7 +81,12 @@ Codex CLI 没有 App 原生任务工具时自动走 app-server；不要把工具
    worker prompt 和身份，CLI 路径还会预建独立 worktree（`<repo>/.claude/worktrees/fleet-<RQ>-<module>`）；原生路径让 App 创建 worktree。
    worker 在 worktree 内与主 session 相同的子目录启动（取 `init --cwd` 相对仓库根的路径，跨子项目的卡用
    `prepare --subdir` 覆盖），客户端才会自动加载该子项目的 CLAUDE.md / AGENTS.md；从根目录启动会漏掉子项目规则。
-5. 按路由派发。即时记录真实 thread/session ID；原生创建返回 `clientThreadId` 时仅记为 setup pending，
+5. **一次排好依赖图再派发**：开发卡（或 solo 的 `--self`）立即开工；`verify` 卡用 `prepare --role verify --phase author`
+   与开发**同时**派出，先按用例与契约写验收脚本/造数/检查清单；`regression` 卡 `prepare --after <全部开发卡>` 排队；
+   验收的执行阶段用 `queue-reply --module verify --after regression --phase execute --text-file <执行说明>` 排队。
+   依赖全部 done 后，`await`（以及 watchdog 每分钟的 `rescue-owners`）自动派发排队卡、自动发出排队消息，
+   排队卡的 worktree 派发时快进到含依赖的最新集成基线。依赖失败时 await 唤醒主端并列出 `queueBlocked`。
+   按路由派发。即时记录真实 thread/session ID；原生创建返回 `clientThreadId` 时仅记为 setup pending，
    等到真实 `threadId` 后再监控。不能把 client ID 当真实 ID，也不能因等待久而重复创建。
    Claude Code / Codex CLI 主端跑在 Ghostty 里时，CLI 路径（Codex app-server 与 Claude `--bg`）派发成功即自动在右侧分屏
    拉起只读面板 `cc-fleet-panel-codex-app`，两种后端的子 session 按任务组同屏展示；面板是全机一块，多个编排主 session 并行时所有任务组都在里面（`init` 即登记，
@@ -77,7 +97,8 @@ Codex CLI 没有 App 原生任务工具时自动走 app-server；不要把工具
    根本没有这条通道；写一句「等 m3 和 m7 完成后再派」就交回控制权，等于停在那里直到用户开口。
    Claude Code 主端：`Bash(run_in_background)` 跑 `cc-fleet await`，进程退出即把通知投递回主 session；
    Codex App 原生 worker 用 `wait_threads` + cursor；跨客户端可订阅 Codex events 或重复有界 `cc-fleet wait`。
-   `await` 在被盯模块状态变化、或 running 却长时间无可观测活动（stalled）时退出；醒来先 `status` 再决定。
+   `await` 在被盯模块状态变化、或 running 却长时间无可观测活动（stalled）时退出；被依赖图自动接续的完成
+   （依赖 done → 下游已派发/已发消息）**不唤醒**，失败/阻塞/待核实、无下游的完成、流水线全部收尾才唤醒；醒来先 `status` 再决定。
    挂着期间新派发的模块自动纳入监视；同一主 session 重复挂会返回 `already-awaiting`，所以**每次派发/醒来后照挂不误**。
    ⛔ 不要自写 `sleep`/`while true` 轮询代替 await，⛔ 不要把输出接 `| tail`（输出已精简成一行 `wake` 摘要）；
    `timeout` 只是本次等待到点（退出码 0），用同一命令重挂。worker 还在跑时尽量别用 AskUserQuestion 阻塞自己。
@@ -92,8 +113,13 @@ Codex CLI 没有 App 原生任务工具时自动走 app-server；不要把工具
    Claude worker 的 status 已改以 job 的 `state.json` 与进程存活为准：进程没了（`process-exited`）或这一轮已停且
    无后台任务超过 60 秒（`turn-ended-without-result`）直接报 `needs-review`，await 约 1–2 分钟内唤醒你，先 `read` 核实。
    `attention=stalled`（久无可观测活动）多半就是这种僵尸 running：**reply 会被静默吞掉**。先 `read` /
-   核对 worktree HEAD 证实，再按需开 fix 卡接手，⛔ 不要对已结束的会话反复 reply。
-8. 用 `reply` 生成新 attempt，避免上一轮 done 回执冒充新一轮完成；原生路径按输出调用宿主消息工具。
+   核对 worktree HEAD 证实再 `--force`。已结束/被回收的 Claude 会话则可直接 `reply`（自动原地复活）。
+8. **回修交回原会话**：验收/回归失败时，把失败用例和证据 `reply` 给负责该结果的原开发 worker（上下文还热）；
+   Claude worker 已被 watchdog 回收时 `reply` 自动原地复活（同一会话，`revived=true`），⛔ 不再因"会话没了"新开 fix 卡。
+   同时 `queue-reply --module verify --after <回修模块> --text-file <复测说明>`，回修合入后验收自动复测失败项与主流程。
+   `reply` 生成新 attempt，避免上一轮 done 回执冒充新一轮完成；原生路径按输出调用宿主消息工具。
+   **熔断**：同一模块人工 reply 满 3 轮（`CC_FLEET_MAX_REPLIES`）后再 reply 会被拒——反复返工说明需求/契约/环境有问题，
+   先回到原始需求与用例核对（业务语义问题找用户），确认后 `--force` 或开带完整资产引用的新卡。
    接口超时显示 launch-uncertain 时先 `reconcile`，不直接再派。换后端/重新实现用新 fix 模块卡。
 9. **测试范围分工（默认，用户无需提醒）**：开发 worker 只跑**自己改动相关**的最小 e2e（任务卡「E2E 范围」
    或 `cc-fleet-e2e-scope suggest` 推导，≤6 spec / ≤15 分钟），⛔ 不许跑项目全量入口——全量一轮几十分钟且
@@ -101,7 +127,8 @@ Codex CLI 没有 App 原生任务工具时自动走 app-server；不要把工具
    范围用 `cc-fleet-e2e-scope plan <COORD>` 合成（各 worker 登记范围 ∪ 集成分支 diff 反推），
    默认只跑这个集合；仅在改了 schema/迁移、公共基座（共享 service/中间件/鉴权/seed/全局开关）、
    或本轮要合回共享分支发布时才升级为全量，且在状态索引里写明升级理由。详见 delivery-quality.md §6。
-10. 模块完成后独立安排 integ/verify worker；验收必须在含全部已合入改动的集成基线上。
+   回归卡只跑测试读结果，派发时默认用 `multi-session-dev.json` 的 `runner` 配置（较便宜的模型），没有该配置则用 `worker`。
+10. 独立 integ/verify 由第 5 步的编写阶段提前开工，执行阶段在依赖合入后自动开始；验收必须在含全部已合入改动的集成基线上。
    先跑通完整主流程，再按用例逐项执行分支/异常。主端核对原始需求覆盖、逐例页面证据、
    回执和必要的 diff，未达标定位回修。修复后复测失败项、受影响分支及完整主流程；记录最终验收 SHA，
    后续合入改动时评估证据失效范围，不能沿用旧基线的“全部通过”。

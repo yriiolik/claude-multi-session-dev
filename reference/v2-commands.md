@@ -17,7 +17,28 @@
 "$FLEET" collect --coord "$COORD" --module api
 "$FLEET" reply --coord "$COORD" --module api --text-file /absolute/correction.md
 "$FLEET" stop --coord "$COORD" --module api
+# 依赖图（开局一次排好，之后编排器自动接续）
+"$FLEET" prepare --coord "$COORD" --module main --self                      # solo：主 session 自己开发的 worktree
+"$FLEET" prepare --coord "$COORD" --module verify --role verify --phase author --task /absolute/verify.md
+"$FLEET" prepare --coord "$COORD" --module regression --role regression --after api,ui --task /absolute/reg.md
+"$FLEET" queue-reply --coord "$COORD" --module verify --after regression --phase execute --text-file /absolute/exec.md
+"$FLEET" advance --coord "$COORD"     # 手动推进一次；平时由 await / rescue-owners 自动调用
 ```
+
+## 依赖图与自动推进
+
+- `prepare --after a,b`：卡进入 `queued`，不需要手动 dispatch；a、b 的回执都核验为 done 后自动派发。
+  派发时 worker 还没动过的 worktree 快进到集成分支最新提交（含依赖改动），`baselineCommit` 随之更新。
+- `queue-reply --after a,b [--phase execute]`：给已派发的模块排一条消息；依赖全部 done 且本模块这一轮已结束
+  （done/failed/blocked/needs-review）时自动发出，只发一次（`firedReply` 留痕）。典型用法：验收编写→执行；回修后自动复测。
+- 推进由 `advance` 完成：`await` 每轮调用，watchdog 每分钟的 `rescue-owners` 在主端没挂 await 时也调用——主 session
+  被回收时流水线照样往前走。协调目录级 flock 单例；自动派发不改写 `owner.meta`、不拉分屏。
+- 唤醒规则：依赖模块 done（下游已被接续）、自己还排着消息的模块 done、被下游验收合入推动基线后旧回执变成
+  `acceptance baseline changed` 都算例行，不唤醒；失败/阻塞/待核实、推进出错、无下游的完成、流水线全部收尾才唤醒。
+  依赖失败导致排队卡无法推进时，唤醒输出带 `queueBlocked`；`advanced` 列出本次 await 期间自动做过的动作。
+- `--phase author`（仅 verify/integ）：编写阶段回执 tests 可 `not-run`、不校验验收基线；执行阶段恢复严格验收。
+- `prepare --self`：solo 模式下主 session 自己开发用的 worktree（state=`self`），不派发、不算 pending；
+  主 session 提交后在该 worktree 里运行 `cc-fleet-land <RQ>`。
 
 `prepare` 省略 --backend 时跟随主端：`claude-code` → claude，`codex-app` / `codex-cli` → codex。
 Claude Code 主端显式 `--backend codex` 时固定使用 `gpt-6-astra` / `low` / `openai`；后续 reply 保持已保存 routing。
@@ -34,8 +55,12 @@ git 根到启动目录路径上的 CLAUDE.md / AGENTS.md（2026-09-11 实测；�
 `regression` 是全 RQ 唯一跑成批 e2e 的角色（开发卡各自只跑改动相关的最小集合），范围用
 `cc-fleet-e2e-scope plan` 合成后写进任务卡；规则见 delivery-quality.md §6。
 
-`prepare` 只创建任务元数据/prompt/worktree，不调用模型；`dispatch` 才启动 worker，且只接受 prepared。
-未知启动结果保留 worktree，禁止自动重试创建。修复可用新模块名 `api-fix1`；同模块追加指令用 reply。
+`prepare` 只创建任务元数据/prompt/worktree，不调用模型；`dispatch` 才启动 worker，接受 prepared 与 queued（后者可提前手动派）。
+未知启动结果保留 worktree，禁止自动重试创建。回修与追加指令一律 `reply` 原模块：Claude worker 已被回收（daemon ENOJOB）时
+自动用其 job `state.json` 经 daemon `launch.mode=resume` 原地复活再投递（输出 `revived=true`）。
+同一模块人工 reply 满 `CC_FLEET_MAX_REPLIES`（默认 3）轮后再 reply 须 `--force`（熔断，先核对需求/契约/环境）。
+reply 后 `CC_FLEET_REPLY_GRACE`（默认 180 秒）内，若 job `state.json` 尚未刷新，仍按 running 计，reply 后立即挂 await 不会秒退。
+只有换后端/重新实现才用新模块名（如 `api-fix1`）。
 
 ## 回执与状态
 
@@ -52,7 +77,7 @@ status/read 同时读取这两个位置，主端必须在收工前 `collect` 将
 - `running`：还在执行；`blocked`：输入/审批等阻塞；`needs-review`：空闲无回执或回执未通过核验。
 - `unknown`：查询失败/后端缺记录；不要判失败后立即重复创建。
 - `launch-uncertain`：启动/回话可能已送达；先用公开列表和名册查证，再 reconcile。
-- `prepared` / `setting-up`：尚未派发/原生 worktree 仍在创建。
+- `prepared` / `setting-up`：尚未派发/原生 worktree 仍在创建。`queued`：等依赖，编排器自动派发（计入 pending）。`self`：主 session 自己的 worktree。
 - `done`：回执经过机械核验；仍需主端业务验收。verify/integ 存在 not-run 时不能 done（真正不适用项在报告说明理由，不伪装为已通过检查）。
 
 新派发前默认先生成用户用例并引用原始需求及本次参考资料（如有）；统一 worker prompt 和 reply 都提醒该流程。
@@ -143,8 +168,8 @@ await 是主 session 的子进程：主 session 被 watchdog 回收、daemon 重
 → 标 `attention=stalled`，`status` 顶层给 `stalled` 列表，`await` 据此唤醒主端。**state 本身不改**，
 stalled 只是「该去看一眼」。核实手段：`read` 看最后回复/日志、比对 worktree HEAD 有没有动。
 
-`reply` 对 stalled 模块**直接拒绝**并提示核实，确认会话还活着才用 `--force`；会话确已结束就开 fix 卡接手
-（新模块名如 `m1-fix1`），⛔ 不要对死会话反复 reply。`reconcile` 同理只认后端真实状态：找到 job 记录只能
+`reply` 对 stalled 模块**直接拒绝**并提示核实（后端仍报 running、消息可能被吞），确认会话状态后再 `--force`。
+已正常结束/被回收的 Claude 会话不属于此列：`reply` 会自动原地复活再投递，回修优先交回原会话。`reconcile` 同理只认后端真实状态：找到 job 记录只能
 证明 worker 存在，`done` 的会话按 `needs-review` 报，不再硬写 running。
 
 `stop` 中断 worker，保留会话和 worktree；不会删除分支或成果。没有运行 turn 的 Codex 任务只登记 stopped。
@@ -154,7 +179,8 @@ stalled 只是「该去看一眼」。核实手段：`read` 看最后回复/日�
 - `CODEX_CLI_PATH`：Codex 二进制绝对路径；app-server 使用已有官方 proxy 传输辅助脚本。
 - `CODEX_MULTI_SESSION_CONFIG` / `CODEX_HOME`：沿用 Codex 原有路由机制。
 - `CLAUDE_CLI_PATH`：Claude 二进制；`CLAUDE_FLEET_CONFIG`：默认 `~/.claude/multi-session-dev.json`，
-  派发使用其中 `worker.model/effort`；可 `dispatch --profile spike`。没有配置则不传模型/effort。
+  派发使用其中 `worker.model/effort`；`regression` 卡缺省用 `runner`（存在时），也可 `prepare/dispatch --profile spike`。
+  没有配置则不传模型/effort。
 - v2 生成 UUID 后缀 RQ，协调数据在 git-common-dir，避免两端各自分配同号；历史全局序号池不受影响。
 - `CC_FLEET_PANEL=0`：不在 Ghostty 分屏拉起只读面板（默认 Codex app-server 与 Claude `--bg` 派发成功即拉起，
   两种后端同屏，幂等复用）。**登记不受它影响**：`init` 与 `dispatch` 总会把协调目录登记进全局注册表，

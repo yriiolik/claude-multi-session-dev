@@ -557,4 +557,130 @@ class FleetTests(unittest.TestCase):
   self.assertEqual(self.rescue(env,c2),[],'主端在完成之后还活动过 = 已看到')
   self.assertFalse([q for q in st['calls'] if q['op'] in('dispatch','reply')])
 
+ # ---- 依赖图自动推进 / 验收两阶段 / 回修交回原会话 / solo / runner ----
+ def dev_done(self,c,d):self.receipt(c,d,commit=self.base)
+ def rec(self,c,m):return json.loads((c/'v2'/f'{m}.json').read_text())
+ def test_prepare_after_queues_then_advance_dispatches_when_all_deps_done(self):
+  c,a,_=self.claude_worker('api');_,w,_=self.claude_worker('web',c=c)
+  self.cli('prepare','--coord',c,'--module','verify','--backend','claude','--role','verify','--task',self.task,'--after','api,web')
+  self.cli('prepare','--coord',c,'--module','x','--task',self.task,'--after','nope',ok=False)  # 依赖必须已登记
+  row=next(r for r in self.cli('status','--coord',c)['jobs'] if r['module']=='verify')
+  self.assertEqual((row['state'],row['after']),('queued',['api','web']))
+  self.dev_done(c,a);self.assertEqual(self.cli('advance','--coord',c)['actions'],[],'只差一个依赖不派')
+  self.dev_done(c,w);acts=self.cli('advance','--coord',c)['actions']
+  self.assertEqual([(x['module'],x['action'],x['state']) for x in acts],[('verify','dispatched','running')])
+  self.assertTrue(self.rec(c,'verify')['autoDispatchedAt']);self.assertEqual(self.cli('advance','--coord',c)['actions'],[],'不重复派')
+ def test_await_stays_quiet_while_pipeline_advances_and_wakes_at_the_end(self):
+  c,a,_=self.claude_worker('api')
+  self.cli('prepare','--coord',c,'--module','verify','--backend','claude','--role','verify','--task',self.task,'--after','api')
+  p=self.run_await(c);time.sleep(1.5)
+  self.dev_done(c,a);time.sleep(9)
+  self.assertIsNone(p.poll(),'依赖完成由编排器接续，不该唤醒主端')
+  v=self.rec(c,'verify');self.assertEqual(v['state'],'running')
+  self.job(v['shortId'],state='done',tempo='idle')  # 下游无后继，结束 → 唤醒
+  j=self.finish(p);self.assertEqual([x['module'] for x in j['changed']],['verify'])
+  self.assertEqual([(x['module'],x['action']) for x in j['advanced']],[('verify','dispatched')])
+ def test_failed_dependency_wakes_owner_with_queue_blocked(self):
+  c,a,_=self.claude_worker('api')
+  self.cli('prepare','--coord',c,'--module','verify','--backend','claude','--role','verify','--task',self.task,'--after','api')
+  p=self.run_await(c);time.sleep(1.5)
+  self.receipt(c,a,result='failed',tests=[dict(command='e2e',result='failed',evidence='log')])
+  j=self.finish(p);self.assertEqual(j['changed'][0]['to'],'failed');self.assertEqual(j['queueBlocked'],['verify'])
+  self.assertEqual(self.rec(c,'verify')['state'],'queued')
+ def test_verify_author_phase_then_queued_execute_reply(self):
+  env,st=self.fake_daemon(dict(state='working',tempo='active'));self.env=env  # worker 会话仍在
+  c,a,_=self.claude_worker('api')
+  v=self.cli('prepare','--coord',c,'--module','verify','--backend','claude','--role','verify','--task',self.task,'--phase','author')
+  self.assertIn('编写阶段',(c/'verify.prompt.md').read_text())
+  self.cli('dispatch','--coord',c,'--module','verify')
+  self.receipt(c,v,commit='',tests=[dict(command='写验收脚本',result='not-run',evidence='tests/e2e/_verify/x.spec.ts')])
+  row=next(r for r in self.cli('status','--coord',c)['jobs'] if r['module']=='verify');self.assertEqual(row['state'],'done','编写阶段 not-run 也算交付')
+  t=self.root/'exec.md';t.write_text('按 use-cases.md 全部执行')
+  self.cli('queue-reply','--coord',c,'--module','verify','--after','api','--text-file',t,'--phase','execute')
+  self.assertEqual(self.cli('advance','--coord',c)['actions'],[])
+  self.dev_done(c,a);acts=self.cli('advance','--coord',c)['actions']
+  self.assertEqual([(x['module'],x['action']) for x in acts],[('verify','replied')])
+  sent=[q for q in st['calls'] if q['op']=='reply'];self.assertEqual(len(sent),1)
+  self.assertIn('执行阶段',sent[0]['text']);self.assertIn('按 use-cases.md 全部执行',sent[0]['text'])
+  r=self.rec(c,'verify');self.assertEqual((r['phase'],r['queuedReply'],r['replies']),('execute',None,0))
+  self.assertEqual(self.cli('advance','--coord',c)['actions'],[],'只发一次')
+  # 执行阶段回到严格验收：not-run 不再算 done
+  self.receipt(c,r,tests=[dict(command='x',result='not-run',evidence='-')])
+  self.assertEqual(next(x for x in self.cli('status','--coord',c)['jobs'] if x['module']=='verify')['state'],'needs-review')
+ def test_queued_retest_fires_after_failed_verification_once_fix_lands(self):
+  env,st=self.fake_daemon(dict(state='working',tempo='active'));self.env=env
+  c,a,_=self.claude_worker('api')
+  v=self.cli('prepare','--coord',c,'--module','verify','--backend','claude','--role','verify','--task',self.task)
+  self.cli('dispatch','--coord',c,'--module','verify');self.dev_done(c,a)
+  self.receipt(c,v,result='failed',tests=[dict(command='UC-A2',result='failed',evidence='shot.png')])  # 验收发现缺陷
+  t=self.root/'fix.md';t.write_text('修 UC-A2');self.cli('reply','--coord',c,'--module','api','--text-file',t)
+  t2=self.root/'re.md';t2.write_text('复测 UC-A2');self.cli('queue-reply','--coord',c,'--module','verify','--after','api','--text-file',t2)
+  self.assertEqual(self.cli('advance','--coord',c)['actions'],[],'回修还没完成')
+  self.dev_done(c,self.rec(c,'api'))
+  self.assertEqual([(x['module'],x['action']) for x in self.cli('advance','--coord',c)['actions']],[('verify','replied')])
+  self.assertIn('复测 UC-A2',[q for q in st['calls'] if q['op']=='reply'][-1]['text'])
+ def test_reply_revives_reaped_claude_worker_in_place(self):
+  env,st=self.fake_daemon();self.env=env
+  c,d,s=self.claude_worker('api');self.dev_done(c,d)
+  self.job(s,sessionId='sid-'+s,state='done',tempo='idle',respawnFlags=['--name','↳api'],cwd=str(self.repo))
+  t=self.root/'fix.md';t.write_text('UC-A2 失败：修复')
+  out=self.cli('reply','--coord',c,'--module','api','--text-file',t)
+  self.assertTrue(out['revived']);self.assertEqual(out['replies'],1)
+  ops=[q['op'] for q in st['calls'] if q['op'] in('reply','dispatch')];self.assertEqual(ops,['reply','dispatch','reply'])
+  dp=next(q for q in st['calls'] if q['op']=='dispatch')['d'];self.assertEqual((dp['short'],dp['launch']['mode'],dp['launch']['fork']),(s,'resume',False))
+ def test_reply_then_await_does_not_exit_on_previous_round_state(self):
+  env,st=self.fake_daemon(dict(state='working',tempo='active'));self.env=env
+  c,d,s=self.claude_worker('api');self.dev_done(c,d);self.job(s,state='done',tempo='idle',updatedAt=self.old(30))
+  t=self.root/'fix.md';t.write_text('再修一处');self.cli('reply','--coord',c,'--module','api','--text-file',t)
+  self.assertEqual(self.state_of(c)[0],'running','state.json 还是上一轮 done，不能判新一轮已结束')
+  p=self.run_await(c);time.sleep(6);self.assertIsNone(p.poll(),'reply 后挂 await 不应秒退')
+  self.job(s,state='done',tempo='idle');j=self.finish(p);self.assertEqual(j['changed'][0]['to'],'needs-review')
+ def test_reply_rework_cap_requires_force(self):
+  c,_,_=self.setup_worker();self.cli('dispatch','--coord',c,'--module','api')
+  env=dict(self.env,CC_FLEET_MAX_REPLIES='1');t=self.root/'fix.md';t.write_text('再修')
+  self.cli('reply','--coord',c,'--module','api','--text-file',t,env=env)
+  r=self.cli('reply','--coord',c,'--module','api','--text-file',t,ok=False,env=env);self.assertIn('re-check',r.stderr)
+  self.assertEqual(self.cli('reply','--coord',c,'--module','api','--text-file',t,'--force',env=env)['replies'],2)
+ def test_self_module_is_main_session_worktree_never_dispatched(self):
+  f=self.cli('init','--cwd',self.repo,'--host','claude-code');c=pathlib.Path(f['coord'])
+  d=self.cli('prepare','--coord',c,'--module','main','--self')
+  self.assertEqual(d['state'],'self');self.assertTrue(pathlib.Path(d['worktree']).is_dir());self.assertIn('cc-fleet-land',d['next'])
+  self.assertFalse((c/'main.prompt.md').exists())
+  self.assertIn('main session',self.cli('dispatch','--coord',c,'--module','main',ok=False).stderr)
+  self.assertEqual(self.cli('await','--coord',c)['reason'],'nothing-to-await');self.assertIsNone(self.guard())
+  self.cli('prepare','--coord',c,'--module','v','--self','--role','verify',ok=False)
+ def test_queued_card_worktree_fast_forwards_to_landed_dependencies(self):
+  c,a,_=self.claude_worker('api')
+  q=self.cli('prepare','--coord',c,'--module','regression','--backend','claude','--role','regression','--task',self.task,'--after','api')
+  wt=pathlib.Path(a['worktree']);(wt/'api.txt').write_text('api');self.git('add','.',cwd=wt);self.git('commit','-qm','api',cwd=wt)
+  rq=json.loads((c/'fleet.json').read_text())['rq']
+  subprocess.run([str(ROOT/'scripts/cc-fleet-land'),rq],cwd=wt,check=True,capture_output=True)
+  tip=self.git('rev-parse','fleet/'+rq);self.receipt(c,a,commit=tip)
+  self.cli('advance','--coord',c)
+  self.assertEqual(self.git('rev-parse','HEAD',cwd=q['worktree']),tip,'派发前快进到含依赖的集成基线')
+  self.assertEqual(self.rec(c,'regression')['baselineCommit'],tip)
+ def test_bounded_wait_also_advances_queue(self):
+  c,a,_=self.claude_worker('api')
+  self.cli('prepare','--coord',c,'--module','regression','--backend','claude','--role','regression','--task',self.task,'--after','api')
+  self.dev_done(c,a);self.cli('wait','--coord',c,'--timeout','0')
+  self.assertEqual(self.rec(c,'regression')['state'],'running')
+ def test_regression_card_defaults_to_runner_profile(self):
+  conf=self.root/'conf.json';conf.write_text(json.dumps(dict(worker=dict(model='big',effort='high'),runner=dict(model='small',effort='medium'))))
+  self.env['CLAUDE_FLEET_CONFIG']=str(conf)
+  c,_,_=self.claude_worker('api')
+  self.cli('prepare','--coord',c,'--module','regression','--backend','claude','--role','regression','--task',self.task)
+  self.cli('dispatch','--coord',c,'--module','regression')
+  bg=[x for x in self.db()['calls'] if '--bg' in x]
+  self.assertEqual([x[x.index('--model')+1] for x in bg],['big','small'])
+ def test_rescue_advances_pipeline_without_waking_owner_until_the_end(self):
+  c,a,_=self.claude_worker('api')
+  self.cli('prepare','--coord',c,'--module','verify','--backend','claude','--role','verify','--task',self.task,'--after','api')
+  self.owner_session(c);env,st=self.fake_daemon()
+  self.rescue(env,c)  # 基线
+  self.dev_done(c,a);self.assertEqual(self.rescue(env,c),[],'依赖完成：自动派发下游，不叫主端')
+  v=self.rec(c,'verify');self.assertEqual(v['state'],'running');self.assertFalse([q for q in st['calls'] if q['op']=='reply'])
+  self.assertIn(self.OWNER,(c/'owner.meta').read_text(),'自动派发不得以 watchdog 身份改写主端归属')
+  self.job(v['shortId'],state='done',tempo='idle')
+  r=self.rescue(env,c)[0];self.assertEqual((r.get('action'),r.get('modules')),('woke',['verify']),r)
+
 if __name__=='__main__':unittest.main(verbosity=2)

@@ -168,3 +168,17 @@ RQ-2026-0824-001（发货单统一上报派生）走模式 A：提供方按契�
 - 已被 kill 的会话：daemon `reply` / `respawn-stale` 都返回 ENOJOB；`dispatch` + `launch.mode=resume` + 原 short/
   sessionId 可原地复活，reply 会进入同一段对话。
 
+
+## 熄屏时开分屏 → Ghostty "The terminal failed to initialize"
+
+**现象**：人离开、屏幕熄灭/锁屏期间编排自动派发，回来看到面板分屏是「Oh, no. The terminal failed to initialize」，
+且可能反复出现（面板没起来 → 下次派发又开一块坏分屏）。
+
+**根因**：没有活动显示器时 Ghostty 给新 surface 建 CVDisplayLink 失败（系统日志
+`CVDisplayLinkCreateWithCGDisplays error -6661 due to invalid display count (0)`），被包装成
+`embedded_window: error initializing surface err=error.OutOfMemory`——**不是**真的内存不足。2026-10-08/09/10
+三次故障全部落在 `pmset -g log` 的 Display off 区间内。
+
+**修复**：`cc-fleet-panel-open` 开分屏前用 JXA `CGGetActiveDisplayList` 探测，0 个活动显示器就跳过（不写状态、
+默认退 0），亮屏后下次派发自动拉起。排查时注意 zsh 里 `log` 可能被函数遮蔽，用 `/usr/bin/log show
+--predicate 'process == "ghostty" AND subsystem == "com.mitchellh.ghostty"'`。

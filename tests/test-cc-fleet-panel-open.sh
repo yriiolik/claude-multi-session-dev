@@ -40,6 +40,15 @@ echo "FAKE-TERM-0001"
 SH
 chmod +x "$FAKE_OSA"
 
+# 假的显示器探测：打印活动显示器数量。默认 1，测「屏幕熄灭」用 FAKE_DISPLAYS=0，测「探测失败」用 FAKE_DISPLAYS=fail。
+FAKE_PROBE="$TMP/fake-display-probe"
+cat > "$FAKE_PROBE" <<'SH'
+#!/bin/sh
+[ "${FAKE_DISPLAYS:-1}" = "fail" ] && exit 1
+echo "${FAKE_DISPLAYS:-1}"
+SH
+chmod +x "$FAKE_PROBE"
+
 REG="$TMP/registry.json"
 STATE="$TMP/panel.json"
 PIDF="$TMP/panel.pid"
@@ -50,6 +59,7 @@ run_open(){
   # 所以这里默认顶回 1；要测"全局开关"那条用例时用 TEST_PANEL_FLAG=0 覆盖。
   CC_FLEET_PANEL="${TEST_PANEL_FLAG:-1}" \
   CC_GHOSTTY_OSASCRIPT="$FAKE_OSA" \
+  CC_FLEET_DISPLAY_PROBE="$FAKE_PROBE" \
   OSA_ARGV_LOG="$ARGV_LOG" OSA_STDIN_LOG="$STDIN_LOG" \
   CC_FLEET_PANEL_REGISTRY="$REG" \
   CC_FLEET_PANEL_STATE="$STATE" \
@@ -159,6 +169,22 @@ assert_eq "$RC" "0" "Ghostty 不可用时默认退出 0——面板开不出来�
 assert_contains "$OUT" "手动运行" "给出手动兜底命令"
 OSA_FAIL=1 run_open --strict >/dev/null 2>&1; RC=$?
 assert_eq "$RC" "4" "--strict 时以非 0 退出"
+
+# ---------------------------------------------------------------- 屏幕熄灭
+# 熄屏/锁屏时没有活动显示器，Ghostty 建 CVDisplayLink 失败 → surface 初始化报 OutOfMemory，
+# 分屏里只剩 "The terminal failed to initialize"。编排会在人离开时自动派发，必须先探测再开。
+CASE="屏幕熄灭"
+rm -f "$STATE" "$PIDF"
+OUT="$(FAKE_DISPLAYS=0 run_open)"; RC=$?
+assert_eq "$RC" "0" "熄屏跳过不让派发失败"
+assert_contains "$OUT" "没有活动显示器" "说明跳过原因"
+assert_eq "$(wc -l < "$ARGV_LOG" | tr -d ' ')" "0" "熄屏时绝不调 osascript 去开分屏"
+[[ ! -s "$STATE" ]] && ok || fail "熄屏跳过时不写面板状态"
+FAKE_DISPLAYS=0 run_open --strict >/dev/null 2>&1; RC=$?
+assert_eq "$RC" "4" "--strict 时熄屏以非 0 退出"
+OUT="$(FAKE_DISPLAYS=fail run_open)"
+assert_contains "$OUT" "已在 Ghostty" "探测本身失败时不拦，照常拉起"
+rm -f "$STATE" "$PIDF"
 
 # ---------------------------------------------------------------- 关闭
 CASE="关闭"

@@ -195,6 +195,25 @@ if (!fs.existsSync(OSASCRIPT)) {
   bail(`找不到 osascript（${OSASCRIPT}）；请手动运行: ${PANEL_BIN}`);
 }
 
+// 屏幕熄灭 / 锁屏时没有「活动显示器」，Ghostty 给新 surface 建 CVDisplayLink 会失败
+// （系统日志 `CVDisplayLinkCreateWithCGDisplays error -6661 due to invalid display count (0)`），
+// 被它包装成 `error initializing surface err=error.OutOfMemory`，分屏里只剩
+// "Oh, no. The terminal failed to initialize"——并非真的内存不足（2026-10-08/09/10 三次实测，
+// 全部落在 pmset 记录的 Display off 区间内）。编排会在人离开时自动派发，所以这里先探测再开：
+// 0 个活动显示器就跳过，亮屏后下一次派发（或手动运行本脚本）会照常拉起。探测失败（-1）不拦。
+const DISPLAY_PROBE = process.env.CC_FLEET_DISPLAY_PROBE || "";
+const DISPLAY_JXA = "ObjC.import('CoreGraphics'); var n = Ref(); $.CGGetActiveDisplayList(0, null, n); n[0];";
+function activeDisplayCount() {
+  const res = DISPLAY_PROBE
+    ? spawnSync(DISPLAY_PROBE, [], { encoding: "utf8", timeout: 10000 })
+    : spawnSync("/usr/bin/osascript", ["-l", "JavaScript", "-e", DISPLAY_JXA], { encoding: "utf8", timeout: 10000 });
+  const n = Number(String(res.stdout || "").trim());
+  return res.status === 0 && String(res.stdout || "").trim() !== "" && Number.isInteger(n) ? n : -1;
+}
+if (activeDisplayCount() === 0) {
+  bail(`没有活动显示器（屏幕熄灭/锁屏），跳过拉起面板——此时 Ghostty 建分屏会失败成 "The terminal failed to initialize"。亮屏后下次派发会自动拉起，或手动运行: ${__filename}`);
+}
+
 // Ghostty 的 `command` **不是交给 shell 的一行脚本**：它自己先做「变量展开 + 按引号拆词」，
 // 再把拆出来的 argv 重新逐个加单引号，拼成 `login -flp <user> /bin/bash --noprofile --norc -c
 // "exec -l 'argv0' 'argv1' …"` 执行（2026-08-13 从进程表实测得到）。后果有两条：

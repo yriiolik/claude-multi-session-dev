@@ -169,7 +169,7 @@ RQ-2026-0824-001（发货单统一上报派生）走模式 A：提供方按契�
   sessionId 可原地复活，reply 会进入同一段对话。
 
 
-## 熄屏时开分屏 → Ghostty "The terminal failed to initialize"
+## 九、熄屏时开分屏 → Ghostty "The terminal failed to initialize"（2026-10-11 实测）
 
 **现象**：人离开、屏幕熄灭/锁屏期间编排自动派发，回来看到面板分屏是「Oh, no. The terminal failed to initialize」，
 且可能反复出现（面板没起来 → 下次派发又开一块坏分屏）。

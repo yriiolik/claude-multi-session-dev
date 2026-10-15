@@ -550,7 +550,7 @@ def status_one(c,d,jobs=None,stale_after=0):
     return stale_check(c,d,out,stale_after)
 
 def statuses(c,stale_after=STALE_AFTER):
-    ds=[json.loads(p.read_text()) for p in sorted((c/'v2').glob('*.json'))]
+    ds=[json.loads(p.read_text()) for p in sorted((c/'v2').glob('*.json')) if not p.name.startswith('.')]
     jobs=[]
     if any(d['backend']=='claude' for d in ds):
         try: jobs=claude_jobs()
@@ -732,6 +732,7 @@ def auto_deps(c):
     （验收卡编写阶段完成、等依赖合入后自动进入执行阶段）。"""
     out=set()
     for p in (c/'v2').glob('*.json'):
+        if p.name.startswith('.'): continue
         with contextlib.suppress(Exception):
             d=json.loads(p.read_text())
             if d.get('queuedReply'): out.add(d['module'])

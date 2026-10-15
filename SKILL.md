@@ -113,9 +113,13 @@ Codex CLI 没有 App 原生任务工具时自动走 app-server；不要把工具
    Claude worker 的 status 已改以 job 的 `state.json` 与进程存活为准：进程没了（`process-exited`）或这一轮已停且
    无后台任务超过 60 秒（`turn-ended-without-result`）直接报 `needs-review`，await 约 1–2 分钟内唤醒你，先 `read` 核实。
    `attention=stalled`（久无可观测活动）多半就是这种僵尸 running：**reply 会被静默吞掉**。先 `read` /
-   核对 worktree HEAD 证实再 `--force`。已结束/被回收的 Claude 会话则可直接 `reply`（自动原地复活）。
-8. **回修交回原会话**：验收/回归失败时，把失败用例和证据 `reply` 给负责该结果的原开发 worker（上下文还热）；
-   Claude worker 已被 watchdog 回收时 `reply` 自动原地复活（同一会话，`revived=true`），⛔ 不再因"会话没了"新开 fix 卡。
+   核对 worktree HEAD 证实再 `--force`。已结束/被回收的 Claude 会话则可直接 `reply`（按下条原则复用或换新会话）。
+8. **回修交回原模块，会话「热且小」才复用**：验收/回归失败时，把失败用例和证据 `reply` 给负责该结果的模块。
+   不分会话类型，`reply` / `queue-reply` 投递前自动判定：距上一轮结束 <1 小时（提示缓存还在）、上下文 <150k、没压缩过，
+   三条都满足才复用原会话（已被回收的原地复活，`revived=true`）；任一不满足就**换新会话**（输出 `rotated`）——停旧会话，
+   同一 worktree、同一任务卡起新会话，靠交接文件 `<COORD>/<module>.handoff.md`（worker 每轮回执前覆写）与 worktree 现状续上。
+   理由：每轮都重读整段上下文，成本≈上下文×轮数，缓存凉了首轮还要整段重写；旧过程超过一定体量后锚定与稀释盖过它的价值，
+   压缩过的已是有损摘要。正在跑的会话不打断；`--session reuse|fresh` 可强制。⛔ 不因"会话没了"新开 fix 卡。
    同时 `queue-reply --module verify --after <回修模块> --text-file <复测说明>`，回修合入后验收自动复测失败项与主流程。
    `reply` 生成新 attempt，避免上一轮 done 回执冒充新一轮完成；原生路径按输出调用宿主消息工具。
    **熔断**：同一模块人工 reply 满 3 轮（`CC_FLEET_MAX_REPLIES`）后再 reply 会被拒——反复返工说明需求/契约/环境有问题，

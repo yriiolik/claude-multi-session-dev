@@ -471,6 +471,25 @@ function collect() {
 // rollout 文件路径按 thread id 扫目录树得到，结果缓存：面板每 2 秒刷一次，不能每次都遍历。
 const rolloutCache = new Map();
 
+// 上下文体量与「下一条回复复用还是换新会话」。数据来自 cc-fleet status 落的增量测量缓存（v2/.ctx-cache.json），
+// 判定与 lib/session_ctx.py 同阈值：热且小（空闲<1h、上下文<150k、没压缩过）才复用。
+function contextLine(job, file) {
+  if (!file || !job.coord) return "";
+  let st;
+  try { st = JSON.parse(fs.readFileSync(path.join(job.coord, "v2", ".ctx-cache.json"), "utf8"))[file]; } catch { return ""; }
+  if (!st || !st.tokens) return "";
+  const maxCtx = Number(process.env.CC_FLEET_FRESH_CTX || 150000);
+  const maxIdle = Number(process.env.CC_FLEET_FRESH_IDLE || 3600);
+  const idle = st.lastAt ? Math.max(0, Math.floor(Date.now() / 1000 - st.lastAt)) : 0;
+  const why = [];
+  if (st.tokens >= maxCtx) why.push("上下文大");
+  if (idle >= maxIdle) why.push("缓存已凉");
+  if (st.compactions) why.push("压缩过");
+  const text = `上下文 ${Math.round(st.tokens / 1000)}k · 压缩 ${st.compactions || 0} 次 · 空闲 ${fmtAge(idle)} → 下次回复`
+    + (why.length ? `换新会话（${why.join("、")}）` : "复用原会话");
+  return why.length ? C.yellow(text) : C.dim(text);
+}
+
 function logFor(job) {
   // Claude worker 的明细在会话 transcript 里，按完整 sessionId 找
   const claude = job.backend === "claude";
@@ -607,6 +626,8 @@ function detailLines(job, width) {
   const wd = meta.workdir || job.worktree_cwd;
   if (wd) lines.push(...wrap(`工作树 ${wd}`, width, "").map(C.dim));
   if (meta.tokens) lines.push(C.dim(`token  ${meta.tokens.toLocaleString("en-US")}`));
+  const ctx = contextLine(job, file);
+  if (ctx) lines.push(ctx);
   lines.push(C.dim(`回执   ${job.receipt ? `🧾 在案 ${job.summary_file}` : "未落回执"}`));
   lines.push(C.dim(`日志   ${file || (job.backend === "claude" ? "(未找到 transcript)" : "(未找到 rollout)")}`));
   lines.push(rule);

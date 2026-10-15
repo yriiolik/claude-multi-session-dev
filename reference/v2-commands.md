@@ -56,8 +56,16 @@ git 根到启动目录路径上的 CLAUDE.md / AGENTS.md（2026-09-11 实测；�
 `cc-fleet-e2e-scope plan` 合成后写进任务卡；规则见 delivery-quality.md §6。
 
 `prepare` 只创建任务元数据/prompt/worktree，不调用模型；`dispatch` 才启动 worker，接受 prepared 与 queued（后者可提前手动派）。
-未知启动结果保留 worktree，禁止自动重试创建。回修与追加指令一律 `reply` 原模块：Claude worker 已被回收（daemon ENOJOB）时
-自动用其 job `state.json` 经 daemon `launch.mode=resume` 原地复活再投递（输出 `revived=true`）。
+未知启动结果保留 worktree，禁止自动重试创建。回修与追加指令一律 `reply` 原模块，投递前按「热且小才复用」判定（不分角色）：
+
+- 复用：距上一轮结束 < `CC_FLEET_FRESH_IDLE`（默认 3600 秒，缓存还在）、上下文 < `CC_FLEET_FRESH_CTX`（默认 150000）、没压缩过。
+  Claude worker 已被回收（daemon ENOJOB）时自动用其 job `state.json` 经 daemon `launch.mode=resume` 原地复活再投递（`revived=true`）。
+- 换新会话：任一不满足 → `claude stop` 旧会话（Codex 旧 thread 留着不动），同一 worktree / 分支 / 任务卡起新会话，
+  消息里带【接续】说明（交接文件、上一轮回执、旧 transcript 路径只许 grep），输出 `rotated`，名册 `previousSessions` 留痕。
+  worker 每轮回执前覆写交接文件 `<COORD>/<module>.handoff.md`（不可写时放临时回执同目录）。
+- 测不到（找不到 transcript/rollout）按复用；正在跑（running 且非 stalled）的会话不打断；`reply/queue-reply --session reuse|fresh` 强制。
+- `status` 每行带 `context`（tokens / idleFor / compactions / reuse / why），面板详情页显示「下次回复复用/换新会话」；
+  `advance` 的动作带 `rotated` 原因，await 唤醒摘要的 `advanced` 里可见。
 同一模块人工 reply 满 `CC_FLEET_MAX_REPLIES`（默认 3）轮后再 reply 须 `--force`（熔断，先核对需求/契约/环境）。
 reply 后 `CC_FLEET_REPLY_GRACE`（默认 180 秒）内，若 job `state.json` 尚未刷新，仍按 running 计，reply 后立即挂 await 不会秒退。
 只有换后端/重新实现才用新模块名（如 `api-fix1`）。
@@ -169,7 +177,7 @@ await 是主 session 的子进程：主 session 被 watchdog 回收、daemon 重
 stalled 只是「该去看一眼」。核实手段：`read` 看最后回复/日志、比对 worktree HEAD 有没有动。
 
 `reply` 对 stalled 模块**直接拒绝**并提示核实（后端仍报 running、消息可能被吞），确认会话状态后再 `--force`。
-已正常结束/被回收的 Claude 会话不属于此列：`reply` 会自动原地复活再投递，回修优先交回原会话。`reconcile` 同理只认后端真实状态：找到 job 记录只能
+已正常结束/被回收的 Claude 会话不属于此列：`reply` 按「热且小」原地复活再投递或换新会话。`reconcile` 同理只认后端真实状态：找到 job 记录只能
 证明 worker 存在，`done` 的会话按 `needs-review` 报，不再硬写 running。
 
 `stop` 中断 worker，保留会话和 worktree；不会删除分支或成果。没有运行 turn 的 Codex 任务只登记 stopped。

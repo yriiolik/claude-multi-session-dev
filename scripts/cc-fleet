@@ -7,7 +7,9 @@ from pathlib import Path
 import re, shlex, subprocess, sys, tempfile, time, uuid
 
 ROOT = Path(__file__).resolve().parent
-HOSTS = ('codex-app', 'codex-cli', 'claude-code')
+sys.path.insert(0, str(ROOT/'lib'))
+import session_ctx  # 上下文「热且小」才复用原会话，否则换新会话靠交接文件续上
+HOSTS =('codex-app', 'codex-cli', 'claude-code')
 TERMINAL = {'done', 'failed', 'blocked', 'stopped', 'needs-review', 'unknown', 'launch-uncertain'}
 STALE_AFTER = int(os.environ.get('CC_FLEET_STALE_AFTER', '600'))  # running with no observable activity
 # Claude worker 这一轮已停、无后台任务、state.json 超过该秒数未更新 → 判定会话已结束（末条漏打 result: 也算）。
@@ -143,6 +145,10 @@ def init(a):
     panel_register(c,rq)
     emit(dict(d,coord=str(c),uncommittedChangesExcluded=bool(git(repo,'status','--porcelain'))))
 
+def handoff_path(c,d,fallback=False):
+    if fallback: return inbox(c,d).parent/(d['module']+'.handoff.md')
+    return c/(d['module']+'.handoff.md')
+
 def preamble(c,d):
     # 只放本任务独有的数据与不可推导的边界；项目规则交给客户端按启动目录自动加载的 CLAUDE.md / AGENTS.md。
     fleet=meta(c); role=d['role']; rq=fleet['rq']
@@ -191,7 +197,7 @@ def preamble(c,d):
 {testing}禁止 reset --hard、推远端、合回共享分支、删除或清理 worktree；范围/权限问题写 blocked 回执并说明所需输入。
 开工及压缩恢复后先读任务卡引用的原始需求、用户用例、契约（及本次参考资料）；实现/验收卡缺用例或必需输入时报告缺项，不自行缩减需求。
 失败如实写 tests.result=failed 且 result=failed/blocked，不藏进 risks、不改 not-run、不删断言；只做了计划不能报 done。
-完成时把下列 JSON 原子写到 {c/(d['module']+'.receipt.json')}（临时文件+rename）；该目录不可写就 mkdir -p 后改写 {inbox(c,d)}，任一成功即可；最后回复同一 JSON。
+每轮完成先覆写交接文件 {handoff_path(c,d)}（≤80 行：环境与坑、结论及 SHA、未关闭项），再把下列 JSON 原子写到 {c/(d['module']+'.receipt.json')}（tmp+rename）；该目录不可写就 mkdir -p 后改写 {inbox(c,d)} 及同目录交接文件；最后回复同一 JSON。
 {{"version":2,"rq":"{rq}","module":"{d['module']}","attempt":"{d['attempt']}","worktree":"worktree 根绝对路径","result":"done|failed|blocked","summary":"真实完成内容/问题","commit":"开发提交或实际验收的完整 SHA，scout 可空","tests":[{{"command":"实际执行的检查","result":"passed|failed|blocked|not-run","evidence":"结果文件路径或简短输出"}}],"risks":[],"needsInput":[]}}
 \n任务卡：\n'''
 
@@ -345,7 +351,11 @@ def launch(c,m,profile=None,auto=False):
         if auto: d['autoDispatchedAt']=time.time()
         refresh_baseline(c,d)
         atomic(record(c,m),d)
-    prompt=(c/f'{m}.prompt.md').read_text()
+    d=start_session(c,m,d,(c/f'{m}.prompt.md').read_text(),profile)
+    return dict(d,panel=panel_attach(c,d,auto),nextWake=wake_hint(c))
+
+def start_session(c,m,d,prompt,profile=None,exclude=()):
+    """在 d 的 worktree 起一个新会话并落盘身份。exclude：换会话时排除旧会话（同名同目录的旧 job 仍在列表里）。"""
     try:
         if d['transport']=='claude-bg':
             args=[claude_bin(),'--bg','--name',d['name']]
@@ -363,7 +373,8 @@ def launch(c,m,profile=None,auto=False):
             # 在子项目目录启动：Claude 按启动目录向上加载 CLAUDE.md，根目录启动会漏掉子项目规则。
             p=run(args,cwd=workdir(d),timeout=55,check=False)
             # Reconcile through public JSON, not localized launch output or session-name prefixes.
-            hits=[j for j in claude_jobs() if j.get('name')==d['name'] and Path(j.get('cwd','/')).resolve()==Path(workdir(d)).resolve()]
+            hits=[j for j in claude_jobs() if j.get('name')==d['name'] and j.get('id') not in exclude
+                  and Path(j.get('cwd','/')).resolve()==Path(workdir(d)).resolve()]
             if len(hits)!=1 or not hits[0].get('id'):
                 raise RuntimeError('launch outcome uncertain; inspect claude agents --json --all; do not redispatch')
             j=hits[0]; d.update(shortId=j['id'],sessionId=j.get('sessionId'),state='running',activeSince=time.time())
@@ -389,8 +400,7 @@ def launch(c,m,profile=None,auto=False):
         # Preserve a concurrently written bind/worktree update.
         d=update(c,m,**{k:v for k,v in d.items() if k not in ('module','worktree','branch')})
         # 记录先落盘再开面板：面板第一次扫描就能看到这个 worker。
-        d=sidebar_attach(c,d)
-        return dict(d,panel=panel_attach(c,d,auto),nextWake=wake_hint(c))
+        return sidebar_attach(c,d)
     except Exception:
         update(c,m,state='launch-uncertain')
         raise
@@ -513,6 +523,9 @@ def status_one(c,d,jobs=None,stale_after=0):
     out={k:d.get(k) for k in ('module','backend','transport','sessionId','shortId','state','worktree')}
     for k in ('after','phase','queuedReply'):
         if d.get(k): out[k]=d[k]
+    if d.get('sessionId') and d.get('transport') in ('claude-bg','app-server'):
+        x=context_of(c,d)  # 下一条回复会复用还是换新会话，主端/面板一眼可见
+        if x: out['context']={k:x[k] for k in ('tokens','idleFor','compactions','reuse','why')}
     try:
         r=receipt(c,d)
         if r: out.update(state=r['result'],receipt=r); return out
@@ -557,7 +570,7 @@ def read(a):
 
 def reply(a):
     c=coord(a.coord); text=Path(a.text_file).read_text()
-    emit(send_reply(c,a.module,text,force=a.force,phase=a.phase,manual=True))
+    emit(send_reply(c,a.module,text,force=a.force,phase=a.phase,manual=True,session=a.session))
 
 def claude_send(d,text):
     """经 daemon 给 Claude worker 投递一条消息。done 会话空闲约 10 分钟会被 watchdog 回收（ENOJOB）：
@@ -572,7 +585,37 @@ def claude_send(d,text):
     if not r.get('ok'): raise RuntimeError(f"reply {d['shortId']} after revive rejected: {r.get('code')} {r.get('error')}")
     return True
 
-def send_reply(c,m,text,force=False,phase=None,manual=False):
+def context_of(c,d):
+    """会话当前上下文体量（见 lib/session_ctx.py）；测不到返回 None。"""
+    try:
+        if d.get('backend')=='claude':
+            js=job_state(d['shortId']) if d.get('shortId') else None
+            p=session_ctx.claude_transcript(d.get('sessionId'),workdir(d) if d.get('cwd') or d.get('worktree') else '',
+                                            (js or {}).get('linkScanPath',''))
+        else: p=session_ctx.codex_rollout(d.get('sessionId'))
+        if not p: return None
+        x=session_ctx.measure(p,'claude' if d.get('backend')=='claude' else 'codex',c/'v2'/'.ctx-cache.json')
+        reuse,why=session_ctx.decide(x)
+        return dict(x,idleFor=int(time.time()-x['lastAt']) if x.get('lastAt') else None,reuse=reuse,why=why)
+    except Exception:
+        return None
+
+def rotate(c,m,d,text,why,ctx):
+    """换新会话：停掉旧会话，同一 worktree、同一任务卡起新会话，靠交接文件与 worktree 现状续上。"""
+    if d['backend']=='claude' and d.get('shortId'):
+        with contextlib.suppress(Exception): run([claude_bin(),'stop',d['shortId']],timeout=30,check=False)
+    prev=list(d.get('previousSessions') or [])+[dict(sessionId=d.get('sessionId'),shortId=d.get('shortId'),
+              transcript=(ctx or {}).get('path'),reason=why,rotatedAt=time.time())]
+    hp=next((p for p in (handoff_path(c,d),handoff_path(c,d,fallback=True)) if p.exists()),None)
+    card=(c/f'{m}.prompt.md').read_text().split('\n任务卡：\n',1)[-1]
+    brief=(f"\n\n【接续】本卡此前由别的会话执行，因{'、'.join(why)}换成你这个新会话接着做。先读"
+           +(f"交接文件 {hp}" if hp else '（没有交接文件）')+f'，再看 worktree 现状（git log、已写脚本、证据目录）与上一轮回执 {c/"v2"}/{m}.receipt-*.json.bak；'
+           +(f"细节缺失时可 grep 旧会话记录 {prev[-1]['transcript']}，⛔ 不要整篇读入。" if prev[-1].get('transcript') else '')
+           +'旧会话的结论只作线索，一律以本轮在当前基线上的实测为准；本轮结束同样更新交接文件。\n\n下面是本轮消息：\n')
+    d=dict(d,previousSessions=prev,sessionId=None,shortId=None,turnId=None)
+    return start_session(c,m,d,preamble(c,d)+card+brief+text,exclude={p.get('shortId') for p in prev if p.get('shortId')})
+
+def send_reply(c,m,text,force=False,phase=None,manual=False,session='auto'):
     d=load(c,m)
     if not text.strip(): raise ValueError('empty reply')
     if d['state']=='self': raise ValueError('self module belongs to the main session')
@@ -586,6 +629,13 @@ def send_reply(c,m,text,force=False,phase=None,manual=False):
         raise ValueError(f"module idle for {cur['idleFor']}s while claiming running; the session may "
                          'have ended and would swallow this reply. Check read/worktree HEAD first, '
                          'then use --force or dispatch a fix module instead')
+    # 复用还是换新会话：正在干活（running 且没卡住）的会话本身就热，不打断；其余按「热且小才复用」判定。
+    fresh,why,ctx=False,[],None
+    if d['transport'] in ('claude-bg','app-server') and session!='reuse':
+        ctx=context_of(c,d)
+        if session=='fresh': fresh,why=True,['主端指定 --session fresh']
+        elif cur.get('state')!='running' or cur.get('attention')=='stalled':
+            fresh,why=not (ctx or {}).get('reuse',True),(ctx or {}).get('why',[])
     # Archive old receipts before a new attempt so stale done cannot win over resumed work.
     with lock(c,m):
         d=load(c,m); old=c/(m+'.receipt.json')
@@ -603,6 +653,12 @@ def send_reply(c,m,text,force=False,phase=None,manual=False):
     text=head+text+'\n继续前重读任务卡及最新需求、用户用例与契约，以及本次参考资料（如有）；失败如实回执，修复后复测失败项和受影响的完整主流程。\n'
     if d['transport']=='native':
         return dict(d,nextAction='send_message_to_thread, then register the same threadId after acceptance',prompt=text)
+    if fresh:
+        try: d=rotate(c,m,d,text,why,ctx)
+        except Exception:
+            update(c,m,state='launch-uncertain'); raise
+        now=time.time(); d=update(c,m,activeSince=now,repliedAt=now)
+        return dict(d,revived=False,rotated=dict(reason=why,previous=d['previousSessions'][-1]),nextWake=wake_hint(c))
     revived=False
     try:
         if d['backend']=='claude':
@@ -640,7 +696,7 @@ def queue_reply(a):
     d=load(c,m)
     if d['transport'] in ('native','self'): raise ValueError('queue-reply needs a CLI-launched worker')
     f=c/f'{m}.queued-reply.md'; f.write_text(text)
-    emit(update(c,m,queuedReply=dict(after=after,textFile=str(f),phase=a.phase,queuedAt=time.time())))
+    emit(update(c,m,queuedReply=dict(after=after,textFile=str(f),phase=a.phase,session=a.session,queuedAt=time.time())))
 
 def deps_ready(after,rows):
     st={r['module']:r['state'] for r in rows}
@@ -664,8 +720,9 @@ def advance(c,rows=None):
                 elif d.get('queuedReply') and r['state'] in SETTLED and deps_ready(d['queuedReply']['after'],rows):
                     q=d['queuedReply']; text=Path(q['textFile']).read_text()
                     update(c,m,queuedReply=None,firedReply=dict(q,firedAt=time.time()))  # 先清再发，绝不重复投递
-                    out=send_reply(c,m,text,force=True,phase=q.get('phase'))
-                    acts.append(dict(module=m,action='replied',revived=out.get('revived',False)))
+                    out=send_reply(c,m,text,force=True,phase=q.get('phase'),session=q.get('session') or 'auto')
+                    acts.append(dict(module=m,action='replied',revived=out.get('revived',False),
+                                     **({'rotated':out['rotated']['reason']} if out.get('rotated') else {})))
             except Exception as e:
                 acts.append(dict(module=m,action='error',error=f'{type(e).__name__}: {e}'))
     return acts
@@ -797,7 +854,7 @@ def await_(a):
                 emit({'wake':head.strip('; '),'reason':'state-changed' if changed else ('stalled' if stalled else 'advance-error'),'label':a.label,
                       'changed':changed,'stalled':stalled,'stillPending':left,'advanced':advanced,'errors':errors,
                       **({'queueBlocked':stuck} if stuck else {}),
-                      'next':'先 status 再决策'+('；queueBlocked 的依赖未成功，回修依赖（reply 原会话）后它会自动派发' if stuck else '')
+                      'next':'先 status 再决策'+('；queueBlocked 的依赖未成功，回修依赖（reply 原模块）后它会自动派发' if stuck else '')
                              +('；stillPending 非空，结束响应前重新挂 await' if left else '')}); return
             if time.monotonic()>=end:
                 # 超时只是本次等待结束：退出码 0（别被当失败），输出一行即可，原命令原样重挂。
@@ -1049,6 +1106,9 @@ def parser():
         if cmd=='queue-reply':
             q.add_argument('--after',required=True,help='comma separated modules that must all be done first')
             q.add_argument('--text-file',required=True); q.add_argument('--phase',choices=('execute',),help='switch a verify card from author to execute phase')
+        if cmd in ('reply','queue-reply'):
+            q.add_argument('--session',choices=('auto','reuse','fresh'),default='auto',
+                           help='auto: reuse only when the session is hot and small (idle<1h, ctx<150k, never compacted), else a fresh session with handoff')
         if cmd in ('status','await'):
             q.add_argument('--stale-after',type=int,default=STALE_AFTER,metavar='SECONDS',
                            help='flag a running module with no observable activity for this long (0 disables)')

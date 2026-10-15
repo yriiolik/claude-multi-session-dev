@@ -125,7 +125,7 @@ node -e '
 const [file, cwd] = process.argv.slice(1);
 const L = [
   { type: "user", cwd, timestamp: "2026-09-11T08:00:00Z", message: { role: "user", content: "⟦FLEET-WORKER⟧ rq=RQ-panel-v2-e2e module=ui\n做 ui 模块。" } },
-  { type: "assistant", cwd, timestamp: "2026-09-11T08:00:05Z", message: { model: "claude-opus-5", content: [{ type: "text", text: "先跑一遍测试" }] } },
+  { type: "assistant", cwd, timestamp: "2026-09-11T08:00:05Z", message: { model: "claude-opus-5", content: [{ type: "text", text: "先跑一遍测试" }], usage: { input_tokens: 10, cache_read_input_tokens: 180000, output_tokens: 5 } } },
   { type: "assistant", cwd, timestamp: "2026-09-11T08:00:06Z", message: { model: "claude-opus-5", content: [{ type: "tool_use", id: "tu1", name: "Bash", input: { command: `cd "${cwd}" && pnpm test` } }] } },
   { type: "user", cwd, timestamp: "2026-09-11T08:00:09Z", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "tu1", content: "12 passed", is_error: false }] } },
   { type: "custom-title", customTitle: "↳ui" },
@@ -142,6 +142,13 @@ assert_contains "$OUT" "📋 任务卡" "详情时间线有任务卡"
 assert_contains "$OUT" "💬 回复" "详情时间线有回复"
 assert_contains "$OUT" "12 passed" "详情时间线带命令输出"
 assert_contains "$OUT" "anthropic/claude-opus-5" "模型取自 transcript"
+CASE="上下文体量 → 下次回复复用还是换新会话"
+ST="$("$FLEET" status --coord "$C")"
+assert_eq "$(printf '%s' "$ST" | jq_ 'JSON.stringify(j.jobs.find(x=>x.module==="ui").context.tokens)')" "180010" "status 报当前上下文"
+assert_eq "$(printf '%s' "$ST" | jq_ 'String(j.jobs.find(x=>x.module==="ui").context.reuse)')" "false" "大且凉 → 不复用"
+OUT="$("$PANEL" --once --plain --keys right)"
+assert_contains "$OUT" "上下文 180k · 压缩 0 次" "详情页显示上下文与压缩次数"
+assert_contains "$OUT" "下次回复换新会话（上下文大、缓存已凉）" "详情页显示下次回复将换新会话及原因"
 rm -f "$TDIR/$SID.jsonl"
 OUT="$("$PANEL" --once --plain --keys right)"
 assert_contains "$OUT" "降级为 claude logs" "transcript 找不到时降级为 claude logs"

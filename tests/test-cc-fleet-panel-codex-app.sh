@@ -255,9 +255,10 @@ assert_near "$(J "$OUT" '(j.jobs.find(x=>x.module==="idle-mod")||{}).elapsed_sec
 assert_near "$(J "$OUT" '(j.jobs.find(x=>x.module==="idle-mod")||{}).ended_at')" "$(( NOW - 120 ))" 5 "结束时间取 rollout 最后写入时刻"
 
 # 详情页把两头摊开，免得一个数字分不清"跑了多久"和"什么时候跑的"
-DETAIL_IDX="$(J "$OUT" "j.jobs.findIndex(x=>x.module==='done-mod')")"
+# 已完成栏默认折叠，要走进已回执的 worker 得先展开；光标按可见行（rows）计
+DETAIL_IDX="$(J "$(run_panel --json --expand-done)" "j.rows.findIndex(x=>x.module==='done-mod')")"
 KEYS="$(printf 'down,%.0s' $(seq 1 "$DETAIL_IDX"))right"
-OUT="$(run_panel --once --plain --keys "$KEYS")"
+OUT="$(run_panel --once --plain --expand-done --keys "$KEYS")"
 assert_contains "$OUT" "耗时   5m" "详情页显示耗时"
 assert_contains "$OUT" "→" "详情页把开始/结束两头都摊开"
 
@@ -294,7 +295,7 @@ done)"
 # 帧序列由 --keys 无关的 ui.frame 驱动，这里直接校验字符集与"非执行中不动"
 MARK="$(run_panel --once --plain | grep -F "↳running-mod" | sed 's/^ *\(.\).*/\1/')"
 [[ "·✢✳∗✻✽" == *"$MARK"* ]] && ok || fail "执行中的标记应取自动画帧集合，实得 [$MARK]"
-MARK_DONE="$(run_panel --once --plain | grep -F "↳done-mod" | sed 's/^ *\(.\).*/\1/')"
+MARK_DONE="$(run_panel --once --plain --expand-done | grep -F "↳done-mod" | sed 's/^ *\(.\).*/\1/')"
 assert_eq "$MARK_DONE" "✓" "已完成的标记固定为 ✓，不参与动画"
 MARK_BLOCKED="$(run_panel --once --plain | grep -F "↳blocked-mod" | sed 's/^ *\(.\).*/\1/')"
 assert_eq "$MARK_BLOCKED" "⏳" "待输入的标记固定为 ⏳"
@@ -314,18 +315,58 @@ assert_eq "$(J "$OUT" 'j.view')" "list" "← 退回列表"
 OUT="$(run_panel --json --keys up,up,up,up)"
 assert_eq "$(J "$OUT" 'j.cursor')" "0" "光标不越界（上）"
 OUT="$(run_panel --json --keys down,down,down,down,down,down,down,down,down,down)"
-assert_eq "$(J "$OUT" 'j.cursor')" "$(J "$OUT" 'j.jobs.length-1')" "光标不越界（下）"
+assert_eq "$(J "$OUT" 'j.cursor')" "$(J "$OUT" 'j.rows.length-1')" "光标不越界（下）"
 # 光标要能跨任务组走到第二组
 OUT="$(run_panel --json --keys down,down,down,down,down)"
 assert_eq "$(J "$OUT" 'j.selected.rq')" "RQ-TEST-002" "光标可以跨任务组移动"
 
+# ---------------------------------------------------------------- 已完成折叠
+CASE="已完成折叠"
+# 收工的 worker 默认折成每组一行汇总：数量 + 后端拆分 + 需关注的状态各自计数，免得铺满窄分屏
+OUT="$(run_panel --once --plain)"
+assert_not_contains "$OUT" "↳done-mod"        "默认不铺开已完成 worker 行"
+assert_not_contains "$OUT" "↳failed-mod"      "需关注的已完成 worker 也一并折叠"
+assert_contains "$OUT" "▸ 已完成 3 · Codex 3" "汇总行带数量与后端拆分"
+assert_contains "$OUT" "!需核验 1"            "汇总行单独计数需核验"
+assert_contains "$OUT" "✗失败 1"              "汇总行单独计数失败"
+assert_contains "$OUT" "未完成 2 · Codex 2"   "未完成栏头带数量与后端拆分"
+assert_contains "$OUT" "↳running-mod"         "未完成的 worker 照常铺开"
+OUT="$(run_panel --json)"
+assert_eq "$(J "$OUT" 'j.groups[0].expanded')" "false" "任务组默认折叠"
+FOLD_IDX="$(J "$OUT" "j.rows.findIndex(x=>x.kind==='fold'&&x.rq==='RQ-TEST-001')")"
+assert_eq "$FOLD_IDX" "2" "汇总行紧跟在未完成 worker 之后、可被光标选中"
+assert_eq "$(J "$OUT" 'j.rows.some(x=>x.module==="done-mod")')" "false" "折叠时已完成 worker 不占可见行"
+TO_FOLD="$(printf 'down,%.0s' $(seq 1 "$FOLD_IDX"))"
+OUT="$(run_panel --json --keys "${TO_FOLD}right")"
+assert_eq "$(J "$OUT" 'j.view')" "list" "汇总行上 → 是展开而不是进详情"
+assert_eq "$(J "$OUT" 'j.groups[0].expanded')" "true" "汇总行上 → 展开该组"
+assert_eq "$(J "$OUT" 'j.groups[1].expanded')" "false" "只展开选中的那一组"
+assert_eq "$(J "$OUT" 'j.rows.some(x=>x.module==="done-mod")')" "true" "展开后已完成 worker 可被选中"
+OUT="$(run_panel --once --plain --keys "${TO_FOLD}enter")"
+assert_contains "$OUT" "▾ 已完成 3"           "展开后汇总行变 ▾"
+assert_contains "$OUT" "↳done-mod"            "展开后铺开已完成 worker"
+OUT="$(run_panel --json --keys "${TO_FOLD}space,space")"
+assert_eq "$(J "$OUT" 'j.groups[0].expanded')" "false" "空格再按一次收起"
+OUT="$(run_panel --json --keys "${TO_FOLD}right,down,space")"
+assert_eq "$(J "$OUT" 'j.groups[0].expanded')" "false" "在已完成 worker 上按空格收起所在组"
+assert_eq "$(J "$OUT" 'j.selected.kind')" "fold" "收起后光标落回该组汇总行"
+OUT="$(run_panel --json --keys all)"
+assert_eq "$(J "$OUT" 'j.groups.every(g=>!g.done||g.expanded)')" "true" "a 展开全部任务组"
+OUT="$(run_panel --json --keys all,all)"
+assert_eq "$(J "$OUT" 'j.groups.some(g=>g.expanded)')" "false" "a 再按一次全部收起"
+OUT="$(run_panel --json --expand-done --keys "$(printf 'down,%.0s' $(seq 1 "$(J "$(run_panel --json --expand-done)" "j.rows.findIndex(x=>x.module==='done-mod')")"))all")"
+assert_eq "$(J "$OUT" 'j.selected.kind+":"+j.selected.rq')" "fold:RQ-TEST-001" "a 收起时光标从已完成 worker 落回其汇总行"
+OUT="$(CC_FLEET_PANEL_EXPAND_DONE=1 run_panel --json)"
+assert_eq "$(J "$OUT" 'j.groups[0].expanded')" "true" "CC_FLEET_PANEL_EXPAND_DONE=1 默认展开"
+
 # ---------------------------------------------------------------- 详情
 CASE="详情走 rollout"
+# 按展开后的可见行定位（调用方同样带 --expand-done）
 keys_to(){
-  local idx; idx="$(J "$(run_panel --json)" "j.jobs.findIndex(x=>x.module==='$1')")"
+  local idx; idx="$(J "$(run_panel --json --expand-done)" "j.rows.findIndex(x=>x.module==='$1')")"
   node -pe '"down,".repeat(Number(process.argv[1]))+"right"' "$idx"
 }
-OUT="$(run_panel --once --plain --keys "$(keys_to running-mod)")"
+OUT="$(run_panel --once --plain --expand-done --keys "$(keys_to running-mod)")"
 # app-server 的 thread/read 只给消息级 item，命令和思考只有 rollout 里有
 assert_contains "$OUT" "pnpm test -- inventory" "详情展示执行的命令"
 assert_contains "$OUT" "42 passed"              "详情展示命令输出"
@@ -338,12 +379,12 @@ assert_contains "$OUT" "← 返回"                 "详情有返回提示"
 
 CASE="详情兜底"
 # 没有 rollout 时退回 app-server，并且要明说这是降级视图
-OUT="$(run_panel --once --plain --keys "$(keys_to idle-mod)")"
+OUT="$(run_panel --once --plain --expand-done --keys "$(keys_to idle-mod)")"
 assert_contains "$OUT" "找不到 rollout" "无 rollout 时明确告知是降级视图"
 assert_contains "$OUT" "我先跑到这里"   "降级视图仍展示 app-server 拿到的回复"
 
 CASE="详情含回执"
-OUT="$(run_panel --once --plain --keys "$(keys_to done-mod)")"
+OUT="$(run_panel --once --plain --expand-done --keys "$(keys_to done-mod)")"
 assert_contains "$OUT" "库存模块已完成" "详情摊开回执正文"
 assert_contains "$OUT" "已合回集成分支" "回执正文完整展示（不止首行）"
 
@@ -381,7 +422,7 @@ assert_contains "$OUT" "派发后会自动出现在这里" "没有 worker 时给
 
 CASE="app-server 不可达"
 BROKEN="$TMP/broken-call"; printf '#!/bin/sh\nexit 9\n' > "$BROKEN"; chmod +x "$BROKEN"
-OUT="$(HOME="$HOME_DIR" CODEX_HOME="$CODEX" CC_FLEET_PANEL_REGISTRY="$REG" CODEX_APP_CALL_BIN="$BROKEN" "$PANEL" --once --plain 2>&1)"
+OUT="$(HOME="$HOME_DIR" CODEX_HOME="$CODEX" CC_FLEET_PANEL_REGISTRY="$REG" CODEX_APP_CALL_BIN="$BROKEN" "$PANEL" --once --plain --expand-done 2>&1)"
 assert_contains "$OUT" "app-server 不可达" "读不到 thread 时明确告警"
 assert_contains "$OUT" "库存模块已完成"    "app-server 挂了也仍能显示已落回执的 worker"
 

@@ -165,6 +165,10 @@ printf '{"version":2,"rq":"RQ-panel-v2-e2e","module":"ui","attempt":"%s","result
 P="$("$PANEL" --json)"
 assert_eq "$(printf '%s' "$P" | jq_ 'j.jobs.find(x=>x.module==="ui").label')" "已回执" "落回执 → 已回执"
 assert_eq "$(printf '%s' "$P" | jq_ 'j.done')" "2" "两个 worker 都已完成"
+OUT="$("$PANEL" --once --plain)"
+assert_contains "$OUT" "2 已完成（Claude 1 · Codex 1）" "混合后端时顶部计数按 Claude / Codex 拆分"
+assert_contains "$OUT" "▸ 已完成 2 · Claude 1 · Codex 1" "折叠汇总行按后端拆数"
+assert_not_contains "$OUT" "↳ui " "已完成的 Claude worker 默认折叠"
 
 CASE="纯 Claude 任务组标题"
 INIT2="$("$FLEET" init --cwd "$R" --host claude-code --owner-id main-e2e --rq RQ-panel-v2-e2e-c)"

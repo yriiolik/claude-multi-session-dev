@@ -112,17 +112,18 @@ OUT="$(CC_FLEET_PANEL_WIDTH=40 "$PANEL" --once --no-start-app-server --no-discov
 assert_eq "$(printf '%s\n' "$OUT" | node -e "$WIDTH_CHECK" 40)" "OK" "彩色输出去 ANSI 后无超宽行"
 
 CASE="超出屏高时视窗跟随光标、标题常驻"
-FULL="$(CC_FLEET_PANEL_WIDTH=80 "$PANEL" --once --plain --no-start-app-server --no-discover)"
+# 滚动用例要的是长列表：已完成栏默认折叠，这里整段展开来测视窗
+FULL="$(CC_FLEET_PANEL_WIDTH=80 "$PANEL" --once --plain --no-start-app-server --no-discover --expand-done)"
 TOTAL=$(printf '%s\n' "$FULL" | wc -l | tr -d ' ')
 [[ $TOTAL -gt 12 ]] && ok || fail "构造的列表应超过 12 行，实得 $TOTAL"
-LAST="$(printf '%s' "$(CC_FLEET_PANEL_WIDTH=80 "$PANEL" --json --no-start-app-server --no-discover)" | jq_ 'j.jobs[j.jobs.length-1].module')"
-FIRST="$(printf '%s' "$(CC_FLEET_PANEL_WIDTH=80 "$PANEL" --json --no-start-app-server --no-discover)" | jq_ 'j.jobs[0].module')"
-OUT="$(CC_FLEET_PANEL_WIDTH=80 CC_FLEET_PANEL_HEIGHT=12 "$PANEL" --once --plain --no-start-app-server --no-discover --keys end)"
+LAST="$(printf '%s' "$(CC_FLEET_PANEL_WIDTH=80 "$PANEL" --json --no-start-app-server --no-discover --expand-done)" | jq_ 'j.jobs[j.jobs.length-1].module')"
+FIRST="$(printf '%s' "$(CC_FLEET_PANEL_WIDTH=80 "$PANEL" --json --no-start-app-server --no-discover --expand-done)" | jq_ 'j.jobs[0].module')"
+OUT="$(CC_FLEET_PANEL_WIDTH=80 CC_FLEET_PANEL_HEIGHT=12 "$PANEL" --once --plain --no-start-app-server --no-discover --expand-done --keys end)"
 assert_eq "$(printf '%s\n' "$OUT" | wc -l | tr -d ' ')" "12" "只输出屏高行数"
 assert_contains "$(printf '%s\n' "$OUT" | head -1)" "Claude Fleet · 全局" "总标题常驻首行"
 assert_contains "$OUT" "↳$LAST " "光标在末行时末行可见"
 assert_not_contains "$OUT" "↳$FIRST " "首个 worker 被滚出视窗"
-OUT="$(CC_FLEET_PANEL_WIDTH=80 CC_FLEET_PANEL_HEIGHT=12 "$PANEL" --once --plain --no-start-app-server --no-discover)"
+OUT="$(CC_FLEET_PANEL_WIDTH=80 CC_FLEET_PANEL_HEIGHT=12 "$PANEL" --once --plain --no-start-app-server --no-discover --expand-done)"
 assert_contains "$OUT" "↳$FIRST " "光标在首行时首个 worker 可见"
 assert_eq "$(printf '%s\n' "$OUT" | wc -l | tr -d ' ')" "12" "光标在首行也不超过屏高"
 

@@ -17,8 +17,11 @@
 // 组织方式：按**任务组（RQ）**分组，组标题是发起这批 worker 的主 session 名字；组内只分
 // 未完成（仍在跑：执行中 / 待输入）/ 已完成（其余一切：已回执、需核验、失败、已停止…）两栏，
 // 各 worker 的具体状态由行首标记与状态词表达（执行中的标记是动画）。
+// 已完成栏默认**折叠**成一行汇总（数量 + Claude/Codex 拆分 + 需关注状态计数），免得收工的 worker 铺满窄分屏；
+// 汇总行本身可选中，按 →/Enter/空格 展开或收起该组，a 一键展开/收起全部。
 //
-// 交互：↑↓/jk 选择 · →/l/Enter 进详情 · ←/h/Esc 返回 · r 刷新 · q 退出。
+// 交互：↑↓/jk 选择 · →/l/Enter 进详情（汇总行上=展开/收起） · 空格 展开/收起 · a 全部展开/收起 ·
+// ←/h/Esc 返回 · r 刷新 · q 退出。
 
 "use strict";
 
@@ -51,6 +54,7 @@ const opt = {
   targetRatio: Number(process.env.CC_FLEET_PANEL_RATIO) || 0,
   discover: process.env.CC_FLEET_PANEL_DISCOVER !== "0",
   includeGone: process.env.CC_FLEET_PANEL_INCLUDE_GONE === "1",
+  expandDone: process.env.CC_FLEET_PANEL_EXPAND_DONE === "1",
 };
 
 function usage() {
@@ -79,7 +83,8 @@ function usage() {
   --codex-bin PATH       指定 Codex CLI
   --no-start-app-server  只连已有 app-server
   --no-discover          只看注册表，不自动发现已知仓库里漏登记的近期任务组（CC_FLEET_PANEL_DISCOVER=0 同效）
-  --include-gone         主 session 已退出的任务组也照常展示（默认隐藏，仍有执行中 worker 的除外；CC_FLEET_PANEL_INCLUDE_GONE=1 同效）`);
+  --include-gone         主 session 已退出的任务组也照常展示（默认隐藏，仍有执行中 worker 的除外；CC_FLEET_PANEL_INCLUDE_GONE=1 同效）
+  --expand-done          已完成栏默认展开（默认折叠成一行汇总；CC_FLEET_PANEL_EXPAND_DONE=1 同效）`);
 }
 
 for (let i = 2; i < process.argv.length; i++) {
@@ -104,6 +109,7 @@ for (let i = 2; i < process.argv.length; i++) {
   else if (a === "--start-app-server") opt.startAppServer = true;
   else if (a === "--no-start-app-server") opt.startAppServer = false;
   else if (a === "--no-discover") opt.discover = false;
+  else if (a === "--expand-done") opt.expandDone = true;
   else if (a === "--include-gone") opt.includeGone = true;
   else if (a === "-h" || a === "--help") { usage(); process.exit(0); }
   else { console.error(`unknown flag: ${a}`); usage(); process.exit(5); }
@@ -675,8 +681,67 @@ function backendCounts(model) {
 
 const BACKEND_LABEL = { claude: "Claude", codex: "Codex" };
 
+// 「Claude 3 · Codex 10」：只列在场的后端，一个都没有返回空串
+function backendSplit(jobs) {
+  const n = backendCounts({ jobs });
+  return ["claude", "codex"].filter((k) => n[k]).map((k) => `${BACKEND_LABEL[k]} ${n[k]}`).join(" · ");
+}
+
+// ---------------------------------------------------------------- 可见行（折叠）
+
+// 光标走的是「可见行」而不是 worker：未完成的 worker 行 + 每组一行已完成汇总（展开时其后跟已完成 worker 行）。
+// 折叠状态 = 默认值（--expand-done）异或 ui.toggled 里点过的组；a 键重置默认值并清空单组记录。
+function isExpanded(g, ui) {
+  return ui.expandDefault !== ui.toggled.has(g.key);
+}
+
+function rowsOf(model, ui) {
+  const rows = [];
+  for (const g of model.groups) {
+    for (const job of g.jobs) if (job.cls.bucket === "pending") rows.push({ kind: "job", job, group: g });
+    if (!g.done) continue;
+    const open = isExpanded(g, ui);
+    rows.push({ kind: "fold", group: g, open });
+    if (open) for (const job of g.jobs) if (job.cls.bucket === "done") rows.push({ kind: "job", job, group: g });
+  }
+  return rows;
+}
+
+function rowKey(row) {
+  if (!row) return "";
+  return row.kind === "fold" ? `fold::${row.group.key}` : `job::${row.job.coord}::${row.job.module}`;
+}
+
+// 汇总行的需关注部分：「⊘已停止 10 · !需核验 2」，按状态分别计数、各带自己的颜色，折叠了也藏不住异常
+function attentionParts(jobs) {
+  const by = new Map();
+  for (const j of jobs) {
+    if (!j.cls.attention) continue;
+    const k = j.cls.label;
+    if (!by.has(k)) by.set(k, { cls: j.cls, n: 0 });
+    by.get(k).n += 1;
+  }
+  return [...by.values()].sort((a, b) => a.cls.rank - b.cls.rank).map((x) => ({ text: `${x.cls.mark}${x.cls.label} ${x.n}`, tone: x.cls.tone }));
+}
+
+function foldLine(row, selected, width) {
+  const done = row.group.jobs.filter((j) => j.cls.bucket === "done");
+  const head = `  ${row.open ? "▾" : "▸"} 已完成 ${done.length}`;
+  const split = backendSplit(done);
+  const att = attentionParts(done);
+  if (selected) {
+    const plain = [head, split, ...att.map((a) => a.text)].filter(Boolean).join(" · ");
+    return C.sel(padTo(truncate(plain, width), width));
+  }
+  const tail = [split && C.dim(split), ...att.map((a) => C[a.tone](a.text))].filter(Boolean);
+  return [C.dim(head), ...tail].join(C.dim(" · "));
+}
+
+const LIST_HINT = "↑↓ 选择 · → 详情/展开 · a 全部展开/收起 · r 刷新 · q 退出";
+
 function renderList(model, ui) {
   const width = ui.width;
+  const rows = rowsOf(model, ui);
   const lines = [];
   const scope = opt.rq ? `RQ ${opt.rq}` : "全局";
   const counts = backendCounts(model);
@@ -685,8 +750,10 @@ function renderList(model, ui) {
   const mix = mixed ? ` · Claude ${counts.claude} · Codex ${counts.codex}` : "";
   lines.push(`${C.bold(fleetTitle(model))} ${C.dim(`· ${scope} · ${model.groups.length} 任务组 · ${model.jobs.length} worker${mix}`)}`);
   const parts = [];
-  if (model.pending) parts.push(C.cyan(`${model.pending} 未完成`));
-  if (model.done) parts.push(C.green(`${model.done} 已完成`));
+  // 混合后端时两栏各自按后端拆数，一眼看出还在跑的是 Claude 还是 Codex
+  const by = (bucket) => (mixed ? `（${backendSplit(model.jobs.filter((j) => j.cls.bucket === bucket))}）` : "");
+  if (model.pending) parts.push(C.cyan(`${model.pending} 未完成${by("pending")}`));
+  if (model.done) parts.push(C.green(`${model.done} 已完成${by("done")}`));
   if (model.hiddenGone) parts.push(C.dim(`已隐藏 ${model.hiddenGone} 个主 session 已退出的任务组`));
   lines.push(parts.length ? parts.join(C.dim(" · ")) : C.dim("暂无 worker"));
   if (model.appUnavailable) lines.push(C.red("⚠ app-server 不可达；未落回执的线程状态读不到"));
@@ -696,7 +763,7 @@ function renderList(model, ui) {
     lines.push("");
     lines.push(C.dim("（还没有 worker；派发后会自动出现在这里）"));
     lines.push("");
-    lines.push(C.dim("↑↓ 选择 · → 进详情 · ← 返回 · r 刷新 · q 退出"));
+    lines.push(C.dim(LIST_HINT));
     return lines;
   }
 
@@ -725,14 +792,16 @@ function renderList(model, ui) {
       lines.push(C.dim(" ".repeat(Math.max(0, width - dispWidth(r))) + r));
     }
 
-    let lastBucket = "";
-    for (const job of g.jobs) {
-      if (job.cls.bucket !== lastBucket) {
-        lastBucket = job.cls.bucket;
-        lines.push(C.dim(`  ${lastBucket === "pending" ? "未完成" : "已完成"}`));
-      }
-      const selected = model.jobs[ui.cursor] === job;
+    const pendingJobs = g.jobs.filter((j) => j.cls.bucket === "pending");
+    if (pendingJobs.length) lines.push(C.dim(`  未完成 ${pendingJobs.length} · ${backendSplit(pendingJobs)}`));
+    for (const row of rows.filter((r) => r.group === g)) {
+      const selected = rows[ui.cursor] === row;
       if (selected) ui.cursorLine = lines.length;
+      if (row.kind === "fold") {
+        lines.push(foldLine(row, selected, width));
+        continue;
+      }
+      const job = row.job;
       const name = padTo(truncate(job.displayName, nameW), nameW);
       const label = padTo(job.cls.label, stateW);
       const detail = padTo(truncate(job.detail || "", detailW), detailW);
@@ -748,7 +817,7 @@ function renderList(model, ui) {
   }
 
   lines.push("");
-  lines.push(C.dim("↑↓ 选择 · → 进详情 · ← 返回 · r 刷新 · q 退出"));
+  lines.push(C.dim(LIST_HINT));
   return lines;
 }
 
@@ -769,7 +838,7 @@ function fitList(lines, ui) {
 }
 
 function renderDetail(model, ui) {
-  const job = model.jobs[ui.cursor];
+  const job = selectedJob();
   if (!job) return [C.dim("（没有选中的 worker）")];
   const g = job.group;
   const head = [
@@ -890,6 +959,8 @@ const ui = {
   frame: 0,
   cursorLine: 0,
   listOffset: 0,
+  expandDefault: opt.expandDone,
+  toggled: new Set(),
   // 非 TTY（--once / 管道）读不到列数时按 CC_FLEET_PANEL_WIDTH 排版，测试靠它模拟窄分屏
   width: process.stdout.columns || Number(process.env.CC_FLEET_PANEL_WIDTH) || 100,
   height: process.stdout.rows || Number(process.env.CC_FLEET_PANEL_HEIGHT) || 30,
@@ -918,15 +989,59 @@ function maybeAutoClose() {
   return Date.now() - allDoneSince >= opt.closeGrace * 1000;
 }
 
+const rows = () => rowsOf(model, ui);
+
 function clampCursor() {
-  if (!model.jobs.length) { ui.cursor = 0; return; }
-  ui.cursor = Math.max(0, Math.min(ui.cursor, model.jobs.length - 1));
+  const n = rows().length;
+  ui.cursor = n ? Math.max(0, Math.min(ui.cursor, n - 1)) : 0;
+}
+
+function selectedRow() {
+  return rows()[ui.cursor] || null;
+}
+
+function selectedJob() {
+  const row = selectedRow();
+  return row && row.kind === "job" ? row.job : null;
+}
+
+// 刷新 / 折叠后把光标放回原来那一行；那一行被折叠掉了就落到它所在组的汇总行
+function restoreCursor(prev) {
+  if (!prev) return clampCursor();
+  let list = rows();
+  let idx = list.findIndex((r) => rowKey(r) === rowKey(prev));
+  // 正在看详情的 worker 收工后会被折进汇总；详情页不能因此丢掉它，就地展开它所在的组
+  if (idx < 0 && prev.kind === "job" && ui.view === "detail") {
+    const g = model.groups.find((x) => x.key === prev.group.key);
+    if (g && g.jobs.some((j) => j.coord === prev.job.coord && j.module === prev.job.module) && !isExpanded(g, ui)) {
+      toggleFold(g);
+      list = rows();
+      idx = list.findIndex((r) => rowKey(r) === rowKey(prev));
+    }
+  }
+  if (idx < 0) idx = list.findIndex((r) => r.kind === "fold" && r.group.key === prev.group.key);
+  if (idx >= 0) ui.cursor = idx;
+  clampCursor();
+}
+
+function toggleFold(g) {
+  if (ui.toggled.has(g.key)) ui.toggled.delete(g.key);
+  else ui.toggled.add(g.key);
+}
+
+// a：只要还有折叠着的组就全部展开，否则全部收起
+function toggleAllFolds() {
+  const prev = selectedRow();
+  const anyClosed = model.groups.some((g) => g.done && !isExpanded(g, ui));
+  ui.expandDefault = anyClosed;
+  ui.toggled.clear();
+  restoreCursor(prev);
 }
 
 let lastDetailAt = 0;
 
 function refreshDetail(force) {
-  const job = model.jobs[ui.cursor];
+  const job = selectedJob();
   if (!job) { ui.detailLines = null; return; }
   const key = `${job.coord}::${job.module}`;
   const stale = Date.now() - lastDetailAt >= opt.detailInterval;
@@ -950,17 +1065,27 @@ function draw() {
 function applyKey(key) {
   if (key === "q") return "quit";
   if (key === "r") {
+    const prev = selectedRow();
     model = collect();
+    restoreCursor(prev);
     if (ui.view === "detail") refreshDetail(true);
     return "";
   }
   if (ui.view === "list") {
+    const row = selectedRow();
     if (key === "up") ui.cursor = Math.max(0, ui.cursor - 1);
-    else if (key === "down") ui.cursor = Math.min(Math.max(0, model.jobs.length - 1), ui.cursor + 1);
+    else if (key === "down") ui.cursor = Math.min(Math.max(0, rows().length - 1), ui.cursor + 1);
     else if (key === "home") ui.cursor = 0;
-    else if (key === "end") ui.cursor = Math.max(0, model.jobs.length - 1);
-    else if (key === "right" || key === "enter") {
-      if (model.jobs.length) {
+    else if (key === "end") ui.cursor = Math.max(0, rows().length - 1);
+    else if (key === "all") toggleAllFolds();
+    else if (key === "space" || ((key === "right" || key === "enter") && row && row.kind === "fold")) {
+      // 空格在 worker 行上收起它所在组的已完成栏（若它就在已完成栏里），在汇总行上展开/收起
+      if (row && (row.kind === "fold" || row.job.cls.bucket === "done")) {
+        toggleFold(row.group);
+        restoreCursor(row);
+      }
+    } else if (key === "right" || key === "enter") {
+      if (row) {
         ui.view = "detail";
         ui.detailOffset = 0;
         ui.follow = true;
@@ -993,6 +1118,8 @@ function decodeKey(buf) {
   if (s === "\x1b[F" || s === "G") return "end";
   if (s === "\r" || s === "\n") return "enter";
   if (s === "\x1b") return "esc";
+  if (s === " ") return "space";
+  if (s === "a") return "all";
   if (s === "q") return "q";
   if (s === "r") return "r";
   return "";
@@ -1005,7 +1132,8 @@ for (const k of opt.keys) {
 }
 
 if (opt.json) {
-  const sel = model.jobs[ui.cursor];
+  const sel = selectedJob();
+  const selRow = selectedRow();
   console.log(JSON.stringify({
     scope: opt.rq || "global",
     pending: model.pending,
@@ -1017,7 +1145,12 @@ if (opt.json) {
     backends: backendCounts(model),
     view: ui.view,
     cursor: ui.cursor,
-    selected: sel ? { module: sel.module, rq: sel.rq, bucket: sel.cls.bucket } : null,
+    selected: sel ? { kind: "job", module: sel.module, rq: sel.rq, bucket: sel.cls.bucket }
+      : selRow ? { kind: "fold", rq: selRow.group.rq, open: selRow.open } : null,
+    // 光标走的可见行：job=worker 行，fold=已完成汇总行（open=是否展开）
+    rows: rows().map((r) => (r.kind === "fold"
+      ? { kind: "fold", rq: r.group.rq, open: r.open, done: r.group.done }
+      : { kind: "job", module: r.job.module, rq: r.job.rq })),
     groups: model.groups.map((g) => ({
       rq: g.rq,
       title: g.title,
@@ -1027,6 +1160,7 @@ if (opt.json) {
       ownerGone: g.ownerGone,
       pending: g.pending,
       done: g.done,
+      expanded: isExpanded(g, ui),
       modules: g.jobs.map((j) => j.module),
     })),
     jobs: model.jobs.map((j) => ({
@@ -1101,12 +1235,9 @@ const spinTimer = opt.spin ? setInterval(() => {
 if (spinTimer && spinTimer.unref) spinTimer.unref();
 
 const listTimer = setInterval(() => {
-  const before = model.jobs[ui.cursor];
+  const before = selectedRow();
   model = collect();
-  if (before) {
-    const idx = model.jobs.findIndex((j) => j.coord === before.coord && j.module === before.module);
-    if (idx >= 0) ui.cursor = idx;
-  }
+  restoreCursor(before);
   if (ui.view === "detail") refreshDetail(false);
   draw();
   if (maybeAutoClose()) {

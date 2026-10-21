@@ -126,17 +126,20 @@ Codex worker 是 app-server 里的 thread，**永远不会出现在 `claude agen
 主 session 派的）、在当前 Ghostty 窗口右侧分屏拉起 `cc-fleet-panel-codex-app`。面板是**全局**的——
 跨 session、跨仓库派发的 worker 都汇总在同一块屏上；全部收工后面板自行退出、分屏随之关闭。
 
-面板按**任务组（RQ）**分组，组标题就是发起这批 worker 的主 session 名字，组内只分未完成（仍在跑：执行中 / 待输入）/ 已完成（其余一切，没落回执的状态词单独标出、排在栏首）：
+面板按**任务组（RQ）**分组，组标题就是发起这批 worker 的主 session 名字，组内只分未完成（仍在跑：执行中 / 待输入）/ 已完成（其余一切）。栏头带数量与 Claude / Codex 拆分；
+**已完成栏默认折叠成一行汇总**，没落回执的状态（需核验 / 失败 / 已停止…）在汇总行里各自计数，折叠了也看得见：
 
 ```
-多会话Codex虚拟OMS上线前检查清单                RQ-2026-0813-002 · qzc  1/6 完成
-  未完成
+4 未完成（Claude 2 · Codex 2） · 9 已完成（Claude 3 · Codex 6）
+多会话Codex虚拟OMS上线前检查清单                RQ-2026-0813-002 · qzc  4/6 完成
+  未完成 2 · Codex 2
    ✳ ↳outbound     执行中 $ bash scripts/run-vitest.sh src/modules/inbound/…   10m
    ⏳ ↳inbound      待输入 等待 approval / 输入                                 10m
-  已完成
-   ! ↳scan-perm    需核验 空闲但未落回执                                        22m
-   ✓ ↳scan-limits  已回执 🧾 scan-limits 完成 — 只读横向排查完毕，产出 7 项发现  10m
+  ▸ 已完成 4 · Codex 4 · !需核验 1
 ```
+
+光标停在汇总行按 `→` / `Enter` / 空格展开（变 `▾`，铺开各 worker 行），再按一次收起；`a` 一键展开 / 收起全部。
+想默认展开就 `--expand-done` 或 `CC_FLEET_PANEL_EXPAND_DONE=1`。
 
 执行中的 `✳` 是动画（和 `claude agents` 一样），detail 列显示 rollout 里最近一条活动（在跑的）或
 回执首行（已完成的）。
@@ -151,7 +154,7 @@ cc-fleet-panel-open --no-close-split     # 面板退出后保留分屏（默认�
 cc-fleet-panel-register --list           # 看注册表里有哪些协调目录
 ```
 
-面板交互：`↑↓` 选择 · `→` 进详情 · `←` 返回 · `PgUp/PgDn` 翻页 · `End` 跟随最新 · `r` 刷新 · `q` 退出。
+面板交互：`↑↓` 选择 · `→` 进详情（汇总行上=展开/收起） · 空格 展开/收起 · `a` 全部展开/收起 · `←` 返回 · `PgUp/PgDn` 翻页 · `End` 跟随最新 · `r` 刷新 · `q` 退出。
 
 面板退出（自动收工 / 按 `q` / `--close`）时**分屏会一并关掉**，不留 "Process exited. Press any key
 to close the terminal."——Ghostty 自己不收 surface，收尾由命令串尾部的 `cc-fleet-panel-close-surface`

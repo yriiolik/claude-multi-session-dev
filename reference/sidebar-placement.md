@@ -11,7 +11,9 @@
 远程 host 不误用本地服务端；记录 pending，由对应主机提供连接后再处理。
 不读写 Codex 私有 UI 状态，不创建同名分区。
 
-**桌面端显示滞后不是归类失败**（2026-10-26 核对 ChatGPT 桌面端代码）：App 的「子 session」分区按自己缓存的
+**桌面端显示滞后不是归类失败**（2026-10-26 核对 ChatGPT 桌面端代码并实测）：桌面端用 ChatGPT.app 内置的
+app-server（进程内管道，外部连不上），`cc-fleet` 连的是共享 daemon；两者共用 `~/.codex` 数据库，但桌面端只收自己
+那个 server 的推送，daemon 上的移动/归档要等 App 重启才显示（实测重启后立即并入分区）。另外 App 的「子 session」分区按自己缓存的
 `app-server-custom-section-threads` 渲染，全局关闭了窗口聚焦刷新；只在 App 启动、与 app-server 重连、
 或在 App 内拖动/置顶（主进程广播 `pinned-threads-updated`）时重拉。服务端没有分区变更通知，外部客户端调
 `thread/section/move` 后 App 不会立即看到，新 worker 会先出现在「最近」。核实以 `thread/read` 的 `section.name`

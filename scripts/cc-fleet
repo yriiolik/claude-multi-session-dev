@@ -24,6 +24,15 @@ NOT_LAUNCHED = ('prepared','queued','self','setting-up','launching','launch-unce
 MAX_REPLIES = int(os.environ.get('CC_FLEET_MAX_REPLIES', '3'))
 ACCEPT_ROLES = ('verify','integ','regression')
 SETTLED = ('done','failed','blocked','needs-review')  # 这一轮已结束、可以接收下一条消息
+# Codex goal：app-server worker 的交付标准挂成线程目标，本轮提前停下时 Codex 自动续跑，直到模型自判完成/受阻或预算耗尽。
+# 关闭：CC_FLEET_CODEX_GOAL=0 或 fleet.json codexGoal=false；预算：CC_FLEET_CODEX_GOAL_BUDGET 或 fleet.json codexGoalBudget（token，0=不限）。
+GOAL_GRACE = int(os.environ.get('CC_FLEET_GOAL_GRACE', '90'))  # 上一轮收尾后等自动续跑开轮的宽限
+GOAL_STATES = {'blocked':'blocked','usageLimited':'blocked','budgetLimited':'needs-review','paused':'needs-review','complete':'needs-review'}
+GOAL_HINTS = {'blocked':'worker 判定同一阻塞反复出现并把目标标为 blocked，先 read 看阻塞原因',
+              'usageLimited':'账号用量上限，目标暂停；额度恢复后 reply 续上',
+              'budgetLimited':'目标 token 预算耗尽，自动续跑已停；read 核对进度后 reply（会重新激活目标）',
+              'paused':'目标被暂停（多半是用户在 Codex App 里接手了这个会话），先 read 再决定',
+              'complete':'worker 自判目标完成但没有本轮回执，先 read 核实'}
 
 def run(argv, cwd=None, timeout=45, check=True, input=None, env=None):
     p = subprocess.run([str(x) for x in argv], cwd=cwd, input=input, text=True, env=env,
@@ -274,6 +283,53 @@ def claude_jobs():
     if not isinstance(obj,list): raise ValueError('unsupported Claude agents JSON schema')
     return obj
 
+def goal_enabled(c, d):
+    if d.get('backend')!='codex' or d.get('transport')!='app-server' or not d.get('sessionId'): return False
+    return os.environ.get('CC_FLEET_CODEX_GOAL','1')!='0' and meta(c).get('codexGoal',True) is not False
+
+def goal_attach(c, m, d):
+    """turn/start/steer 之后挂目标：先挂会让空闲线程自己按短目标开跑一轮，与任务卡那轮抢跑。挂不上不影响派发。"""
+    if not goal_enabled(c,d): return d
+    budget=int(os.environ.get('CC_FLEET_CODEX_GOAL_BUDGET') or meta(c).get('codexGoalBudget') or 0)
+    obj=(f"完成 fleet 任务卡 {c/(m+'.prompt.md')}（模块 {m}，attempt {d['attempt']}）及本线程后续消息：按卡开发/执行、自测，"
+         f"需要合入的 commit 用 cc-fleet-land 合入集成分支，再写好 attempt 为 {d['attempt']} 的回执 {c/(m+'.receipt.json')}"
+         f"（协调目录不可写时写临时回执 {inbox(c,d)}）。回执写好才算完成，随即把目标标为完成；"
+         '按规则判定为 blocked 时先写 result=blocked 的回执再标 blocked。')
+    try:
+        g=call('thread/goal/set',dict(threadId=d['sessionId'],objective=obj,status='active',origin='user',
+                                      **({'tokenBudget':budget} if budget>0 else {})))['goal']
+        res=dict(state='attached',attempt=d['attempt'],tokenBudget=g.get('tokenBudget'))
+    except Exception as e:
+        res=dict(state='unavailable',reason=f'{type(e).__name__}: {e}'[:200])
+    return update(c,m,goal=res)
+
+def goal_pause(c, d):
+    """停/换会话时暂停目标：active 目标会在 resume、daemon 重启后恢复续跑，被停的 worker 不能自己复活。"""
+    if goal_enabled(c,d) and (d.get('goal') or {}).get('state')=='attached':
+        with contextlib.suppress(Exception): call('thread/goal/set',dict(threadId=d['sessionId'],status='paused',origin='user'))
+
+def goal_close(c, d, r):
+    """收到本轮有效回执即关目标：worker 写完回执常不标完成，放着会再续跑一轮、整段上下文重读一遍。每个 attempt 只关一次。"""
+    g=d.get('goal') or {}
+    if not goal_enabled(c,d) or g.get('state')!='attached' or g.get('closed')==d['attempt']: return
+    with contextlib.suppress(Exception):
+        call('thread/goal/set',dict(threadId=d['sessionId'],status='complete' if r.get('result')=='done' else 'paused',origin='user'))
+        update(c,d['module'],goal=dict(g,closed=d['attempt']))
+
+def goal_status(c, d, out, turns):
+    """用目标状态细化 Codex 运行态；回执仍是唯一交付凭据，目标 complete 也只到 needs-review。"""
+    if not goal_enabled(c,d) or (d.get('goal') or {}).get('state')!='attached': return
+    with contextlib.suppress(Exception):
+        g=call('thread/goal/get',dict(threadId=d['sessionId'])).get('goal')
+        if not g: return
+        out['goal']={k:g.get(k) for k in ('status','tokensUsed','tokenBudget','timeUsedSeconds')}
+        gs=g.get('status'); last=turns[-1] if turns else {}
+        if out['state']!='needs-review': return  # 还在跑或已失败/中断，目标状态只作展示
+        if gs=='active' and last.get('status')=='completed' and time.time()-float(last.get('completedAt') or 0)<GOAL_GRACE:
+            out['state']='running'  # 上一轮刚收尾，目标会自动续跑下一轮
+        elif gs in GOAL_STATES:
+            out['state']=GOAL_STATES[gs]; out['goalHint']=GOAL_HINTS[gs]
+
 def sidebar_attach(c, d):
     """Use server-owned sections, never private desktop UI state or worker prompts."""
     if d.get('backend') != 'codex' or not d.get('sessionId'): return d
@@ -399,6 +455,7 @@ def start_session(c,m,d,prompt,profile=None,exclude=()):
             res=call('turn/start',turn); d.update(state='running',turnId=res['turn']['id'],startedAt=time.time(),activeSince=time.time())
         # Preserve a concurrently written bind/worktree update.
         d=update(c,m,**{k:v for k,v in d.items() if k not in ('module','worktree','branch')})
+        d=goal_attach(c,m,d)
         # 记录先落盘再开面板：面板第一次扫描就能看到这个 worker。
         return sidebar_attach(c,d)
     except Exception:
@@ -528,7 +585,7 @@ def status_one(c,d,jobs=None,stale_after=0):
         if x: out['context']={k:x[k] for k in ('tokens','idleFor','compactions','reuse','why')}
     try:
         r=receipt(c,d)
-        if r: out.update(state=r['result'],receipt=r); return out
+        if r: out.update(state=r['result'],receipt=r); goal_close(c,d,r); return out
         if d['state'] in NOT_LAUNCHED: return out
         if d['backend']=='claude':
             j=next((x for x in (claude_jobs() if jobs is None else jobs) if x.get('id')==d['shortId']),None)
@@ -545,6 +602,7 @@ def status_one(c,d,jobs=None,stale_after=0):
             turns=t.get('turns',[])
             if turns and turns[-1].get('status') in ('failed','interrupted'):
                 out['state']='failed' if turns[-1]['status']=='failed' else 'stopped'
+            goal_status(c,d,out,turns)
     except Exception as e:
         out.update(state='unknown',error=type(e).__name__)
     return stale_check(c,d,out,stale_after)
@@ -604,6 +662,7 @@ def rotate(c,m,d,text,why,ctx):
     """换新会话：停掉旧会话，同一 worktree、同一任务卡起新会话，靠交接文件与 worktree 现状续上。"""
     if d['backend']=='claude' and d.get('shortId'):
         with contextlib.suppress(Exception): run([claude_bin(),'stop',d['shortId']],timeout=30,check=False)
+    goal_pause(c,d)
     prev=list(d.get('previousSessions') or [])+[dict(sessionId=d.get('sessionId'),shortId=d.get('shortId'),
               transcript=(ctx or {}).get('path'),reason=why,rotatedAt=time.time())]
     hp=next((p for p in (handoff_path(c,d),handoff_path(c,d,fallback=True)) if p.exists()),None)
@@ -677,6 +736,7 @@ def send_reply(c,m,text,force=False,phase=None,manual=False,session='auto'):
                 if routing.get('providerType')=='deepseek': params.update(serviceTier=None,summary='none')
                 params.update(permission_params(d, turn=True))
                 call('turn/start',params)
+            goal_attach(c,m,d)  # 新 attempt 重新激活目标（之前可能已 complete/预算耗尽/暂停）
         # activeSince anchors staleness: an exited session accepts the reply silently, so if
         # nothing moves after this stamp, status/await surface it instead of claiming running.
         now=time.time()
@@ -752,6 +812,7 @@ def stop(a):
         for turn in reversed(t.get('turns',[])):
             if turn.get('status')=='inProgress':
                 call('turn/interrupt',dict(threadId=d['sessionId'],turnId=turn['id'])); break
+        goal_pause(c,d)
     emit(update(c,a.module,state='stopped'))
 
 def wait(a):

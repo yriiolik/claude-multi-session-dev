@@ -112,6 +112,8 @@ Codex CLI 没有 App 原生任务工具时自动走 app-server；不要把工具
    `running` 只是后端自述，会话已退出后它还会那么说（worker 末条消息没打 `result:` 时尤其如此）。
    Claude worker 的 status 已改以 job 的 `state.json` 与进程存活为准：进程没了（`process-exited`）或这一轮已停且
    无后台任务超过 60 秒（`turn-ended-without-result`）直接报 `needs-review`，await 约 1–2 分钟内唤醒你，先 `read` 核实。
+   Codex app-server worker 默认挂 goal（交付标准作线程目标），这一轮提前停下会自动续跑，status 附 goal 状态，
+   blocked/预算耗尽/被用户在 App 里暂停才唤醒你（见 v2-commands.md「Codex goal」）。
    `attention=stalled`（久无可观测活动）多半就是这种僵尸 running：**reply 会被静默吞掉**。先 `read` /
    核对 worktree HEAD 证实再 `--force`。已结束/被回收的 Claude 会话则可直接 `reply`（按下条原则复用或换新会话）。
 8. **回修交回原模块，会话「热且小」才复用**：验收/回归失败时，把失败用例和证据 `reply` 给负责该结果的模块。

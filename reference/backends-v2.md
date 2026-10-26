@@ -42,6 +42,11 @@ native 路径（Codex App 主端，App 自带侧栏）不开分屏，但同样�
 模型不可用时报告实际错误，不静默更换模型；本偏好不修改全局配置或已有 session 的 routing。
 DeepSeek 特例继续省去 priority 和 reasoning summary。threadId 在 turn/start 前落盘，避免后续 RPC 失败丢身份。
 
+**goal**：派发后给线程挂持久目标（交付标准 = 合入 + 本轮回执），worker 这一轮提前停下时 Codex 自动续跑；
+stop/换会话时暂停旧目标。2026-10-26 在 0.164.0 实测：空闲线程 `goal/set` 会自行开跑（所以必须 turn 之后挂）；
+turn 进行中挂不会多开 turn；故意停在半路的一轮之后自动开了第二轮并标 complete；超预算进入 budgetLimited 后不再续跑；
+`turn/interrupt` 后目标仍 active、显式 paused 才落定。细节见 v2-commands.md「Codex goal」。
+
 `events` 用持续连接接收 thread/status/changed、turn/completed；不会替 worker 回答审批请求。
 连接超时/丢失后 status 补读 thread/read，回执负责持久交付状态。`read` 默认 API 消息视图，必要的历史
 rollout 诊断可使用保留的旧辅助脚本；不把某个历史版本的返回条数当作永久 API 限制。

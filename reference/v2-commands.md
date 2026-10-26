@@ -181,6 +181,25 @@ stalled 只是「该去看一眼」。核实手段：`read` 看最后回复/日�
 证明 worker 存在，`done` 的会话按 `needs-review` 报，不再硬写 running。
 
 `stop` 中断 worker，保留会话和 worktree；不会删除分支或成果。没有运行 turn 的 Codex 任务只登记 stopped。
+Codex worker 挂着目标时 `stop` 同时把目标置为 paused（active 目标会在 resume/daemon 重启后自己续跑）。
+
+## Codex goal：提前停下自动续跑（app-server worker 默认开启）
+
+Codex 0.164 起线程可挂持久目标（`thread/goal/*`，stable 特性 `goals`）：目标 active 时这一轮停下会自动开下一轮，
+直到模型用 `update_goal` 标 complete/blocked、预算耗尽或被暂停。`dispatch` / 换新会话在 **turn/start 下发完整任务卡之后**
+挂目标（先挂会让空闲线程按短目标自己开跑一轮、与任务卡抢跑），目标 = 本轮 attempt 的交付标准（合入 + 写好回执），
+`reply` 在 steer/turn/start 后以新 attempt 重新激活。名册 `goal.state=attached|unavailable`，挂不上不影响派发。
+
+`status` 对挂了目标的 Codex worker 附 `goal{status,tokensUsed,tokenBudget,timeUsedSeconds}`，并只在线程已空闲时细化状态：
+上一轮完成不到 `CC_FLEET_GOAL_GRACE`（默认 90 秒）且目标 active → running（续跑间隙，不误唤醒）；blocked/usageLimited → blocked；
+budgetLimited/paused/complete → needs-review，附 `goalHint`。paused 多半是用户在 Codex App 里接手了这个会话。
+**回执仍是唯一交付凭据**：目标 complete 而没有本轮回执只到 needs-review。反过来，`status` 收到本轮有效回执时主动关目标
+（done→complete，其余→paused，每个 attempt 一次）：实测 worker 写完回执常不标完成，放着会再续跑一轮、整段上下文重读一遍。
+
+- 关闭：`CC_FLEET_CODEX_GOAL=0` 或 `fleet.json` 的 `"codexGoal": false`。
+- 预算：`CC_FLEET_CODEX_GOAL_BUDGET` 或 `fleet.json` 的 `codexGoalBudget`（token，默认不限）。单轮基础开销约 2 万 token，
+  预算按整张卡给足，耗尽后当前轮收尾即停（budgetLimited），`reply` 重新激活。
+- native 路径（Codex App 主端原生任务）与 Claude worker 不挂目标。
 
 ## 兼容配置
 

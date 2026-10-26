@@ -33,6 +33,11 @@ elif method=='turn/start':
  t=db['threads'][params['threadId']];u=dict(id='turn-'+str(len(t['turns'])+1),status='inProgress');t['turns'].append(u);t['status']={'type':'active'};result={'turn':u}
 elif method=='turn/interrupt':
  t=db['threads'][params['threadId']];t['turns'][-1]['status']='interrupted';t['status']={'type':'idle'};result={}
+elif method=='thread/goal/set':
+ if os.environ.get('FAKE_FAIL_GOAL'): save();sys.exit(10)
+ g=db.setdefault('goals',{}).setdefault(params['threadId'],dict(threadId=params['threadId'],tokensUsed=0,timeUsedSeconds=0))
+ g.update({k:v for k,v in params.items() if k in ('objective','status','tokenBudget')});result={'goal':g}
+elif method=='thread/goal/get': result={'goal':db.get('goals',{}).get(params['threadId'])}
 else: result={}
 save();print(json.dumps(result))
 '''
@@ -67,6 +72,8 @@ class FleetTests(unittest.TestCase):
   d=self.cli('prepare','--coord',c,'--module',module,'--backend',backend,'--task',self.task,'--role',role,*(['--permissions','inherit'] if host=='codex-app' and backend=='codex' else []))
   return c,d,f
  def db(self):return json.loads((self.root/'db.json').read_text())
+ def last_turn_call(self):return [x for x in self.db()['calls'] if x[0] in ('turn/start','turn/steer')][-1]
+ def set_db(self,db):(self.root/'db.json').write_text(json.dumps(db))
  def receipt(self,c,d,**kw):
   r=dict(version=2,rq=json.loads((c/'fleet.json').read_text())['rq'],module=d['module'],attempt=d['attempt'],result='done',summary='finished',tests=[dict(command='check',result='passed',evidence='passed')],commit='')
   if d['role'] in ('verify','integ'):r['commit']=self.git('rev-parse','HEAD',cwd=d['worktree'])
@@ -195,9 +202,10 @@ class FleetTests(unittest.TestCase):
   text=self.root/'reply.txt';text.write_text('Please check the second case.')
   out=self.cli('reply','--coord',c,'--module','api','--text-file',text)
   self.assertNotEqual(out['attempt'],d['attempt']);self.assertFalse((c/'api.receipt.json').exists())
-  self.assertEqual(self.db()['calls'][-1][0],'turn/steer')
+  # 回话之后紧跟一次 thread/goal/set（新 attempt 重新激活目标），所以按「最后一次 turn 调用」定位。
+  self.assertEqual(self.last_turn_call()[0],'turn/steer');self.assertEqual(self.db()['calls'][-1][0],'thread/goal/set')
   self.cli('stop','--coord',c,'--module','api');self.assertTrue(pathlib.Path(d['worktree']).exists())
-  self.cli('reply','--coord',c,'--module','api','--text-file',text);self.assertEqual(self.db()['calls'][-1][0],'turn/start')
+  self.cli('reply','--coord',c,'--module','api','--text-file',text);self.assertEqual(self.last_turn_call()[0],'turn/start')
  def test_claude_public_lifecycle(self):
   c,d,_=self.setup_worker(backend='claude');out=self.cli('dispatch','--coord',c,'--module','api')
   self.assertEqual(out['shortId'],'00000001');self.cli('reconcile','--coord',c,'--module','api')
@@ -233,7 +241,7 @@ class FleetTests(unittest.TestCase):
   self.assertEqual(start['model'],'gpt-6-astra');self.assertEqual(start['modelProvider'],'openai');self.assertEqual(turn['effort'],'low')
   self.cli('stop','--coord',c,'--module','api');t=self.root/'reply';t.write_text('Continue.')
   self.cli('reply','--coord',c,'--module','api','--text-file',t)
-  self.assertEqual(self.db()['calls'][-1][1]['effort'],'low')
+  self.assertEqual(self.last_turn_call()[1]['effort'],'low')
  def test_full_permissions_dispatch_and_resume(self):
   c,d,_=self.setup_worker();self.cli('dispatch','--coord',c,'--module','api')
   self.cli('stop','--coord',c,'--module','api');p=self.root/'continue';p.write_text('Continue.')
@@ -682,5 +690,64 @@ class FleetTests(unittest.TestCase):
   self.assertIn(self.OWNER,(c/'owner.meta').read_text(),'自动派发不得以 watchdog 身份改写主端归属')
   self.job(v['shortId'],state='done',tempo='idle')
   r=self.rescue(env,c)[0];self.assertEqual((r.get('action'),r.get('modules')),('woke',['verify']),r)
+
+ # ── Codex goal：交付标准挂成线程目标，提前停下自动续跑 ──
+ def goal_worker(self,env=None):
+  c,d,_=self.setup_worker(role='scout');self.cli('dispatch','--coord',c,'--module','api',env=env);return c,d
+ def test_goal_attached_after_task_turn_with_attempt_and_receipt(self):
+  c,d=self.goal_worker();calls=[x[0] for x in self.db()['calls']]
+  self.assertLess(calls.index('turn/start'),calls.index('thread/goal/set'))  # 先挂会让空闲线程按短目标抢跑
+  g=next(p for m,p in self.db()['calls'] if m=='thread/goal/set')
+  self.assertEqual(g['status'],'active');self.assertNotIn('tokenBudget',g)
+  for frag in (d['attempt'],str(c/'api.prompt.md'),str(c/'api.receipt.json')):self.assertIn(frag,g['objective'])
+  rec=json.loads((c/'v2'/'api.json').read_text());self.assertEqual(rec['goal']['state'],'attached');self.assertEqual(rec['goal']['attempt'],d['attempt'])
+ def test_goal_reactivated_with_new_attempt_on_reply(self):
+  c,d=self.goal_worker();db=self.db();t=next(iter(db['threads'].values()));t['status']={'type':'idle'};t['turns'][-1].update(status='completed',completedAt=0)
+  db['goals'][t['id']]['status']='complete';self.set_db(db)
+  text=self.root/'reply.txt';text.write_text('Fix the failing case.');out=self.cli('reply','--coord',c,'--module','api','--text-file',text)
+  last=self.db()['calls'][-1];self.assertEqual(last[0],'thread/goal/set');self.assertEqual(last[1]['status'],'active')
+  self.assertIn(out['attempt'],last[1]['objective']);self.assertNotIn(d['attempt'],last[1]['objective'])
+ def test_goal_status_refines_idle_codex_worker(self):
+  c,d=self.goal_worker();db=self.db();t=next(iter(db['threads'].values()));tid=t['id']
+  t['status']={'type':'idle'};t['turns'][-1].update(status='completed',completedAt=time.time());self.set_db(db)
+  row=self.cli('status','--coord',c)['jobs'][0];self.assertEqual(row['state'],'running');self.assertEqual(row['goal']['status'],'active')
+  db=self.db();db['threads'][tid]['turns'][-1]['completedAt']=time.time()-3600;self.set_db(db)
+  self.assertEqual(self.cli('status','--coord',c)['jobs'][0]['state'],'needs-review')  # 宽限过了还没续跑
+  for gs,want in (('blocked','blocked'),('usageLimited','blocked'),('budgetLimited','needs-review'),('paused','needs-review'),('complete','needs-review')):
+   db=self.db();db['goals'][tid]['status']=gs;self.set_db(db)
+   row=self.cli('status','--coord',c)['jobs'][0];self.assertEqual(row['state'],want,gs);self.assertTrue(row['goalHint'],gs)
+  self.receipt(c,d);self.assertEqual(self.cli('status','--coord',c)['jobs'][0]['state'],'done')  # 回执仍是唯一交付凭据
+ def test_receipt_closes_goal_once_per_attempt(self):
+  c,d=self.goal_worker();self.receipt(c,d);self.assertEqual(self.cli('status','--coord',c)['jobs'][0]['state'],'done')
+  goal_sets=lambda:[p for m,p in self.db()['calls'] if m=='thread/goal/set']
+  self.assertEqual(goal_sets()[-1]['status'],'complete');n=len(goal_sets())
+  self.cli('status','--coord',c);self.assertEqual(len(goal_sets()),n)  # 同一 attempt 不重复关
+  text=self.root/'reply.txt';text.write_text('Recheck.');out=self.cli('reply','--coord',c,'--module','api','--text-file',text)
+  self.assertEqual(goal_sets()[-1]['status'],'active')  # 新 attempt 重新激活
+  self.receipt(c,dict(d,attempt=out['attempt']),result='blocked',summary='needs creds');self.cli('status','--coord',c)
+  self.assertEqual(goal_sets()[-1]['status'],'paused')
+ def test_goal_does_not_override_active_or_failed_turn(self):
+  c,d=self.goal_worker();db=self.db();tid=next(iter(db['threads']));db['goals'][tid]['status']='blocked';self.set_db(db)
+  self.assertEqual(self.cli('status','--coord',c)['jobs'][0]['state'],'running')
+  db=self.db();db['threads'][tid]['status']={'type':'idle'};db['threads'][tid]['turns'][-1]['status']='failed';self.set_db(db)
+  self.assertEqual(self.cli('status','--coord',c)['jobs'][0]['state'],'failed')
+ def test_stop_pauses_goal(self):
+  c,d=self.goal_worker();self.cli('stop','--coord',c,'--module','api')
+  calls=self.db()['calls'];self.assertEqual(calls[-2][0],'turn/interrupt')
+  self.assertEqual(calls[-1],['thread/goal/set',dict(threadId=calls[-1][1]['threadId'],status='paused',origin='user')])
+ def test_goal_switches_and_budget(self):
+  self.goal_worker(env=dict(self.env,CC_FLEET_CODEX_GOAL='0'))
+  self.assertFalse(any(x[0].startswith('thread/goal') for x in self.db()['calls']))
+  c,d,_=self.setup_worker(role='scout',module='web');fj=c/'fleet.json';f=json.loads(fj.read_text());f['codexGoal']=False;fj.write_text(json.dumps(f))
+  self.cli('dispatch','--coord',c,'--module','web');self.assertFalse(any(x[0].startswith('thread/goal') for x in self.db()['calls']))
+  c,d,_=self.setup_worker(role='scout',module='job');self.cli('dispatch','--coord',c,'--module','job',env=dict(self.env,CC_FLEET_CODEX_GOAL_BUDGET='3000000'))
+  self.assertEqual(next(p for m,p in self.db()['calls'] if m=='thread/goal/set')['tokenBudget'],3000000)
+ def test_goal_failure_never_breaks_dispatch(self):
+  c,d=self.goal_worker(env=dict(self.env,FAKE_FAIL_GOAL='1'))
+  rec=json.loads((c/'v2'/'api.json').read_text());self.assertEqual(rec['state'],'running');self.assertEqual(rec['goal']['state'],'unavailable')
+  self.cli('stop','--coord',c,'--module','api',env=dict(self.env,FAKE_FAIL_GOAL='1'))
+  self.assertNotEqual(self.db()['calls'][-1][0],'thread/goal/set')  # 没挂上就不去暂停
+  self.assertNotIn('goal',self.cli('status','--coord',c)['jobs'][0])
+
 
 if __name__=='__main__':unittest.main(verbosity=2)

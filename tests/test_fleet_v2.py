@@ -49,7 +49,8 @@ class FleetTests(unittest.TestCase):
   # CC_FLEET_PANEL=0：测试绝不去动真实 Ghostty；init/dispatch 总会登记面板注册表，一律指到临时文件。
   # 面板路径由 test_app_server_dispatch_opens_ghostty_panel 用假脚本单独测。
   self.env=dict(os.environ,FAKE_DB=str(self.root/'db.json'),CLAUDE_FLEET_CONFIG=str(self.root/'missing.json'),CODEX_MULTI_SESSION_CONFIG=str(self.root/'absent-route.json'),CC_FLEET_PANEL='0',
-                CC_FLEET_PANEL_REGISTRY=str(self.root/'coords.json'),CLAUDE_JOBS_DIR=str(self.root/'jobs'),CLAUDE_CODE_SESSION_ID='main-123')
+                CC_FLEET_PANEL_REGISTRY=str(self.root/'coords.json'),CLAUDE_JOBS_DIR=str(self.root/'jobs'),CLAUDE_CODE_SESSION_ID='main-123',
+                CC_FLEET_CODEX_ENSURE='0')  # 不许碰真实 Codex daemon；版本对齐用例自带假 ensure
   for n in ('claude','app-call'):
    p=self.root/n;p.write_text(FAKE);p.chmod(0o755)
   self.env.update(CLAUDE_CLI_PATH=str(self.root/'claude'),CODEX_APP_CALL_BIN=str(self.root/'app-call'))
@@ -748,6 +749,42 @@ class FleetTests(unittest.TestCase):
   self.cli('stop','--coord',c,'--module','api',env=dict(self.env,FAKE_FAIL_GOAL='1'))
   self.assertNotEqual(self.db()['calls'][-1][0],'thread/goal/set')  # 没挂上就不去暂停
   self.assertNotIn('goal',self.cli('status','--coord',c)['jobs'][0])
+
+ # ── 派 Codex 前对齐 app-server 版本，并带回「Codex App 是另一个 server」 ──
+ def fake_ensure(self,body):
+  p=self.root/'ensure';log=self.root/'ensure.log'
+  p.write_text('#!/bin/sh\necho "$*" >> "%s"\n%s\n'%(log,body));p.chmod(0o755)
+  return dict(self.env,CC_FLEET_CODEX_ENSURE='1',CC_CODEX_ENSURE_BIN=str(p)),log
+ def test_codex_dispatch_aligns_server_once_and_records_versions(self):
+  out=json.dumps(dict(ok=True,actions=['app-server daemon 0.146.1 落后于本机 0.164.0，已重启对齐'],warnings=[],
+                      servers=dict(daemon=dict(version='0.164.0'),installed=dict(version='0.164.0'),app=dict(version='0.164.0-alpha.11.1',running=True),appNote='Codex App 用自带的 app-server')))
+  env,log=self.fake_ensure("echo '%s'"%out)
+  c,d,_=self.setup_worker(role='scout');self.cli('dispatch','--coord',c,'--module','api',env=env)
+  self.assertEqual(log.read_text().split(),['--skip-routing','--json','--allow-restart','--start-app'])
+  srv=json.loads((c/'v2'/'api.json').read_text())['codexServer']
+  self.assertEqual((srv['daemon'],srv['app']),('0.164.0','0.164.0-alpha.11.1'));self.assertIn('自带',srv['appNote']);self.assertIn('已重启',srv['actions'][0])
+  self.assertNotIn('warnings',srv)
+ def test_codex_dispatch_survives_broken_ensure(self):
+  env,_=self.fake_ensure('echo garbage; exit 9')
+  c,d,_=self.setup_worker(role='scout');self.cli('dispatch','--coord',c,'--module','api',env=env)
+  rec=json.loads((c/'v2'/'api.json').read_text());self.assertEqual(rec['state'],'running');self.assertIn('不可解析',rec['codexServer']['warnings'][0])
+ def test_claude_dispatch_skips_codex_ensure(self):
+  env,log=self.fake_ensure("echo '{}'")
+  c,d,_=self.setup_worker(backend='claude');self.cli('dispatch','--coord',c,'--module','api',env=env)
+  self.assertFalse(log.exists())
+ def test_long_lived_process_rechecks_server_after_ttl(self):
+  # await/advance 一个进程里连派多张排队卡：TTL 内只查一次；TTL=0（模拟过期）每张都查，Codex 自动更新后能及时切到新版
+  for ttl,want in (('600',1),('0',2)):
+   env,log=self.fake_ensure("echo '{\"ok\":true}'");env['CC_FLEET_SERVER_TTL']=ttl
+   c,d,_=self.setup_worker(role='scout',module='a'+ttl);self.cli('dispatch','--coord',c,'--module','a'+ttl,env=env);self.receipt(c,d)
+   for m in ('b','c'):self.cli('prepare','--coord',c,'--module',m+ttl,'--backend','codex','--task',self.task,'--role','scout','--after','a'+ttl)
+   log.unlink();self.cli('advance','--coord',c,env=env)
+   self.assertEqual(len(log.read_text().splitlines()),want,ttl)
+ def test_server_command_is_read_only(self):
+  env,log=self.fake_ensure("""echo '{"ok":true,"servers":{"daemon":{"version":"0.146.1"},"installed":{"version":"0.164.0"},"stale":true},"warnings":["daemon 仍是旧版 0.146.1"]}'""")
+  r=subprocess.run([str(FLEET),'server'],env=env,text=True,capture_output=True);self.assertEqual(r.returncode,0,r.stderr)
+  out=json.loads(r.stdout);self.assertEqual(out['daemon'],'0.146.1');self.assertIn('旧版',out['warnings'][0])
+  self.assertNotIn('--allow-restart',log.read_text())
 
 
 if __name__=='__main__':unittest.main(verbosity=2)

@@ -36,6 +36,18 @@ Codex worker 状态读 thread/read、明细读 rollout。面板读 `v2/<module>.
 只提示不报错，绝不因面板让派发失败。`CC_FLEET_PANEL=0` 只关分屏不关登记（`init` 即登记，并行的多个任务组、任何后端都进同一块面板）。
 native 路径（Codex App 主端，App 自带侧栏）不开分屏，但同样登记。
 
+**两个 app-server，版本自动对齐**：Codex App（ChatGPT.app）用内置 codex 起**自己的** app-server（进程内管道，外部连不上；
+桌面端的 `CODEX_APP_SERVER_USE_LOCAL_DAEMON` 开关在 2026-10 版本里对主连接不生效），fleet 走 `~/.codex` 下的共享 daemon。
+两边同库不同进程：App 收不到 daemon 的推送，worker 归入「子 session」、归档等要重启 App 才显示。
+**技能不负责更新 Codex，只负责跟上**：Codex 自己自动更新（切换 `~/.codex/packages/standalone/current`，`~/.local/bin/codex`
+是指向它的软链）后，正在跑的 daemon 仍是旧版——历史上 fleet 因此长期连着老版本 server。所以 `cc-fleet` 派 Codex worker 前跑
+`cc-codex-ensure --skip-routing --allow-restart --start-app`（结果缓存 `CC_FLEET_SERVER_TTL`，默认 600 秒，
+await/advance 这类长驻进程过期后重查）：daemon 核心版本低于本机当前安装 → daemon 上没有进行中的 turn 时自动重启到新版，有就告警、
+下次派发再试；App 内置 codex 比本机安装还新 → 告警，等本机自动更新后再对齐；Codex App 没在运行（被关掉）→ `open -g` 后台启动它
+（`CC_CODEX_APP_AUTOSTART=0` 关）。首次接管（无指纹记录或旧格式指纹）只记录不重启，配置漂移重启同样先查进行中的 turn；配置指纹按内容计算并剔除 Codex 自己追加的
+`[projects."<目录>"]` 信任记录（每个新 worktree 都会追加一段，按 mtime 判断会让每次派发都误重启 daemon）。结果写进名册
+`codexServer`（daemon/installed/app 版本、actions、warnings、appNote）；`cc-fleet server` 只读查看。ensure 失败不阻断派发。
+
 传输复用 `cc-codex-app-call`，它通过官方 `codex app-server proxy` 使用 WebSocket handshake。
 权限默认开放：Codex 的 thread/start、thread/resume 使用 `approvalPolicy=never` 和 `sandbox=danger-full-access`，turn/start 使用 `approvalPolicy=never` 和 `sandboxPolicy={"type":"dangerFullAccess"}`。`--permissions inherit` 不传权限覆盖。Claude Code 主端显式派的 Codex worker 使用用户指定的 `gpt-6-astra` / `low` / `openai`；
 其他主端沿用原有 session route 的 model/modelProvider/effort。不会把 GPT-6 发到 DeepSeek provider。

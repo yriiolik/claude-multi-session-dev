@@ -14,6 +14,9 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # 兜底：任何测试都不该去动真实 Ghostty / 真实 ~/.claude/fleet。
 # 需要走面板路径的测试（test-panel-codex-e2e.sh）会自己带假 osascript 再打开。
 export CC_FLEET_PANEL=0
+# 同理不许碰真实 Codex daemon：cc-fleet 派 Codex 前的版本对齐（可能重启 daemon）一律关掉，
+# 需要测它的用例自带假 cc-codex-ensure 再打开。
+export CC_FLEET_CODEX_ENSURE=0
 # RQ 序号池/注册表是跨仓库全局的（~/.claude/fleet）。整轮测试共用一个临时池并在结束时删除，
 # 免得测试分配的编号抬高真实全局高水位。子测试脚本会沿用这里导出的值。
 export CC_FLEET_HOME_TEST_OVERRIDE="$(mktemp -d)"

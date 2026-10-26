@@ -94,6 +94,31 @@ def call(method, params, start=False, timeout=35):
     argv+=['--timeout-ms', str(max(1000, (timeout-2)*1000)), method, '-']
     return json.loads(run(argv, input=json.dumps(params), timeout=timeout).stdout)
 
+_SERVER=None; _SERVER_AT=0.0
+SERVER_TTL = int(os.environ.get('CC_FLEET_SERVER_TTL', '600'))  # await 一挂几小时，期间 Codex 可能已自动更新
+def codex_server(restart=True):
+    """派 Codex worker 前让 daemon 跟上本机已安装的 Codex（Codex 自动更新后 daemon 仍是旧版 → 无进行中 turn 时重启），
+    App 没开就后台启动，并带回两边版本与「Codex App 是另一个 app-server」的事实。结果缓存 SERVER_TTL 秒；
+    失败不阻断派发（thread/start 会给出真实错误）。"""
+    global _SERVER, _SERVER_AT
+    if _SERVER is not None and restart and time.time()-_SERVER_AT<SERVER_TTL: return _SERVER
+    if os.environ.get('CC_FLEET_CODEX_ENSURE','1')=='0': _SERVER={}; _SERVER_AT=time.time(); return _SERVER
+    argv=[os.environ.get('CC_CODEX_ENSURE_BIN',str(ROOT/'cc-codex-ensure')),'--skip-routing','--json']+(['--allow-restart','--start-app'] if restart else [])
+    p=run(argv,timeout=150,check=False)
+    try: j=json.loads(p.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError): j={'warnings':[f'cc-codex-ensure 输出不可解析（rc={p.returncode}）']}
+    sv=j.get('servers') or {}
+    out=dict(daemon=(sv.get('daemon') or {}).get('version'),installed=(sv.get('installed') or {}).get('version'),
+             app=(sv.get('app') or {}).get('version'),actions=j.get('actions'),warnings=j.get('warnings'),appNote=sv.get('appNote'))
+    if not j.get('ok',False) and j.get('error'): out['error']=j['error']
+    out={k:v for k,v in out.items() if v}
+    if restart: _SERVER=out; _SERVER_AT=time.time()
+    return out
+
+def server(a):
+    """只读查看：fleet 用的 daemon、本机安装、Codex App 内置 codex 的版本与告警（不重启）。"""
+    emit(codex_server(restart=False))
+
 def permission_params(d, turn=False):
     # Explicit user preference for fleet workers; legacy records adopt the new default.
     if d.get('permissions', 'full') == 'inherit': return {}
@@ -436,6 +461,7 @@ def start_session(c,m,d,prompt,profile=None,exclude=()):
             j=hits[0]; d.update(shortId=j['id'],sessionId=j.get('sessionId'),state='running',activeSince=time.time())
         else:
             routing=route(meta(c)); d['routing']=routing
+            d['codexServer']=codex_server()
             # Apply fleet permission preference explicitly at thread and turn boundaries.
             # Codex 只加载 git 根到 cwd 路径上的 AGENTS.md，cwd 必须是子项目目录。
             params=dict(cwd=workdir(d),ephemeral=False,serviceName='multi-session-dev-v2',threadSource='user')
@@ -1158,6 +1184,7 @@ def parser():
     p=argparse.ArgumentParser(description=__doc__); s=p.add_subparsers(dest='cmd',required=True)
     q=s.add_parser('init'); q.add_argument('--cwd',required=True); q.add_argument('--host',choices=HOSTS,required=True)
     q.add_argument('--owner-id'); q.add_argument('--base'); q.add_argument('--rq'); q.set_defaults(fn=init)
+    s.add_parser('server',help='查看 fleet 的 Codex daemon / 本机安装 / Codex App 内置 codex 版本与告警（只读）').set_defaults(fn=server)
     s.add_parser('stop-guard',help='Claude Code Stop hook: block ending a turn while workers run unawaited').set_defaults(fn=stop_guard)
     q=s.add_parser('rescue-owners',help='watchdog 周期调用：worker 已结束而主 session 没挂 await（被回收/重启）时复活并唤醒主 session')
     q.add_argument('--coord',action='append',help='只查这些协调目录（可重复）；默认扫描注册表')

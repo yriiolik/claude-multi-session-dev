@@ -204,6 +204,9 @@ budgetLimited/paused/complete → needs-review，附 `goalHint`。paused 多半�
 ## 兼容配置
 
 - `CODEX_CLI_PATH`：Codex 二进制绝对路径；app-server 使用已有官方 proxy 传输辅助脚本。
+- `"$FLEET" server`：只读查看 fleet 用的 daemon、本机安装、Codex App 内置 codex 三者版本与告警。派 Codex worker 前的
+  对齐（Codex 自动更新后 daemon 落后且无进行中 turn → 重启到新版；App 被关 → 后台启动）可用 `CC_FLEET_CODEX_ENSURE=0` 整体关闭，
+  `CC_CODEX_APP_AUTOSTART=0` 只关 App 启动，`CC_FLEET_SERVER_TTL`（默认 600 秒）控制长驻进程多久重查；详见 backends-v2.md「两个 app-server」。
 - `CODEX_MULTI_SESSION_CONFIG` / `CODEX_HOME`：沿用 Codex 原有路由机制。
 - `CLAUDE_CLI_PATH`：Claude 二进制；`CLAUDE_FLEET_CONFIG`：默认 `~/.claude/multi-session-dev.json`，
   派发使用其中 `worker.model/effort`；`regression` 卡缺省用 `runner`（存在时），也可 `prepare/dispatch --profile spike`。

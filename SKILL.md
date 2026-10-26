@@ -36,7 +36,8 @@ solo 模式（见「执行模式」）由主 session 自己在 `--self` worktree
 （2026-09-11 用户纠正：v2 曾把 Claude 主端未指定时默认成 Codex，属误改，不要恢复。）
 Claude Code 主端**明确要求** Codex worker 时，脚本固定使用 `gpt-6-astra` / `low` / provider `openai`，
 后续 reply 沿用登记的 routing；不要改 Claude 主 session 自己的模型，也不要将 GPT-6 名称传给 Claude 后端。
-Codex CLI 没有 App 原生任务工具时自动走 app-server；不要把工具名称当作所有客户端都提供的能力。
+fleet 的 Codex worker 跑在共享 daemon 上，与 Codex App 自带的 app-server 不是同一个进程：Codex 自动更新后派发前自动把 daemon 切到新版、App 被关会后台启动，
+App 侧的分区/归档显示要重启 App（`cc-fleet server` 查看两边版本）。Codex CLI 没有 App 原生任务工具时自动走 app-server；不要把工具名称当作所有客户端都提供的能力。
 使用前读取 [v2-commands.md](reference/v2-commands.md)。Codex App 原生路径另读
 [native-codex.md](reference/native-codex.md)，跨客户端路径读 [backends-v2.md](reference/backends-v2.md)。
 技能脚本相对于本 SKILL.md 的 `scripts/` 定位，不能假设已加入 PATH。

@@ -123,11 +123,27 @@ function fileStamp(file) {
   }
 }
 
+// config.toml 按内容取指纹，剔除 Codex 运行时自己追加的 `[projects."<目录>"]` 信任记录：
+// 每个新 worktree 都会追加一段，按 mtime/大小判断会让 fleet 每派一张卡就误判「配置已变更」而重启 daemon（2026-10-26 实测）。
+function configContentStamp(file) {
+  let text;
+  try { text = fs.readFileSync(file, "utf8"); } catch { return `${path.basename(file)}:absent`; }
+  const kept = [];
+  let skipping = false;
+  for (const line of text.split(/\r?\n/)) {
+    const header = line.match(/^\s*\[\[?\s*([^\]]+?)\s*\]\]?\s*(#.*)?$/);
+    if (header) skipping = /^projects\./.test(header[1]);
+    if (!skipping) kept.push(line);
+  }
+  const digest = require("crypto").createHash("sha256").update(kept.join("\n")).digest("hex").slice(0, 16);
+  return `${path.basename(file)}#${digest}`;
+}
+
 // 指纹只覆盖 **app-server 进程启动时读取** 的文件：config.toml（provider 定义 / base_url /
 // 认证）与模型目录 json。逐 session 的 model/provider 选择是 thread/start 参数，改了不用重启，
 // 因此 multi-session-dev.json 故意不进指纹。
 function configFingerprint(config, catalogPath) {
-  const parts = [fileStamp(config.path)];
+  const parts = [configContentStamp(config.path)];
   if (catalogPath) parts.push(fileStamp(catalogPath));
   return parts.join("|");
 }
@@ -163,7 +179,83 @@ function freshStderr(paths, sinceMs, maxLines = 8) {
   }
 }
 
+// ---- 版本对齐：daemon 与本机 Codex 安装、Codex App 内置 codex ----
+// 桌面端（ChatGPT.app / Codex.app）用内置 codex 起**自己的** app-server（进程内管道，外部连不上），
+// fleet 走共享 daemon。两边同库不同进程：版本可能不一致，桌面端也收不到 daemon 上的推送。
+const APP_BUNDLED_CODEX = [
+  "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+  "/Applications/Codex.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+];
+
+function coreVersion(v) {
+  const m = String(v || "").match(/(\d+)\.(\d+)\.(\d+)/);
+  return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
+}
+
+// a<b → -1；只比核心版本号，0.164.0-alpha.11.1 与 0.164.0 视为同版。任一不可解析 → 0（不判）。
+function compareCore(a, b) {
+  const x = coreVersion(a), y = coreVersion(b);
+  if (!x || !y) return 0;
+  for (let i = 0; i < 3; i++) if (x[i] !== y[i]) return x[i] < y[i] ? -1 : 1;
+  return 0;
+}
+
+function cliVersion(bin, timeoutMs = 5000) {
+  if (!bin) return "";
+  const rc = spawnSync(bin, ["--version"], { encoding: "utf8", timeout: timeoutMs });
+  const m = `${rc.stdout || ""} ${rc.stderr || ""}`.match(/codex-cli\s+(\S+)/);
+  return m ? m[1] : "";
+}
+
+// 正在运行的 daemon 是哪个版本、由哪个二进制托管（`app-server daemon version` 的公开 JSON）。
+function daemonInfo(bin, timeoutMs = 8000) {
+  const rc = spawnSync(bin, ["app-server", "daemon", "version"], { encoding: "utf8", timeout: timeoutMs });
+  try {
+    const j = JSON.parse(String(rc.stdout || "").trim().split("\n").pop());
+    return { status: j.status || "", version: j.appServerVersion || "", managedPath: j.managedCodexPath || "",
+             managedVersion: j.managedCodexVersion || "" };
+  } catch { return null; }
+}
+
+// 测试可用 CC_CODEX_APP_BUNDLED_BIN 指定（none = 没装 App）、CC_CODEX_APP_RUNNING=0/1/file:<路径> 覆盖进程探测。
+function appInfo() {
+  const override = process.env.CC_CODEX_APP_BUNDLED_BIN;
+  const bin = override === "none" ? "" : (override || APP_BUNDLED_CODEX.find((p) => {
+    try { fs.accessSync(p, fs.constants.X_OK); return true; } catch { return false; }
+  }) || "");
+  if (!bin) return null;
+  let running = process.env.CC_CODEX_APP_RUNNING;
+  if (running?.startsWith("file:")) running = fs.existsSync(running.slice(5)) ? "1" : "0";
+  if (running === undefined) {
+    const rc = spawnSync("pgrep", ["-f", "CodexCLI.app/Contents/MacOS/codex.* app-server"], { encoding: "utf8" });
+    running = rc.status === 0 ? "1" : "0";
+  }
+  const bundle = (bin.match(/^(.*?\.app)\/Contents\//) || [])[1] || "";
+  return { path: bin, bundle, version: cliVersion(bin), running: running === "1" };
+}
+
+// Codex App 被关掉时在后台把它拉起来（open -g 不抢焦点），等它自带的 app-server 起来。
+// 测试用 CC_CODEX_APP_OPEN_BIN 替换 open。
+function launchApp(app, timeoutMs = 45000) {
+  if (!app?.bundle) return { ok: false, error: "找不到 Codex App 安装位置" };
+  const opener = process.env.CC_CODEX_APP_OPEN_BIN || "open";
+  const rc = spawnSync(opener, ["-g", "-a", app.bundle], { encoding: "utf8", timeout: 15000 });
+  if (rc.status !== 0) return { ok: false, error: String(rc.stderr || rc.error || "open failed").trim().split("\n")[0] };
+  const end = Date.now() + timeoutMs;
+  while (Date.now() < end) {
+    if (appInfo()?.running) return { ok: true };
+    spawnSync("sleep", ["1"]);
+  }
+  return { ok: false, error: `已发出启动，${Math.round(timeoutMs / 1000)} 秒内未见 App 的 app-server 进程` };
+}
+
 module.exports = {
+  APP_BUNDLED_CODEX,
+  compareCore,
+  cliVersion,
+  daemonInfo,
+  appInfo,
+  launchApp,
   daemonPaths,
   readPidFile,
   pidAlive,

@@ -28,8 +28,9 @@ function discoverCodexBin(preferred) {
   const home = homeDir();
   const bundled = [
     path.join(home, ".local", "bin", "codex"),
-    "/Applications/ChatGPT.app/Contents/Resources/codex",
-    "/Applications/Codex.app/Contents/Resources/codex",
+    // Codex App 内置 codex（与桌面端同版本）；旧路径 Resources/codex 已不存在。
+    "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+    "/Applications/Codex.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
     path.join(home, ".codex", "plugins", ".plugin-appserver", "codex"),
   ].find(executable);
   if (bundled) return bundled;

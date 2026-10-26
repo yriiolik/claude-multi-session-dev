@@ -19,12 +19,16 @@ let verbose = false;
 let allowRestart = false;
 let fleetRoot = "";
 let timeoutMs = 45000;
+let skipRouting = false;
+let startApp = false;
 
 function usage() {
   console.error(`cc-codex-ensure [--codex-bin PATH] [--allow-restart] [--fleet-root DIR] [--timeout-ms N] [--json] [--verbose]
 
 保证 Codex app-server 就绪且活动路由目标可用。默认静默，只在做了动作或失败时输出。
---allow-restart  允许在 config.toml/模型目录变更后重启 app-server（无活跃 worker 时才会真重启）`);
+--allow-restart  允许在 config.toml/模型目录变更、或 daemon 版本落后时重启 app-server（daemon 上没有进行中的 turn 才会真重启）
+--skip-routing   跳过路由目标校验（调用方自带路由，例如 cc-fleet）
+--start-app      Codex App 已安装但没在运行时在后台启动它`);
 }
 
 for (let i = 2; i < process.argv.length; i++) {
@@ -34,6 +38,8 @@ for (let i = 2; i < process.argv.length; i++) {
   else if (a === "--verbose") verbose = true;
   else if (a === "--quiet") verbose = false;
   else if (a === "--allow-restart") allowRestart = true;
+  else if (a === "--skip-routing") skipRouting = true;
+  else if (a === "--start-app") startApp = true;
   else if (a === "--fleet-root") fleetRoot = process.argv[++i] || "";
   else if (a === "--timeout-ms") timeoutMs = Number(process.argv[++i] || "45000");
   else if (a === "-h" || a === "--help") { usage(); process.exit(0); }
@@ -68,13 +74,16 @@ const version = cfg.codexVersion(bin);
 // ---- 2. 配置与路由目标 ----
 const codexHome = cfg.codexHome();
 const config = cfg.readCodexConfig(codexHome);
-const routed = cfg.resolveRouting(scriptsDir);
-if (!routed.ok) done(2, { error: `路由配置无效: ${routed.error}`, codexBin: bin });
-const routing = routed.routing;
-const check = cfg.validateRouting(config, routing, { version });
-advisories.push(...check.warnings);
-if (check.problems.length) {
-  done(2, { error: check.problems.join("；"), codexBin: bin, routing });
+let routing = null;
+if (!skipRouting) {
+  const routed = cfg.resolveRouting(scriptsDir);
+  if (!routed.ok) done(2, { error: `路由配置无效: ${routed.error}`, codexBin: bin });
+  routing = routed.routing;
+  const check = cfg.validateRouting(config, routing, { version });
+  advisories.push(...check.warnings);
+  if (check.problems.length) {
+    done(2, { error: check.problems.join("；"), codexBin: bin, routing });
+  }
 }
 
 // ---- 3. app-server 活性 ----
@@ -150,21 +159,75 @@ if (!probe.ok) {
   bringUp("已拉起 Codex app-server");
 } else {
   const state = dmn.readServerState(paths);
-  const drifted = !state || state.fingerprint !== fingerprint;
-  if (drifted && allowRestart) {
-    const live = activeWorkers();
+  // 旧版指纹（config.toml:<大小>:<mtime>）不可比，按首次接管处理，避免升级后无谓重启一次。
+  const legacy = state && /^config\.toml:\d+:/.test(String(state.fingerprint || ""));
+  const drifted = !state || legacy || state.fingerprint !== fingerprint;
+  if (drifted && (!state || legacy)) {
+    // 首次接管一个别处启动的 server：只记下指纹，之后才能判断漂移；没有依据就重启会打断别人的 turn。
+    dmn.writeServerState(paths, { fingerprint, startedAt: Date.now(), codexBin: bin, version, adopted: true });
+  } else if (drifted && allowRestart) {
+    // 旧 env 名册 ∪ daemon 上真实进行中的 turn（v2 worker 不写 env 文件）。
+    let live = activeWorkers();
+    try { live = live.concat(liveTurns()); } catch { live.push("?"); }
     if (live.length) {
       warnings.push(`config.toml/模型目录已变更，但有 ${live.length} 个 Codex worker 正在跑，本次沿用运行中的配置（等它们结束后再派发会自动重启生效）`);
     } else {
       dmn.stopDaemon(bin, timeoutMs);
       bringUp("配置已变更，已重启 app-server 使其生效");
     }
-  } else if (drifted && !state) {
-    // 首次接管一个别处启动的 server：记下指纹，之后才能判断漂移。
-    dmn.writeServerState(paths, { fingerprint, startedAt: Date.now(), codexBin: bin, version, adopted: true });
   } else if (drifted) {
     warnings.push("config.toml/模型目录已变更，运行中的 app-server 仍是旧配置（下次派发会自动重启生效）");
   }
 }
 
-done(0, { codexBin: bin, version, routing, fingerprint });
+// ---- 4. 版本对齐：daemon 不能落后于本机安装的 Codex；Codex App 是另一个 app-server ----
+// 历史教训：daemon 一旦用旧二进制起来就一直跑下去（升级后不重启），fleet 连的是很老的 server。
+function liveTurns() {
+  const call = process.env.CODEX_APP_CALL_BIN || path.join(scriptsDir, "cc-codex-app-call");
+  const rpc = (method, params) => {
+    const rc = spawnSync(call, ["--codex-bin", bin, "--timeout-ms", "8000", method, "-"],
+      { input: JSON.stringify(params), encoding: "utf8", timeout: 12000 });
+    if (rc.status !== 0) throw new Error(`${method} failed`);
+    return JSON.parse(rc.stdout || "{}");
+  };
+  const ids = rpc("thread/loaded/list", {}).data || [];
+  return ids.slice(0, 50).filter((id) => {
+    try { return /"type"\s*:\s*"active"/.test(JSON.stringify(rpc("thread/read", { threadId: id }).thread?.status || {})); }
+    catch { return true; }  // 读不到当作在跑，宁可不重启
+  });
+}
+
+function alignVersions() {
+  const daemon = dmn.daemonInfo(bin);
+  let app = dmn.appInfo();
+  if (app && !app.running && startApp && process.env.CC_CODEX_APP_AUTOSTART !== "0") {
+    const r = dmn.launchApp(app);
+    if (r.ok) { actions.push("Codex App 没在运行，已在后台启动"); app = dmn.appInfo(); }
+    else warnings.push(`Codex App 没在运行，自动启动失败：${r.error}`);
+  }
+  const servers = { daemon, installed: { path: bin, version: cfg.codexVersion(bin) || version }, app };
+  if (app?.version && dmn.compareCore(app.version, servers.installed.version) > 0) {
+    warnings.push(`Codex App 内置 codex ${app.version} 比本机安装的 ${servers.installed.version} 新，fleet worker 暂时落后于 App；本机安装自动更新后，下次派发会自动把 daemon 切到新版`);
+  }
+  if (daemon?.version && dmn.compareCore(daemon.version, servers.installed.version) < 0) {
+    let live = [];
+    try { live = liveTurns(); } catch { live = ["?"]; }
+    if (!allowRestart || live.length) {
+      warnings.push(`app-server daemon 仍是旧版 ${daemon.version}（本机已装 ${servers.installed.version}）` +
+        (live.length ? `，有 ${live.length} 个 turn 在跑，暂不重启；它们结束后下次派发自动重启` : "，下次派发自动重启"));
+      servers.stale = true;
+    } else {
+      dmn.stopDaemon(bin, timeoutMs);
+      bringUp(`app-server daemon ${daemon.version} 落后于本机 ${servers.installed.version}，已重启对齐`);
+      servers.daemon = dmn.daemonInfo(bin);
+    }
+  }
+  if (app?.running) {
+    servers.appNote = "Codex App 用自带的 app-server，与 fleet 的 daemon 同库不同进程：App 收不到 daemon 推送，" +
+      "worker 归入「子 session」、归档等要重启 App 才显示";
+  }
+  return servers;
+}
+
+const servers = alignVersions();
+done(0, { codexBin: bin, version, routing, fingerprint, servers });

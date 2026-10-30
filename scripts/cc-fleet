@@ -126,8 +126,8 @@ def permission_params(d, turn=False):
                                          if turn else {'sandbox': 'danger-full-access'}))
 
 def default_backend(host):
-    # 未指定 --backend 时跟随主端（用户 2026-09-11 纠正）：Claude 主端派 Claude，Codex 主端派 Codex。
-    return 'claude' if host=='claude-code' else 'codex'
+    # 2026-10-30 用户要求：所有主端默认 Codex；能力不足不能静默换后端。
+    return 'codex'
 
 def clean_subdir(s):
     s=(s or '').strip().strip('/')
@@ -173,7 +173,7 @@ def init(a):
     identity_source='session' if owner_id else 'generated-controller'
     owner_id=owner_id or ('controller-'+uuid.uuid4().hex)
     d=dict(version=2,rq=rq,repo=str(repo),commonDir=str(common),subdir=subdir,base=base,baseCommit=sha,
-           integrationBranch='fleet/'+rq,inboxRoot=str((Path(tempfile.gettempdir())/'fleet-v2-inbox'/rq).resolve()),owner={'host':a.host,'id':owner_id,'identitySource':identity_source},createdAt=time.time())
+           integrationBranch='fleet/'+rq,codexTransport='native-only',inboxRoot=str((Path(tempfile.gettempdir())/'fleet-v2-inbox'/rq).resolve()),owner={'host':a.host,'id':owner_id,'identitySource':identity_source},createdAt=time.time())
     atomic(c/'fleet.json',d); (c/'base.ref').write_text(base+'\n')
     # 建组即登记面板：任何后端/传输（含 native）、无论本 session 开不开分屏，全局面板都看得到这个任务组。
     panel_register(c,rq)
@@ -187,8 +187,11 @@ def preamble(c,d):
     # 只放本任务独有的数据与不可推导的边界；项目规则交给客户端按启动目录自动加载的 CLAUDE.md / AGENTS.md。
     fleet=meta(c); role=d['role']; rq=fleet['rq']
     if d['transport']=='native':
-        where=(f"在 App 新建的隔离 worktree 内工作；若它尚未基于集成分支，确认工作树干净后 git switch --detach {fleet['integrationBranch']}"
-               +(f"，再 cd {d['subdir']}" if d.get('subdir') else '')+'。')
+        where=(f"写文件或 Git 元数据前先用 App 原生 list_artifacts 核对隔离 worktree；没有合适工作树时用 "
+               f"create_worktree(ref={fleet['integrationBranch']}, sourceRoot={fleet['repo']}, allowAsync=true) 创建并附加，"
+               '有 operationId 则用 get_worktree_creation_status 等完成。不得在主 checkout 开发。'
+               f"显式使用返回的工作目录；已有隔离工作树基线不符时，确认干净后 git switch --detach {fleet['integrationBranch']}"
+               +(f"，再 cd {d['subdir']}" if d.get('subdir') else '')+'。切换后显式读取工作树根到当前子目录适用的 AGENTS.md / CLAUDE.md，不假定 App 重新加载了规则。')
     else:
         where=f"工作目录 {d['cwd']}（worktree 根 {d['worktree']}），不在主 checkout 改文件。"
     if d.get('permissions')=='inherit': where+='Git 元数据写入需审批时用宿主审批工具申请，无通道则报 blocked。'
@@ -239,11 +242,17 @@ def prepare(a):
     c=coord(a.coord); fleet=meta(c); m=name(a.module)
     a.backend=a.backend or default_backend(fleet['owner']['host'])
     transport=a.transport
-    if transport=='auto': transport='native' if fleet['owner']['host']=='codex-app' and a.backend=='codex' and a.permissions=='inherit' else ('app-server' if a.backend=='codex' else 'claude-bg')
+    if transport=='auto': transport='native' if a.backend=='codex' else 'claude-bg'
+    permissions=a.permissions or ('inherit' if transport=='native' else 'full')
+    if a.self_dev: transport='self'
+    if transport=='app-server' and fleet.get('codexTransport')=='native-only':
+        raise ValueError('new Codex tasks require native Codex App tools; app-server is retained only for existing legacy RQs')
     if (a.backend=='claude' and transport!='claude-bg') or (a.backend=='codex' and transport not in ('native','app-server')):
-        raise ValueError('backend/transport mismatch')
-    if transport=='native' and fleet['owner']['host']!='codex-app': raise ValueError('native requires a Codex App main session')
-    if transport=='native' and a.permissions=='full': raise ValueError('native cannot set full permissions; use app-server or --permissions inherit')
+        if transport!='self': raise ValueError('backend/transport mismatch')
+    if transport=='native' and fleet['owner']['host']!='codex-app':
+        raise ValueError('Codex mode requires native Codex App tools; continue in Codex App or explicitly select --backend claude')
+    if transport=='native' and permissions=='full':
+        raise ValueError('native Codex tasks inherit App permissions; configure access in the App, not through app-server')
     subdir=clean_subdir(fleet.get('subdir','') if a.subdir is None else a.subdir)
     if subdir and run(['git','-C',fleet['repo'],'cat-file','-e',f"{fleet['integrationBranch']}:{subdir}"],check=False).returncode:
         raise ValueError(f'subdir not found on integration branch: {subdir}')
@@ -252,14 +261,15 @@ def prepare(a):
         if a.role!='developer' or after: raise ValueError('--self is a developer worktree for the main session; no --after')
         transport='self'
     if a.phase and a.role not in ('verify','integ'): raise ValueError('--phase only applies to verify/integ')
-    if transport=='native' and after: raise ValueError('native tasks are created by the host; --after needs a CLI transport')
+    if transport=='native' and after:
+        raise ValueError('native dependencies are advanced by the host with create_thread/send_message_to_thread; record the graph in the controller, do not switch transports')
     for x in after:
         if x==m or not record(c,x).exists(): raise ValueError(f'--after module not registered: {x}')
     task=Path(a.task).resolve().read_text() if a.task else ''
     if not task.strip() and not a.self_dev: raise ValueError('empty task card')
     with lock(c,m):
         if record(c,m).exists(): raise ValueError('module already registered; use reply, or a new fix module')
-        d=dict(version=2,module=m,backend=a.backend,transport=transport,role=a.role,permissions=a.permissions,
+        d=dict(version=2,module=m,backend=a.backend,transport=transport,role=a.role,permissions=permissions,
                attempt=uuid.uuid4().hex,state='self' if a.self_dev else ('queued' if after else 'prepared'),
                name=f'↳{m}@{fleet["rq"]}',createdAt=time.time(),after=after,phase=a.phase,profile=a.profile,replies=0,
                sessionId=None,shortId=None,worktree=None,branch=None,subdir=subdir,cwd=None,
@@ -290,16 +300,25 @@ def bind(a):
     branch=git(wt,'rev-parse','--abbrev-ref','HEAD')
     if d.get('worktree')==str(wt) and d.get('branch')==branch:
         emit(d); return
-    emit(update(c,a.module,worktree=str(wt),branch=branch))
+    emit(update(c,a.module,worktree=str(wt),branch=branch,cwd=str(wt/d['subdir']) if d.get('subdir') else str(wt)))
 
 def register(a):
     c=coord(a.coord); d=load(c,a.module)
     if d['transport']!='native': raise ValueError('register is for native App tasks')
     # clientThreadId represents pending setup, never a callable threadId.
     if a.client_thread_id:
-        emit(update(c,a.module,clientThreadId=a.client_thread_id,state='setting-up')); return
+        if d.get('sessionId'): raise ValueError('real threadId is already registered; do not replace it with a clientThreadId')
+        if a.sidebar_section_id: raise ValueError('sidebar placement requires a real threadId')
+        fields=dict(clientThreadId=a.client_thread_id,state='setting-up')
+        if a.host_id: fields['hostId']=a.host_id
+        emit(update(c,a.module,**fields)); return
     if d.get('sessionId') and d['sessionId']!=a.session_id: raise ValueError('task already has a different threadId')
-    emit(sidebar_attach(c,update(c,a.module,sessionId=a.session_id,hostId=a.host_id,state='running',clientThreadId=None)))
+    host_id=a.host_id or d.get('hostId') or 'local'
+    if d.get('sessionId') and d.get('hostId') and d['hostId']!=host_id: raise ValueError('task already belongs to a different host')
+    fields=dict(sessionId=a.session_id,hostId=host_id,state='running',clientThreadId=None)
+    if a.sidebar_section_id:
+        fields['sidebar']=dict(state='placed',sectionId=a.sidebar_section_id,source='codex-app-native')
+    emit(sidebar_attach(c,update(c,a.module,**fields)))
 
 def workdir(d): return d.get('cwd') or d['worktree']
 def claude_bin(): return os.environ.get('CLAUDE_CLI_PATH','claude')
@@ -358,6 +377,10 @@ def goal_status(c, d, out, turns):
 def sidebar_attach(c, d):
     """Use server-owned sections, never private desktop UI state or worker prompts."""
     if d.get('backend') != 'codex' or not d.get('sessionId'): return d
+    if d.get('transport')=='native':
+        if (d.get('sidebar') or {}).get('state')=='placed': return d
+        return update(c,d['module'],sidebar=dict(state='pending',source='codex-app-native',
+            nextAction='Use list_threads + move_thread_to_sidebar_section for the unique 子 session section; then register --sidebar-section-id'))
     if d.get('hostId', 'local') != 'local':
         result = dict(state='pending', reason='remote host requires its own app-server connection')
     else:
@@ -389,15 +412,15 @@ def panel_register(c, rq, no_owner=False):
     except Exception: return False
 
 def panel_attach(c, d, auto=False):
-    """CLI 路径（Codex app-server / Claude --bg）worker 派发成功后：登记面板注册表 + 在当前 Ghostty 窗口分屏拉起只读面板。
-    两种后端同屏：按任务组列出子 session、状态与最近动作，→ 进详情看完整时间线（Codex 读 rollout，Claude 读 transcript）。
-    尽力而为：面板脚本自己处理 Ghostty 没开/没授权/不是 macOS 的情况，绝不因面板让派发失败。
-    CC_FLEET_PANEL=0 只是不开分屏（panelOpened=None），登记照做；native（Codex App 主端，App 自带侧栏）不走这里。"""
+    """CLI 旧任务登记全局注册表；只有 Claude 路径保留自动面板。
+    Codex（含旧 app-server）不打开终端，native 不走这里。
+    CC_FLEET_PANEL=0 关闭 Claude 自动面板但保留登记；失败不影响派发。"""
     if d.get('transport') not in ('app-server','claude-bg'): return None
     fleet=meta(c)
     # 编排器自动派发可能跑在 watchdog（rescue-owners）进程里：不能以它的身份改写主端归属，也不在别处拉分屏。
     out=dict(registered=panel_register(c,fleet['rq'],no_owner=auto),panelOpened=None)
-    if auto or os.environ.get('CC_FLEET_PANEL')=='0': return out
+    # Codex workers never open a terminal surface, including legacy app-server RQs.
+    if d.get('backend')=='codex' or auto or os.environ.get('CC_FLEET_PANEL')=='0': return out
     bin_=os.environ.get('CC_FLEET_PANEL_OPEN_BIN',str(ROOT/'cc-fleet-panel-open'))
     try: out['panelOpened']=run([bin_,'--quiet'],timeout=30,check=False,env=dict(os.environ,CC_FLEET_PANEL_CWD=fleet['repo'])).returncode==0
     except Exception: out['panelOpened']=False
@@ -427,7 +450,7 @@ def launch(c,m,profile=None,auto=False):
         if d['state']=='self': raise ValueError('self module is developed by the main session; nothing to dispatch')
         if d['state'] not in ('prepared','queued'): raise ValueError('already attempted; inspect/reconcile before retrying')
         if d['transport']=='native':
-            return dict(d,nextAction='Use list_projects + create_thread, then register the returned threadId (or clientThreadId while pending).',promptFile=str(c/f'{m}.prompt.md'))
+            return dict(d,nextAction='Use list_projects + create_thread, register the real threadId/hostId (or clientThreadId while pending), then move_thread_to_sidebar_section for 子 session.',promptFile=str(c/f'{m}.prompt.md'))
         d['state']='launching'
         if auto: d['autoDispatchedAt']=time.time()
         refresh_baseline(c,d)
@@ -613,6 +636,9 @@ def status_one(c,d,jobs=None,stale_after=0):
         r=receipt(c,d)
         if r: out.update(state=r['result'],receipt=r); goal_close(c,d,r); return out
         if d['state'] in NOT_LAUNCHED: return out
+        if d['transport']=='native':
+            out.update(state='unknown',nextAction='Use wait_threads or read_thread with the registered threadId and hostId; no verified receipt yet')
+            return out
         if d['backend']=='claude':
             j=next((x for x in (claude_jobs() if jobs is None else jobs) if x.get('id')==d['shortId']),None)
             if j is None: out['state']='unknown'; return out
@@ -648,7 +674,9 @@ def status(a):
 
 def read(a):
     c=coord(a.coord); d=load(c,a.module); r=receipt(c,d)
-    if r: emit(r); return
+    if r and not a.logs: emit(r); return
+    if d['transport']=='native':
+        emit(dict(sessionId=d.get('sessionId'),hostId=d.get('hostId'),nextAction='Use read_thread for native Codex tasks')); return
     if d['backend']=='claude': print(run([claude_bin(),'logs',d['shortId']]).stdout)
     else: emit(call('thread/read',dict(threadId=d['sessionId'],includeTurns=True)))
 
@@ -780,7 +808,8 @@ def queue_reply(a):
     for x in after:
         if x==m or not record(c,x).exists(): raise ValueError(f'--after module not registered: {x}')
     d=load(c,m)
-    if d['transport'] in ('native','self'): raise ValueError('queue-reply needs a CLI-launched worker')
+    if d['transport']=='native': raise ValueError('native followups use send_message_to_thread after the controller verifies dependencies')
+    if d['transport']=='self': raise ValueError('queue-reply needs a CLI-launched worker')
     f=c/f'{m}.queued-reply.md'; f.write_text(text)
     emit(update(c,m,queuedReply=dict(after=after,textFile=str(f),phase=a.phase,session=a.session,queuedAt=time.time())))
 
@@ -832,6 +861,8 @@ def advance_cmd(a):
 
 def stop(a):
     c=coord(a.coord); d=load(c,a.module)
+    if d['transport']=='native':
+        raise ValueError('native interrupt tool unavailable; pause the task in Codex App. Archive does not stop execution')
     if d['backend']=='claude': run([claude_bin(),'stop',d['shortId']])
     else:
         t=call('thread/read',dict(threadId=d['sessionId'],includeTurns=True))['thread']
@@ -1154,6 +1185,8 @@ def collect(a):
 
 def reconcile(a):
     c=coord(a.coord); d=load(c,a.module)
+    if d['transport']=='native':
+        emit(dict(d,nextAction='Use list_threads/read_thread to verify identity, then register the real threadId/hostId; move via App sidebar tools')); return
     if d['backend']=='claude':
         hits=[j for j in claude_jobs() if j.get('name')==d['name'] and Path(j.get('cwd','/')).resolve()==Path(workdir(d)).resolve()]
         if len(hits)!=1: raise ValueError('cannot uniquely reconcile worker; inspect public session list')
@@ -1172,6 +1205,7 @@ def reconcile(a):
 
 def events(a):
     c=coord(a.coord); d=load(c,a.module)
+    if d['transport']=='native': raise ValueError('use wait_threads for native Codex tasks; app-server subscriptions are not supported')
     if d['backend']!='codex' or not d.get('sessionId'): raise ValueError('events requires a registered Codex worker')
     # This is an active controller subscription, never used by a read-only UI panel.
     argv=[os.environ.get('CODEX_APP_CALL_BIN',str(ROOT/'cc-codex-app-call')),
@@ -1207,8 +1241,8 @@ def parser():
             q.add_argument('--timeout',type=int,default=7200,metavar='60..86400')
             q.add_argument('--interval',type=int,default=20,metavar='5..300')
         if cmd=='prepare':
-            q.add_argument('--permissions',choices=('full','inherit'),default='full',help='worker permissions (default: full); inherit preserves backend configuration')
-            q.add_argument('--backend',choices=('codex','claude'),help='default follows host: claude-code -> claude, codex-* -> codex')
+            q.add_argument('--permissions',choices=('full','inherit'),help='default: inherit for native Codex; full for Claude/legacy workers')
+            q.add_argument('--backend',choices=('codex','claude'),help='default: codex (requires native Codex App tools); Claude must be selected explicitly')
             q.add_argument('--transport',default='auto',choices=('auto','native','app-server','claude-bg'))
             q.add_argument('--subdir',help='worker start dir relative to repo root (default: subdir of init --cwd; "" for repo root)')
             q.add_argument('--task'); q.add_argument('--role',default='developer',choices=('developer','scout','verify','integ','regression'))
@@ -1216,9 +1250,11 @@ def parser():
             q.add_argument('--self',dest='self_dev',action='store_true',help='solo mode: worktree for the main session itself, never dispatched')
             q.add_argument('--phase',choices=('author',),help='verify/integ: write acceptance specs in parallel with development')
             q.add_argument('--profile',help='Claude profile in multi-session-dev.json (default: runner for regression if defined, else worker)')
+        if cmd=='read': q.add_argument('--logs',action='store_true',help='read backend logs even when a receipt exists (including invalid receipts)')
         if cmd=='dispatch': q.add_argument('--profile')
         if cmd=='register':
-            g=q.add_mutually_exclusive_group(required=True); g.add_argument('--session-id'); g.add_argument('--client-thread-id'); q.add_argument('--host-id',default='local')
+            g=q.add_mutually_exclusive_group(required=True); g.add_argument('--session-id'); g.add_argument('--client-thread-id'); q.add_argument('--host-id')
+            q.add_argument('--sidebar-section-id',help='record a verified native App sidebar move; does not call a server')
         if cmd=='reconcile': q.add_argument('--session-id')
         if cmd=='events': q.add_argument('--timeout',type=int,choices=range(1,56),default=50,metavar='1..55')
         if cmd=='bind': q.add_argument('--worktree',required=True)

@@ -1,8 +1,14 @@
 # 跨客户端执行适配
 
+## 当前路由
+
+默认 Codex，使用 [native-codex.md](native-codex.md) 的 App 原生工具管理完整生命周期与侧边栏。
+缺少原生工具时报告缺口，不静默启动外部 server 或改为 Claude。以下 Claude 流程仅在用户明确选择时使用；
+以下 app-server 章节仅用于升级前已有 RQ 收尾，不得用于新 RQ。原生任务不调用 server ensure、goal、events 或服务端分区接口。
+
 ## Claude 后台 session（两个主端都能调用）
 
-`cc-fleet prepare --backend claude`（Claude Code 主端省略 --backend 时也走这里）从集成分支创建独立 worktree，
+`cc-fleet prepare --backend claude` 从集成分支创建独立 worktree，
 再由 `dispatch` 在其子项目启动目录（名册 `cwd`）调用 `claude --bg --name ... <完整prompt>`，
 这样 Claude 启动即加载 worktree 根与子项目的 CLAUDE.md。已有 linked worktree 不再自动创建第二层 worktree。
 默认附加 `--dangerously-skip-permissions`，显式 `--permissions inherit` 时省略。
@@ -12,7 +18,7 @@
 状态、读取、停止使用公开 CLI。启动成功但列表尚未反映结果时显示 launch-uncertain，保留现场，稍后 reconcile。
 `--bg` 输出不明确不意味着创建失败；禁止自动重派。模型/effort 使用 Claude 自己的配置，不继承 Codex 名称。
 
-派发成功后与 Codex app-server 路径一样登记面板注册表、在 Ghostty 右侧分屏拉起只读面板（见下一节）。
+Claude 派发成功后登记面板注册表，可在 Ghostty 右侧分屏拉起只读面板（CC_FLEET_PANEL=0 可关）。
 面板对 Claude worker 的状态读 `claude agents --json --all`（每轮刷新只调一次，无 Claude worker 不调），
 「最近动作」与详情时间线读会话 transcript `$CLAUDE_CONFIG_DIR/projects/<cwd 转写>/<sessionId>.jsonl`，
 找不到时降级为 `claude logs`。`done` 只代表会话空闲，无回执照样显示「需核验」（归已完成栏、排在栏首，不当交付、不触发自动关闭）。
@@ -22,18 +28,18 @@
 reply 协议失败明确报错，用户可 `claude attach <shortId>` 手工接续；不能伪报送达、自动重启或重复创建。
 升级后若公开 CLI 提供同等能力再替换该接口。`claude --resume ... --bg` 可能建立副本，因此不把它当无条件原位回话。
 
-## Codex app-server（两个主端/CLI 都能调用）
+## 历史 Codex app-server（仅已有 RQ）
 
 v2 预建 worktree，从其子项目启动目录（名册 `cwd`）thread/start，再 turn/start；Codex 只加载 git 根到 cwd
 路径上的 AGENTS.md，子目录 AGENTS.md 只是指针时由 worker 按统一前缀要求读取所指文件。不使用“先挂主目录、后覆盖 cwd”的侧栏技巧，
 不临时 pin，不强行注入用户级 CLAUDE.md。独立 session 为非 ephemeral、有清晰名称。
 派发脚本通过服务端分区 API 自动归入“子 session”；任务是否成功以 API 和回执为准。
 
-派发成功后自动把协调目录登记进面板注册表，并在当前 Ghostty 窗口右侧分屏拉起只读面板
-`cc-fleet-panel-codex-app`（文件名沿用历史叫法；Codex 与 Claude worker 同屏，这块分屏是用户看子 session 的地方）。
+派发成功后仍把协调目录登记进旧面板注册表，但 Codex 不再自动打开 Ghostty 或终端分屏。
+`cc-fleet-panel-codex-app` 仅保留为历史任务的手动诊断入口。
 Codex worker 状态读 thread/read、明细读 rollout。面板读 `v2/<module>.json` 名册与 `<module>.receipt.json` 回执，
 标题随在场后端显示 Codex Fleet / Claude Fleet / Fleet，幂等复用已开的分屏；Ghostty 没开/未授权/非 macOS
-只提示不报错，绝不因面板让派发失败。`CC_FLEET_PANEL=0` 只关分屏不关登记（`init` 即登记，并行的多个任务组、任何后端都进同一块面板）。
+只提示不报错，绝不因面板让派发失败。`CC_FLEET_PANEL` 不会重新启用 Codex 的自动面板；CLI 历史任务仍登记供手动诊断。
 native 路径（Codex App 主端，App 自带侧栏）不开分屏，但同样登记。
 
 **两个 app-server，版本自动对齐**：Codex App（ChatGPT.app）用内置 codex 起**自己的** app-server（进程内管道，外部连不上；

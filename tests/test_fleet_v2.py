@@ -70,8 +70,13 @@ class FleetTests(unittest.TestCase):
   return json.loads(r.stdout)
  def setup_worker(self,host='claude-code',backend='codex',role='developer',module='api'):
   f=self.cli('init','--cwd',self.repo,'--host',host,'--owner-id','main-123');c=pathlib.Path(f['coord'])
-  d=self.cli('prepare','--coord',c,'--module',module,'--backend',backend,'--task',self.task,'--role',role,*(['--permissions','inherit'] if host=='codex-app' and backend=='codex' else []))
+  # Existing app-server lifecycle coverage uses an actual pre-v2.3 registry shape.
+  legacy=host!='codex-app' and backend=='codex'
+  if legacy:self.legacy_coord(c)
+  d=self.cli('prepare','--coord',c,'--module',module,'--backend',backend,'--task',self.task,'--role',role,*(['--transport','app-server'] if legacy else []))
   return c,d,f
+ def legacy_coord(self,c):
+  p=pathlib.Path(c)/'fleet.json';f=json.loads(p.read_text());f.pop('codexTransport',None);p.write_text(json.dumps(f))
  def db(self):return json.loads((self.root/'db.json').read_text())
  def last_turn_call(self):return [x for x in self.db()['calls'] if x[0] in ('turn/start','turn/steer')][-1]
  def set_db(self,db):(self.root/'db.json').write_text(json.dumps(db))
@@ -100,30 +105,30 @@ class FleetTests(unittest.TestCase):
   fake=self.root/'panel-open';log=self.root/'panel-open.log'
   fake.write_text('#!/bin/sh\nprintf \'%s|%s\\n\' "$*" "$CC_FLEET_PANEL_CWD" >> "$PANEL_LOG"\n');fake.chmod(0o755)
   return dict(self.env,CC_FLEET_PANEL=flag,CC_FLEET_PANEL_OPEN_BIN=str(fake),PANEL_LOG=str(log),CC_FLEET_PANEL_REGISTRY=str(self.root/'coords.json')),log
- def test_app_server_dispatch_opens_ghostty_panel(self):
+ def test_codex_never_opens_ghostty_panel_but_claude_keeps_its_behavior(self):
   env,log=self.panel_env()
   c,d,f=self.setup_worker();out=self.cli('dispatch','--coord',c,'--module','api',env=env)
-  self.assertEqual(out['panel'],dict(registered=True,panelOpened=True))
-  self.assertEqual(log.read_text().splitlines(),[f'--quiet|{f["repo"]}'])
+  self.assertEqual(out['panel'],dict(registered=True,panelOpened=None))
+  self.assertFalse(log.exists())
   reg=json.loads((self.root/'coords.json').read_text())['coords']
   self.assertEqual([(x['coord'],x['rq']) for x in reg],[(str(c),f['rq'])])
   self.assertTrue((c/'owner.meta').exists())
   # Claude 后端（claude --bg）同样登记 + 分屏；记下 model/effort 供面板详情展示
   (self.root/'missing.json').write_text(json.dumps({'worker':{'model':'claude-opus-5','effort':'high'}}))
   c2,_,_=self.setup_worker(backend='claude',module='ui');out=self.cli('dispatch','--coord',c2,'--module','ui',env=env)
-  self.assertEqual(out['panel'],dict(registered=True,panelOpened=True));self.assertEqual(len(log.read_text().splitlines()),2)
+  self.assertEqual(out['panel'],dict(registered=True,panelOpened=True));self.assertEqual(len(log.read_text().splitlines()),1)
   self.assertEqual(out['claudeProfile'],dict(model='claude-opus-5',effort='high'))
   self.assertEqual(json.loads((c2/'v2'/'ui.json').read_text())['claudeProfile'],dict(model='claude-opus-5',effort='high'))
   # 全局开关 0 只是不开分屏：登记照做，别的主 session 已开的全局面板仍看得到这个任务组
   env0,log0=self.panel_env('0');c3,_,_=self.setup_worker(module='svc');out=self.cli('dispatch','--coord',c3,'--module','svc',env=env0)
-  self.assertEqual(out['panel'],dict(registered=True,panelOpened=None));self.assertEqual(len(log0.read_text().splitlines()),2)
+  self.assertEqual(out['panel'],dict(registered=True,panelOpened=None));self.assertEqual(len(log0.read_text().splitlines()),1)
   c5,_,_=self.setup_worker(backend='claude',module='web');out=self.cli('dispatch','--coord',c5,'--module','web',env=env0)
-  self.assertEqual(out['panel'],dict(registered=True,panelOpened=None));self.assertEqual(len(log0.read_text().splitlines()),2)
+  self.assertEqual(out['panel'],dict(registered=True,panelOpened=None));self.assertEqual(len(log0.read_text().splitlines()),1)
   reg=[x['coord'] for x in json.loads((self.root/'coords.json').read_text())['coords']]
   self.assertIn(str(c3),reg);self.assertIn(str(c5),reg)
   # 面板脚本失败只在输出里标 False，派发本身仍是 running
   (self.root/'panel-open').write_text('#!/bin/sh\nexit 7\n');c4,_,_=self.setup_worker(module='job');out=self.cli('dispatch','--coord',c4,'--module','job',env=env)
-  self.assertEqual(out['state'],'running');self.assertEqual(out['panel'],dict(registered=True,panelOpened=False))
+  self.assertEqual(out['state'],'running');self.assertEqual(out['panel'],dict(registered=True,panelOpened=None))
  def test_init_registers_panel_for_every_transport(self):
   # 建组即登记：native（不走 panel_attach）与关掉分屏的 CLI 路径都能进全局注册表；不开任何分屏
   env,log=self.panel_env('0')
@@ -158,6 +163,15 @@ class FleetTests(unittest.TestCase):
   self.assertTrue(pathlib.Path(d['worktree']).exists())
   self.cli('dispatch','--coord',c,'--module','api',ok=False)
   rec=self.cli('reconcile','--coord',c,'--module','api');self.assertEqual(rec['sessionId'],saved['sessionId'])
+ def test_read_logs_bypasses_invalid_receipt(self):
+  c,d,_=self.setup_worker(host='codex-cli')
+  d=self.cli('dispatch','--coord',c,'--module','api')
+  self.receipt(c,d,commit='abc123')
+  normal=self.cli('read','--coord',c,'--module','api')
+  self.assertEqual(normal['result'],'needs-review')
+  logs=self.cli('read','--coord',c,'--module','api','--logs')
+  self.assertEqual(logs['thread']['id'],d['sessionId'])
+
  def test_receipt_must_land_and_match_attempt(self):
   c,d,f=self.setup_worker();self.cli('dispatch','--coord',c,'--module','api')
   wt=pathlib.Path(d['worktree']);(wt/'module.txt').write_text('implemented');self.git('add','.',cwd=wt);self.git('commit','-m','module',cwd=wt)
@@ -215,7 +229,26 @@ class FleetTests(unittest.TestCase):
  def test_native_reply_outputs_instruction_without_backend_send(self):
   c,d,_=self.setup_worker(host='codex-app');self.cli('register','--coord',c,'--module','api','--session-id','native')
   p=self.root/'text';p.write_text('Continue.');out=self.cli('reply','--coord',c,'--module','api','--text-file',p)
-  self.assertIn('send_message_to_thread',out['nextAction']);self.assertIn(out['attempt'],out['prompt']);self.assertFalse(any(x[0] in ('thread/start','turn/start','turn/steer') for x in self.db()['calls']))
+  self.assertIn('send_message_to_thread',out['nextAction']);self.assertIn(out['attempt'],out['prompt']);self.assertFalse((self.root/'db.json').exists())
+ def test_native_lifecycle_never_contacts_external_server_or_terminal(self):
+  c,d,_=self.setup_worker(host='codex-app',role='scout')
+  panel_env,panel_log=self.panel_env('1');ensure_env,ensure_log=self.fake_ensure("echo '{}'")
+  # Enable both old hooks; native operations must still never invoke either hook.
+  env=dict(panel_env,CC_FLEET_CODEX_ENSURE='1',CC_CODEX_ENSURE_BIN=ensure_env['CC_CODEX_ENSURE_BIN'])
+  out=self.cli('dispatch','--coord',c,'--module','api',env=env)
+  self.assertIn('create_thread',out['nextAction'])
+  self.cli('register','--coord',c,'--module','api','--session-id','native','--host-id','remote',env=env)
+  status=self.cli('status','--coord',c,env=env)['jobs'][0]
+  self.assertEqual(status['state'],'unknown');self.assertIn('wait_threads',status['nextAction'])
+  self.assertIn('read_thread',self.cli('read','--coord',c,'--module','api','--logs',env=env)['nextAction'])
+  self.assertIn('list_threads',self.cli('reconcile','--coord',c,'--module','api',env=env)['nextAction'])
+  for cmd in ('events','stop'):
+   self.cli(cmd,'--coord',c,'--module','api',env=env,ok=False)
+  self.assertEqual(json.loads((c/'v2/api.json').read_text())['state'],'running')
+  msg=self.root/'native-reply.md';msg.write_text('Continue with the remaining case.')
+  reply=self.cli('reply','--coord',c,'--module','api','--text-file',msg,env=env)
+  self.assertNotEqual(reply['attempt'],d['attempt']);self.assertIn('send_message_to_thread',reply['nextAction'])
+  self.assertFalse((self.root/'db.json').exists());self.assertFalse(panel_log.exists());self.assertFalse(ensure_log.exists())
  def test_bind_checks_repo_and_baseline(self):
   c,d,_=self.setup_worker();self.cli('bind','--coord',c,'--module','api','--worktree',self.repo,ok=False)
   self.cli('bind','--coord',c,'--module','api','--worktree',d['worktree'])
@@ -235,7 +268,8 @@ class FleetTests(unittest.TestCase):
  def test_claude_main_explicit_codex_uses_gpt6_low_and_preserves_resume(self):
   # 2026-09-11 用户纠正需求：Claude 主端未指定时默认派 Claude；gpt-6-astra/low 只作用于显式 --backend codex。
   f=self.cli('init','--cwd',self.repo,'--host','claude-code','--owner-id','main')
-  c=pathlib.Path(f['coord']);d=self.cli('prepare','--coord',c,'--module','api','--backend','codex','--task',self.task)
+  c=pathlib.Path(f['coord']);self.legacy_coord(c)
+  d=self.cli('prepare','--coord',c,'--module','api','--backend','codex','--transport','app-server','--task',self.task)
   self.assertEqual(d['backend'],'codex');self.assertEqual(d['transport'],'app-server')
   self.cli('dispatch','--coord',c,'--module','api')
   calls=self.db()['calls'];start=next(p for m,p in calls if m=='thread/start');turn=next(p for m,p in calls if m=='turn/start')
@@ -257,10 +291,15 @@ class FleetTests(unittest.TestCase):
  def test_claude_full_permissions(self):
   c,d,_=self.setup_worker(backend='claude');self.cli('dispatch','--coord',c,'--module','api')
   self.assertIn('--dangerously-skip-permissions',self.db()['calls'][0])
- def test_app_full_defaults_to_app_server(self):
+ def test_app_defaults_to_native_without_permissions_flags(self):
   f=self.cli('init','--cwd',self.repo,'--host','codex-app');c=f['coord']
   d=self.cli('prepare','--coord',c,'--module','api','--task',self.task)
-  self.assertEqual(d['transport'],'app-server')
+  self.assertEqual((d['backend'],d['transport'],d['permissions']),('codex','native','inherit'))
+  self.assertIsNone(d['worktree']);self.assertFalse((self.root/'db.json').exists())
+  self.assertEqual(self.git('worktree','list','--porcelain').count('worktree '),1)
+  self.cli('prepare','--coord',c,'--module','full','--permissions','full','--task',self.task,ok=False)
+  self.cli('prepare','--coord',c,'--module','external','--transport','app-server','--task',self.task,ok=False)
+  self.assertFalse((self.root/'db.json').exists())
  def test_inherit_does_not_force_permissions(self):
   c,d,_=self.setup_worker(host='codex-cli');d['permissions']='inherit';(c/'v2/api.json').write_text(json.dumps(d));self.cli('dispatch','--coord',c,'--module','api')
   for meth,p in self.db()['calls']:
@@ -280,20 +319,28 @@ class FleetTests(unittest.TestCase):
   self.assertEqual(sum(x[0]=='thread/section/move' for x in self.db()['calls']),count)
  def test_sidebar_native_registration(self):
   c,d,_=self.setup_worker(host='codex-app')
-  self.cli('register','--coord',c,'--module','api','--client-thread-id','pending')
+  self.cli('register','--coord',c,'--module','api','--client-thread-id','pending','--host-id','remote-native')
   self.assertFalse((self.root/'db.json').exists())
-  out=self.cli('register','--coord',c,'--module','api','--session-id','native')
-  self.assertEqual(out['sidebar']['state'],'placed')
+  out=self.cli('register','--coord',c,'--module','api','--session-id','native','--host-id','remote-native')
+  self.assertEqual(out['sidebar']['state'],'pending');self.assertFalse((self.root/'db.json').exists())
+  out=self.cli('register','--coord',c,'--module','api','--session-id','native','--sidebar-section-id','app-section-id')
+  self.assertEqual(out['sidebar'],dict(state='placed',sectionId='app-section-id',source='codex-app-native'))
+  self.assertEqual(out['hostId'],'remote-native');self.assertFalse((self.root/'db.json').exists())
+  self.cli('register','--coord',c,'--module','api','--client-thread-id','late-client',ok=False)
+  self.cli('register','--coord',c,'--module','api','--session-id','different-thread',ok=False)
+  self.cli('register','--coord',c,'--module','api','--session-id','native','--host-id','wrong-host',ok=False)
+  saved=json.loads((c/'v2/api.json').read_text());self.assertEqual((saved['sessionId'],saved['hostId']),('native','remote-native'))
 
- def test_default_backend_follows_host(self):
-  for host,backend,transport in [('claude-code','claude','claude-bg'),('codex-cli','codex','app-server'),('codex-app','codex','app-server')]:
+ def test_default_codex_never_silently_falls_back_for_other_hosts(self):
+  for host in ('claude-code','codex-cli'):
    with self.subTest(host=host):
     f=self.cli('init','--cwd',self.repo,'--host',host,'--owner-id','main');c=pathlib.Path(f['coord'])
-    d=self.cli('prepare','--coord',c,'--module','api','--task',self.task)
-    self.assertEqual((d['backend'],d['transport']),(backend,transport))
-  # Claude 主端未指定后端：派发走 claude --bg，绝不启动 Codex thread
+    result=self.cli('prepare','--coord',c,'--module','api','--task',self.task,ok=False)
+    self.assertIn('native Codex App tools',result.stderr)
+    self.assertFalse((c/'v2'/'api.json').exists());self.assertFalse((self.root/'db.json').exists())
+  # Explicit Claude remains supported, even though the default is Codex.
   f=self.cli('init','--cwd',self.repo,'--host','claude-code','--owner-id','main');c=pathlib.Path(f['coord'])
-  self.cli('prepare','--coord',c,'--module','ui','--task',self.task);self.cli('dispatch','--coord',c,'--module','ui')
+  self.cli('prepare','--coord',c,'--module','ui','--backend','claude','--task',self.task);self.cli('dispatch','--coord',c,'--module','ui')
   calls=self.db()['calls'];self.assertTrue(any('--bg' in x for x in calls));self.assertFalse(any(x[0]=='thread/start' for x in calls))
  def commit_subproject(self):
   sub=self.repo/'factory';sub.mkdir();(sub/'CLAUDE.md').write_text('sub rules');(sub/'AGENTS.md').write_text('sub pointer')
@@ -302,7 +349,7 @@ class FleetTests(unittest.TestCase):
   sub=self.commit_subproject()
   f=self.cli('init','--cwd',sub,'--host','claude-code','--owner-id','main');c=pathlib.Path(f['coord'])
   self.assertEqual(f['subdir'],'factory')
-  d=self.cli('prepare','--coord',c,'--module','ui','--role','scout','--task',self.task);wt=pathlib.Path(d['worktree'])
+  d=self.cli('prepare','--coord',c,'--module','ui','--backend','claude','--role','scout','--task',self.task);wt=pathlib.Path(d['worktree'])
   self.assertEqual(d['cwd'],str(wt/'factory'));self.assertTrue((wt/'factory'/'CLAUDE.md').exists())
   self.assertIn('工作目录 '+d['cwd'],(c/'ui.prompt.md').read_text())
   self.cli('dispatch','--coord',c,'--module','ui')
@@ -311,15 +358,16 @@ class FleetTests(unittest.TestCase):
   self.assertEqual(self.cli('bind','--coord',c,'--module','ui','--worktree',d['cwd'])['worktree'],d['worktree'])
   self.receipt(c,d,worktree=d['cwd']);self.assertEqual(self.cli('status','--coord',c)['jobs'][0]['state'],'done')
   # Codex 同样从子项目目录起 thread 与 turn（Codex 只加载 git 根到 cwd 路径上的 AGENTS.md）
-  d2=self.cli('prepare','--coord',c,'--module','api','--backend','codex','--task',self.task);self.cli('dispatch','--coord',c,'--module','api')
+  self.legacy_coord(c)
+  d2=self.cli('prepare','--coord',c,'--module','api','--backend','codex','--transport','app-server','--task',self.task);self.cli('dispatch','--coord',c,'--module','api')
   calls=self.db()['calls'];start=next(x[1] for x in calls if x[0]=='thread/start');turn=next(x[1] for x in calls if x[0]=='turn/start')
   self.assertEqual((start['cwd'],turn['cwd']),(d2['cwd'],d2['cwd']))
  def test_subdir_override_and_validation(self):
   sub=self.commit_subproject()
   f=self.cli('init','--cwd',sub,'--host','claude-code','--owner-id','main');c=pathlib.Path(f['coord'])
-  d=self.cli('prepare','--coord',c,'--module','root','--subdir','','--task',self.task);self.assertEqual(d['cwd'],d['worktree'])
-  self.cli('prepare','--coord',c,'--module','bad','--subdir','nope','--task',self.task,ok=False)
-  self.cli('prepare','--coord',c,'--module','esc','--subdir','../x','--task',self.task,ok=False)
+  d=self.cli('prepare','--coord',c,'--module','root','--backend','claude','--subdir','','--task',self.task);self.assertEqual(d['cwd'],d['worktree'])
+  self.cli('prepare','--coord',c,'--module','bad','--backend','claude','--subdir','nope','--task',self.task,ok=False)
+  self.cli('prepare','--coord',c,'--module','esc','--backend','claude','--subdir','../x','--task',self.task,ok=False)
   self.assertFalse((self.repo/'.claude'/'worktrees'/f"fleet-{f['rq']}-bad").exists())
  def test_worktree_outside_git_dir_and_excluded(self):
   c,d,f=self.setup_worker(backend='claude')
@@ -777,7 +825,7 @@ class FleetTests(unittest.TestCase):
   for ttl,want in (('600',1),('0',2)):
    env,log=self.fake_ensure("echo '{\"ok\":true}'");env['CC_FLEET_SERVER_TTL']=ttl
    c,d,_=self.setup_worker(role='scout',module='a'+ttl);self.cli('dispatch','--coord',c,'--module','a'+ttl,env=env);self.receipt(c,d)
-   for m in ('b','c'):self.cli('prepare','--coord',c,'--module',m+ttl,'--backend','codex','--task',self.task,'--role','scout','--after','a'+ttl)
+   for m in ('b','c'):self.cli('prepare','--coord',c,'--module',m+ttl,'--backend','codex','--transport','app-server','--task',self.task,'--role','scout','--after','a'+ttl)
    log.unlink();self.cli('advance','--coord',c,env=env)
    self.assertEqual(len(log.read_text().splitlines()),want,ttl)
  def test_server_command_is_read_only(self):

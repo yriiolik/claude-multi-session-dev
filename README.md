@@ -1,4 +1,5 @@
-> **v2 已上线**：新 RQ 使用统一 `scripts/cc-fleet`，支持 Codex / Claude Code 双主端和双后端。
+> **v2.3**：默认 Codex，新 RQ 的会话管理全部使用 Codex App 原生线程与侧边栏工具，统一放入“子 session”分区。
+> Codex 不再自动打开终端面板；`cc-fleet` 保留协调元数据、回执和集成能力。Claude 后端需明确选择，旧 app-server 仅供已有 RQ 收尾。
 > 请先读 [SKILL.md](SKILL.md) 与 [v2 命令](reference/v2-commands.md)。以下内容保留为旧命令/历史 RQ 的参考。
 
 # claude-multi-session-dev

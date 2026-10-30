@@ -1,4 +1,7 @@
-# Codex 后端模式（用户明确要求时加载）
+# 历史 Codex 后端模式（仅已有旧 RQ）
+
+> 2026-10-30 起 Codex 为默认模式，新 RQ 全部走 [native-codex.md](native-codex.md) 的 App 原生线程工具。
+> 本文的 app-server、旧派发脚本和终端面板仅供历史诊断，不作为新任务入口；Codex 不再自动打开终端面板。
 
 触发：用户说「codex / codex-app / App 可见 / 子 session 要在 Codex App 里看到」。
 

@@ -1,4 +1,16 @@
-# 脚本侧栏归类实现
+# Codex App 原生侧边栏归类
+
+新 Codex RQ 全部由主端调用原生工具归类，流程见 [native-codex.md](native-codex.md)：
+`list_threads` 解析唯一“子 session”分区 → `move_thread_to_sidebar_section` 移动真实 threadId/hostId → 再读分区核对。
+成功后 `register --sidebar-section-id <原生sectionId>` 只记录结果，不执行任何服务端调用。
+原生 register 不调用 threadSection/list 或 thread/section/move；没有原生归类结果时返回 pending 与宿主操作提示。
+
+当前线程工具未提供父子容器写入能力；主会话入口和状态更新加上用户的“子 session”分区用于展示本轮任务。
+分区 ID 必须每轮从原生工具解析，不硬编码，不与下述历史服务端 ID 混用。
+
+## 历史 app-server RQ
+
+以下行为仅适用于升级前已存在的 app-server RQ，解释旧列表不同步问题；不得用作新任务的归类方案。
 
 归类由 `cc-fleet` 自动执行，不需要主端或 worker 提示词调用 UI 工具。
 `dispatch` 成功、`register` 获得真实 ID、`reconcile` 恢复名册时，调用

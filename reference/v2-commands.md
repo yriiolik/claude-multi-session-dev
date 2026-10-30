@@ -1,5 +1,30 @@
 # v2 统一命令
 
+## Codex 默认路径（2026-10-30）
+
+所有主端省略 `--backend` 都选择 Codex。新 RQ 写入 `codexTransport=native-only`，禁止用 app-server 派 Codex；
+宿主必须提供 Codex App 原生工具，缺少工具时报告能力缺口，不自动换后端。
+
+```bash
+"$FLEET" init --cwd /absolute/repo --host codex-app --owner-id '<真实主任务ID>'
+"$FLEET" prepare --coord "$COORD" --module api --task /absolute/api.md
+# 读取完整 promptFile → list_projects + create_thread → register
+"$FLEET" register --coord "$COORD" --module api --session-id '<threadId>' --host-id '<hostId>'
+# list_threads → move_thread_to_sidebar_section，确认归属后记录原生 sectionId
+"$FLEET" register --coord "$COORD" --module api --session-id '<threadId>' --host-id '<hostId>' --sidebar-section-id '<sectionId>'
+"$FLEET" status --coord "$COORD"  # 仅核验原生任务回执；运行态用 wait_threads/read_thread
+"$FLEET" reply --coord "$COORD" --module api --text-file /absolute/correction.md
+# 把返回 prompt 交给 send_message_to_thread；脚本不发送原生消息
+```
+
+完整流程与隔离工作树规则见 [native-codex.md](native-codex.md)。Codex 模式不自动开终端面板；默认权限为
+inherit，继承 App/项目配置。显式 full 会报告能力限制，不能触发 app-server 回退。
+
+## Claude 与历史 RQ 的 CLI 路径
+
+下文的 CLI 派发、自动队列、await、events、goal 和 provider 路由只适用于显式选择的 Claude，或升级前已存在的
+app-server RQ。新 Codex 原生任务不使用这些生命周期路径；保留历史命令是为了已有任务收尾。
+
 将 `FLEET` 设置为本技能 `scripts/cc-fleet` 的绝对路径。以下是参数示例，RQ、coord 和真实 ID 必须使用
 工具返回值；不要重新猜测。主 session ID 可取得时传 --owner-id；否则读取适用环境变量，仍不可得时生成独立 controller ID，并标明不是会话 ID。命令输出为 JSON（read 日志与 events 除外）。Python 3 + Node.js + Git 为依赖。
 
@@ -8,19 +33,20 @@
 # host: codex-app / codex-cli / claude-code；可传 --base 已有分支、--rq 指定唯一任务号
 "$FLEET" prepare --coord "$COORD" --module api --backend codex --task /absolute/api.md
 "$FLEET" prepare --coord "$COORD" --module ui --backend claude --task /absolute/ui.md
-"$FLEET" dispatch --coord "$COORD" --module api
+"$FLEET" dispatch --coord "$COORD" --module api  # 仅历史 app-server RQ；原生只返回宿主操作提示
 "$FLEET" dispatch --coord "$COORD" --module ui
 "$FLEET" status --coord "$COORD"
 "$FLEET" wait --coord "$COORD" --timeout 50
 "$FLEET" await --coord "$COORD" --label '等 m3 回修、m7 完成'   # 长驻唤醒，配 run_in_background
 "$FLEET" read --coord "$COORD" --module api
+"$FLEET" read --coord "$COORD" --module api --logs  # 回执存在/无效时仍查看后端日志
 "$FLEET" collect --coord "$COORD" --module api
 "$FLEET" reply --coord "$COORD" --module api --text-file /absolute/correction.md
 "$FLEET" stop --coord "$COORD" --module api
 # 依赖图（开局一次排好，之后编排器自动接续）
 "$FLEET" prepare --coord "$COORD" --module main --self                      # solo：主 session 自己开发的 worktree
-"$FLEET" prepare --coord "$COORD" --module verify --role verify --phase author --task /absolute/verify.md
-"$FLEET" prepare --coord "$COORD" --module regression --role regression --after api,ui --task /absolute/reg.md
+"$FLEET" prepare --coord "$COORD" --module verify --backend claude --role verify --phase author --task /absolute/verify.md
+"$FLEET" prepare --coord "$COORD" --module regression --backend claude --role regression --after api,ui --task /absolute/reg.md
 "$FLEET" queue-reply --coord "$COORD" --module verify --after regression --phase execute --text-file /absolute/exec.md
 "$FLEET" advance --coord "$COORD"     # 手动推进一次；平时由 await / rescue-owners 自动调用
 ```
@@ -40,8 +66,8 @@
 - `prepare --self`：solo 模式下主 session 自己开发用的 worktree（state=`self`），不派发、不算 pending；
   主 session 提交后在该 worktree 里运行 `cc-fleet-land <RQ>`。
 
-`prepare` 省略 --backend 时跟随主端：`claude-code` → claude，`codex-app` / `codex-cli` → codex。
-Claude Code 主端显式 `--backend codex` 时固定使用 `gpt-6-astra` / `low` / `openai`；后续 reply 保持已保存 routing。
+`prepare` 省略 --backend 时统一使用 Codex 原生路径。Claude 必须显式 `--backend claude`。
+历史 app-server RQ 保留已保存 routing，新原生任务模型只通过宿主工具按用户明确要求设置。
 
 worktree 建在 `<repo>/.claude/worktrees/fleet-<RQ>-<module>`（该路径未被忽略时自动写入 `.git/info/exclude`），
 不放 `.git/` 内：Vite 等开发服务器默认拒绝服务 `**/.git/**`。worker 启动目录（名册 `cwd`）取 `init --cwd`
@@ -49,13 +75,13 @@ worktree 建在 `<repo>/.claude/worktrees/fleet-<RQ>-<module>`（该路径未被
 git 根到启动目录路径上的 CLAUDE.md / AGENTS.md（2026-09-11 实测；不会越过 worktree 根读到主 checkout），
 所以子项目卡必须从子项目目录启动。`bind` 与回执里的子目录路径统一规整为 worktree 根。
 
-`prepare --transport auto` 根据明确 host/backend 选择路径，不靠环境变量猜宿主。可强制
-`--transport app-server` / `claude-bg` / `native`（原生仅 Codex App + Codex）。`--role` 为
+`prepare --transport auto` 选择 Codex→native、Claude→claude-bg，不再由权限切换 transport。
+`--transport app-server` 只用于升级前已存在的旧 RQ，新 RQ 拒绝该路径。`--role` 为
 `developer`（默认）、`scout`、`integ`、`verify`、`regression`。非开发角色不合回业务代码。
 `regression` 是全 RQ 唯一跑成批 e2e 的角色（开发卡各自只跑改动相关的最小集合），范围用
 `cc-fleet-e2e-scope plan` 合成后写进任务卡；规则见 delivery-quality.md §6。
 
-`prepare` 只创建任务元数据/prompt/worktree，不调用模型；`dispatch` 才启动 worker，接受 prepared 与 queued（后者可提前手动派）。
+`prepare` 不调用模型；原生只生成元数据/prompt，不建 worktree。`dispatch` 只启动 CLI worker，原生返回宿主操作提示。
 未知启动结果保留 worktree，禁止自动重试创建。回修与追加指令一律 `reply` 原模块，投递前按「热且小才复用」判定（不分角色）：
 
 - 复用：距上一轮结束 < `CC_FLEET_FRESH_IDLE`（默认 3600 秒，缓存还在）、上下文 < `CC_FLEET_FRESH_CTX`（默认 150000）、没压缩过。
@@ -212,8 +238,8 @@ budgetLimited/paused/complete → needs-review，附 `goalHint`。paused 多半�
   派发使用其中 `worker.model/effort`；`regression` 卡缺省用 `runner`（存在时），也可 `prepare/dispatch --profile spike`。
   没有配置则不传模型/effort。
 - v2 生成 UUID 后缀 RQ，协调数据在 git-common-dir，避免两端各自分配同号；历史全局序号池不受影响。
-- `CC_FLEET_PANEL=0`：不在 Ghostty 分屏拉起只读面板（默认 Codex app-server 与 Claude `--bg` 派发成功即拉起，
-  两种后端同屏，幂等复用）。**登记不受它影响**：`init` 与 `dispatch` 总会把协调目录登记进全局注册表，
+- Codex worker（含历史 app-server RQ）无论 `CC_FLEET_PANEL` 如何设置都不自动打开终端面板。
+  Claude CLI 路径仍可用 `CC_FLEET_PANEL=0` 关闭自动面板。**登记不受它影响**：`init` 与 CLI `dispatch` 仍登记协调目录，
   别的主 session 已开着的面板照样显示本任务组；面板还会自动发现已知仓库里漏登记的近期 v2 任务组
   （`--no-discover` / `CC_FLEET_PANEL_DISCOVER=0` 关）。混合后端时标题为 Fleet 并按 Claude/Codex 报数、行内标后端。
   主 session 确定已退出（fleet.json 记的 Claude 会话 UUID 已不在活会话里，或 owner.meta 的 pid 已退出）且
@@ -229,9 +255,8 @@ budgetLimited/paused/complete → needs-review，附 `goalHint`。paused 多半�
 
 ## 默认权限
 
-用户已指定 worker 默认开放权限。`prepare --permissions full`（默认）写入名册；
-`prepare --permissions inherit` 保留后端配置。Codex 的 auto transport 在 full 模式走 app-server；
-原生 App 接口不能指定权限，因此 `--transport native` 要搭配 `--permissions inherit`。
+Codex 原生任务默认 `inherit`，不需要额外参数；显式 full 会报错，不改 transport。
+Claude 与历史 app-server worker 默认 full；`prepare --permissions inherit` 保留后端配置。
 新 Claude worker 的 full 模式传 `--dangerously-skip-permissions`，后续 reply 沿用会话权限。
 Codex 没有 permissions 字段的旧名册在下一次空闲 reply 时也使用 full；显式 inherit 的记录保持继承。
 运行中的 turn/steer 不能改变权限，需等当前轮结束再 reply，脚本不会自动中断或重派。

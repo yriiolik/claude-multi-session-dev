@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# e2e：派发 Codex worker → 自动登记 + 自动分屏拉起面板 → 面板看到 worker → 全部收工后面板自动关闭。
+# e2e：历史 Codex 派发仅登记、不打开终端；手动诊断面板仍能看到 worker 并在收工后关闭。
 # 全程假 codex app-server + 假 osascript，不碰真实 Ghostty / Codex。
 set -u
 
@@ -92,7 +92,7 @@ PIDF="$T/panel.pid"
 export CC_FLEET_PANEL_REGISTRY="$REG"
 export CC_FLEET_PANEL_STATE="$PSTATE"
 export CC_FLEET_PANEL_PIDFILE="$PIDF"
-# 本文件要真的走"派发即拉起面板"这条路径——用上面那个假 osascript 顶掉真实 Ghostty。
+# 即使旧开关为 1，派发也不得调用 osascript；假的 osascript 记录任何意外调用。
 export CC_FLEET_PANEL=1
 export CC_GHOSTTY_OSASCRIPT="$FAKE_OSA"
 export OSA_ARGV_LOG="$OSA_LOG"
@@ -101,7 +101,7 @@ export FAKE_CALL_LOG="$CALL_LOG"
 export FAKE_STATE_FILE="$STATE_FILE"
 
 # ---------------------------------------------------------------- ① 派发
-CASE="派发即拉起面板"
+CASE="派发不打开终端面板"
 OUT="$(cd "$R" && CODEX_HOME="$T/codex-home" "$DISPATCH" \
   --cwd "$R/pkg" --name "↳库存@$RQ" \
   --env FLEET_ROLE=worker --env FLEET_RQ="$RQ" --env FLEET_MODULE=库存 --env FLEET_BASE_BRANCH="$INT" \
@@ -110,9 +110,8 @@ OUT="$(cd "$R" && CODEX_HOME="$T/codex-home" "$DISPATCH" \
 assert_eq "$RC" "0" "派发应成功（实际输出: ${OUT:0:200}）"
 assert_contains "$OUT" "codex app thread dispatched" "派发成功回显"
 assert_contains "$(cat "$REG")" "$CDIR" "协调目录被自动登记进全局注册表"
-assert_contains "$(cat "$OSA_LOG")" "cc-fleet-panel-codex-app" "自动分屏，且分屏里跑的是面板程序"
-assert_contains "$(cat "$OSA_LOG")" "right" "默认右侧分屏"
-assert_eq "$(node -pe 'JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).terminalId' "$PSTATE")" "FAKE-TERM-E2E" "记下分屏 surface id 以便收尾关闭"
+assert_eq "$(wc -c < "$OSA_LOG" | tr -d ' ')" "0" "CC_FLEET_PANEL=1 也不得打开终端"
+[[ ! -f "$PSTATE" ]] && ok || fail "派发不得创建终端面板状态"
 
 # ---------------------------------------------------------------- ② 面板看得见
 CASE="面板看得见 worker"
@@ -155,7 +154,7 @@ echo "$LIVE" > "$PIDF"
   --cwd "$R/pkg" --name "↳库存二批@$RQ" \
   --env FLEET_ROLE=worker --env FLEET_RQ="$RQ" --env FLEET_MODULE=库存二批 --env FLEET_BASE_BRANCH="$INT" \
   --sid-file "$CDIR/库存二批.sid" --prompt-file "$R/card.md" \
-  --codex-bin /usr/bin/true --pin-policy never --join >/dev/null 2>&1)
+  --codex-bin /usr/bin/true --pin-policy never --join --panel >/dev/null 2>&1)
 assert_eq "$(wc -c < "$OSA_LOG" | tr -d ' ')" "0" "面板已开着时不再开第二个分屏"
 kill "$LIVE" 2>/dev/null; rm -f "$PIDF"
 

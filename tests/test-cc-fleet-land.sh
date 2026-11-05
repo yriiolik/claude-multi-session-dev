@@ -7,13 +7,9 @@
 # 测试铁律：断言只增强不削弱；失败一律是脚本 bug，改脚本不改断言。
 set -u
 
-# RQ 序号池/注册表现在是【跨仓库全局】的（~/.claude/fleet）。测试一律指到临时目录，
-# 否则会污染真实全局池、甚至抬高真实高水位。
-export CC_FLEET_HOME="${CC_FLEET_HOME_TEST_OVERRIDE:-$(mktemp -d)}"
-
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 LAND="$ROOT/scripts/cc-fleet-land"
-COORD="$ROOT/scripts/cc-fleet-coord"
+COORD="$ROOT/scripts/cc-fleet"
 PASS=0; FAIL=0; CASE=""
 DIRS=()
 trap 'for d in "${DIRS[@]:-}"; do [ -n "$d" ] && rm -rf "$d"; done' EXIT
@@ -42,7 +38,7 @@ intsha(){ git -C "$1" rev-parse "fleet/$2"; }
 # ---------- 1. ff 落地：单 worker 落地推进集成分支 ----------
 CASE="ff-land"
 R="$(new_repo)"
-( cd "$R" && "$COORD" --init-base RQ-1 >/dev/null 2>&1 )
+( cd "$R" && "$COORD" init --cwd "$PWD" --rq RQ-1 >/dev/null 2>&1 )
 before="$(intsha "$R" RQ-1)"
 WT="$(add_worker "$R" a "fleet/RQ-1")"
 ( cd "$WT" && printf 'A\n' > a.txt && git add -A && git commit -qm "module A" && "$LAND" RQ-1 >/dev/null 2>&1 )
@@ -59,7 +55,7 @@ eq "$(intsha "$R" RQ-1)" "$mid" "集成分支应不变"
 
 # ---------- 3. 两 worker 串行：零丢更新 ----------
 CASE="serial-no-lost-update"
-R3="$(new_repo)"; ( cd "$R3" && "$COORD" --init-base RQ-3 >/dev/null 2>&1 )
+R3="$(new_repo)"; ( cd "$R3" && "$COORD" init --cwd "$PWD" --rq RQ-3 >/dev/null 2>&1 )
 WA="$(add_worker "$R3" A "fleet/RQ-3")"
 ( cd "$WA" && printf 'A\n' > a.txt && git add -A && git commit -qm A && "$LAND" RQ-3 >/dev/null 2>&1 )
 # B 从 base 起（不含 A），改不同文件，落地时应自动 merge 进 A
@@ -80,7 +76,7 @@ CASE="dirty-tree"
 
 # ---------- 6. 与集成分支冲突 → exit 7，集成分支不变 ----------
 CASE="merge-conflict"
-R6="$(new_repo)"; ( cd "$R6" && "$COORD" --init-base RQ-6 >/dev/null 2>&1 )
+R6="$(new_repo)"; ( cd "$R6" && "$COORD" init --cwd "$PWD" --rq RQ-6 >/dev/null 2>&1 )
 WX="$(add_worker "$R6" X "fleet/RQ-6")"
 ( cd "$WX" && printf 'fromX\n' > shared.txt && git add -A && git commit -qm X && "$LAND" RQ-6 >/dev/null 2>&1 )
 intafterX="$(intsha "$R6" RQ-6)"
@@ -91,13 +87,13 @@ eq "$(intsha "$R6" RQ-6)" "$intafterX" "冲突时集成分支应不变"
 
 # ---------- 7. 当前就在集成分支上 → exit 2（guard）----------
 CASE="on-int-branch"
-R7="$(new_repo)"; ( cd "$R7" && "$COORD" --init-base RQ-7 >/dev/null 2>&1 )
+R7="$(new_repo)"; ( cd "$R7" && "$COORD" init --cwd "$PWD" --rq RQ-7 >/dev/null 2>&1 )
 WI="$R7/wt-int"; git -C "$R7" worktree add -q "$WI" "fleet/RQ-7" >/dev/null 2>&1
 ( cd "$WI" && "$LAND" RQ-7 >/dev/null 2>&1 ); eq "$?" "2" "在集成分支上退出码"
 
 # ---------- 8. --dry-run 不改 ref ----------
 CASE="dry-run"
-R8="$(new_repo)"; ( cd "$R8" && "$COORD" --init-base RQ-8 >/dev/null 2>&1 )
+R8="$(new_repo)"; ( cd "$R8" && "$COORD" init --cwd "$PWD" --rq RQ-8 >/dev/null 2>&1 )
 WD="$(add_worker "$R8" D "fleet/RQ-8")"
 b8="$(intsha "$R8" RQ-8)"
 ( cd "$WD" && printf 'D\n' > d.txt && git add -A && git commit -qm D && "$LAND" RQ-8 --dry-run >/dev/null 2>&1 )

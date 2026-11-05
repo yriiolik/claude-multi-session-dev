@@ -1,298 +1,51 @@
-# fleet 命令手册（按需加载）
+# 命令与回执
 
-SKILL.md 只列「哪些场景有命令可用」；参数、退出码、坑在这里。脚本固定装在
-`~/.claude/skills/multi-session-dev/scripts/`，**从任意 cwd 都用绝对路径调**。
-
-## 选哪一套：Claude 后端 vs Codex 后端
-
-**同一套场景、同一套流程、同一套 RQ/协调目录/回执/集成分支**，只是 worker 跑在哪。
-默认 Claude；用户明确说 codex / codex-app / App 可见时换 Codex。
-
-| 场景 | Claude 后端 | Codex 后端 |
-|---|---|---|
-| 开工取号 | `cc-fleet-init` | 同左（共用） |
-| 解析协调目录 | `cc-fleet-coord` | 同左（共用） |
-| 派发 worker | `cc-dispatch` | `cc-dispatch-codex-app` |
-| 看状态 | `cc-fleet-status` | `cc-fleet-status-codex-app` |
-| 阻塞监视→推送 | `cc-fleet-watch` | `cc-fleet-watch-codex-app` |
-| 读最新快照 | （读最后一条消息） | `cc-fleet-read-codex-app` |
-| 回话/纠偏 | `cc-fleet-reply` | `cc-fleet-reply-codex-app` |
-| 终止 | `cc-fleet-kill` | `cc-fleet-kill-codex-app` |
-| 换新 session 重跑 | `cc-fleet-respawn` | `cc-fleet-respawn --dispatch cc-dispatch-codex-app` |
-| 收回执 | `cc-fleet-summary` | 同左（共用） |
-| worker 落地 | `cc-fleet-land` | 同左（共用） |
-| 终端可视面板 | `claude agents` | `cc-fleet-panel-codex-app`（派发时自动分屏拉起） |
-
-`-codex` 是 `-codex-app` 的短别名，完全等价。Codex 后端的模型路由与后端就绪细节见
-`codex-mode.md`——**日常派发不需要读它，脚本会自己处理**。
-
----
-
-## 开工：取 RQ + 协调目录 + 集成分支
+`FLEET=<本技能绝对路径>/scripts/cc-fleet`，`COORD` 取 init 输出；所有命令都不操作原生线程生命周期。
 
 ```bash
-eval "$(~/.claude/skills/multi-session-dev/scripts/cc-fleet-init)"
-# → $RQ / $COORD / $INT 就绪
-```
-一句 eval 做四件事：GC 删 >7 天旧协调目录、从持久序号池+原子锁取**全新单调 RQ**（永不重号）、
-解析 canonical `$COORD`、建集成分支 `fleet/<RQ>` 并落 `base.ref`。stdout 只吐三行可 eval 的赋值，
-诊断走 stderr。
-
-选项：`--base <branch>`（detached HEAD 必给）/ `--no-init-base`（只要 RQ+COORD）/ `--no-gc` / `--gc-days N`。
-
-> 🚫 **RQ 只能由脚本现场分配，绝不凭「今天日期+NNN」在脑内重构**（真实串台事故见 `pitfalls.md`）。
-> 同一 RQ 的后续批次（契约先行第二批、修复批）**复用本轮 `$RQ`，别重跑 init**——init 会另发新号。
-
-### 序号池是【跨仓库全局】的
-
-RQ 是全机命名空间（worker 名 `↳<模块>@<RQ>`、job 列表、面板都按它认人），所以序号池和
-「RQ→owner 协调目录」注册表放在 **`~/.claude/fleet`**（`CC_FLEET_HOME` 可改，测试用）：
-
-| 路径 | 作用 |
-|------|------|
-| `~/.claude/fleet/.seq/<stem>` | 全局高水位序号（只增不减，目录被 GC 也不回退） |
-| `~/.claude/fleet/registry/<RQ>` | 这个号归谁：owner 仓库 + 协调目录 + 分配时间 |
-
-取号 = `max(本仓目录扫描, 本仓 .seq, 全局 .seq, 全局注册表)` + 1，并**先取全局锁再取本仓锁**，
-所以两个主 session 在**不同仓库同时** `cc-fleet-init` 也各拿各号。全局目录不可写时只告警不阻断，
-退化成旧的「本仓唯一」。
-
-```bash
-cc-fleet-coord --seed-global   # 老仓库升级用：把本仓已有 RQ 灌进全局池 + 注册表（幂等；顺带报出历史撞号）
-```
-每个用过 fleet 的仓库跑一次即可，不跑的话升级后第一次分配仍可能撞上别仓当天已用的号。
-
-## 协调目录
-
-```bash
-cc-fleet-coord <RQ>                       # 解析 canonical 目录 <git-common-dir>/fleet/<RQ>
-cc-fleet-coord <RQ> --no-mkdir            # 只读解析
-cc-fleet-coord <RQ> --fresh               # 防撞：已被往轮 run 占用、或全局注册表显示归别的仓库 → exit 4
-cc-fleet-coord <RQ> --put <rel> [src]     # 把文件落进协调目录（绕开后台 job 的 Write 隔离闸）
+"$FLEET" init --cwd <仓库或子目录> --host codex-app --owner-id <真实主会话ID>
+"$FLEET" prepare --coord "$COORD" --module api --task <绝对任务卡路径> --role developer
+"$FLEET" prepare --coord "$COORD" --module verify --task <验收卡路径> --role verify --phase author
+# solo 也生成卡；主端用 App 原生隔离工作树后 bind，不由 CLI 创建工作树
+"$FLEET" prepare --coord "$COORD" --module main --task <任务卡路径> --self
+"$FLEET" bind --coord "$COORD" --module api --attempt <本轮attempt> --worktree <真实目录>
+"$FLEET" register --coord "$COORD" --module api --session-id <真实ID> --host-id <host> --sidebar-section-id <已核验分区>
+# setup 未完成时，register 改用 --client-thread-id，仅记 pending
+"$FLEET" status --coord "$COORD"
+"$FLEET" validate-receipt --coord "$COORD" --module api --receipt-file <实际回执文件>
+"$FLEET" collect --coord "$COORD" --module api
+"$FLEET" snapshot --coord "$COORD" --file <准备好的唯一当前快照>
+"$FLEET" reply --coord "$COORD" --module api --text-file <本轮纠偏内容> --session reuse
+"$FLEET" reply --coord "$COORD" --module verify --text-file <执行说明> --phase execute --session fresh \
+  --observed-session-id <刚核实的旧真实ID> --observed-state completed
 ```
 
-⚠ **主 session 作为后台 job 时，`Write`/`Edit` 对一切仓库内路径都会被隔离闸拦**（canonical 协调目录
-在 `.git/` 里，同样算仓库内）。固定套路：`Write` 到仓库外的 `$CLAUDE_JOB_DIR/tmp/<file>`，再
-`cc-fleet-coord <RQ> --put <rel> "$CLAUDE_JOB_DIR/tmp/<file>"`。`--prompt-file` 可直接吃 tmp 里的文件。
+reply 的 reuse/auto 返回 promptFile，由主端按当前模型/深度用原生消息投递；接受后 register 同一身份。
+fresh 需主端实际核实旧本轮结束、当前 handoff 存在，随后原生创建并带新 --attempt 登记。
+`--observed-state` 允许 completed/failed/interrupted/stopped；未知、运行中、输入/审批等待不能换新，--force 不能绕过。
+CLI 只检身份与显式终态断言，无法代替宿主读取。fresh 保留模块/worktree/成果与 previousSessions，不停止、归档旧线程。
+auto 为旧原生任务兼容默认复用；主端按阶段决定是否明确 fresh，不按 token 阈值自动选择。
 
-## 派发 worker
+status/collect 默认输出模块、attempt、身份、结论、SHA、测试计数、风险/输入和证据位置；`--details` 才附全量回执/名册。
+`read` 读取本地当前完整回执，没有回执只返回原生定位提示；不从任何旧后端取日志。
+validate-receipt 成功退出0，检测到问题退出1并列全部 errors；参数/环境错误退出2。格式修正不要求重跑有效测试。
+collect 保持 failed/blocked 原结果，保存回执与可找到的 handoff 到 `history/<module>/<attempt>/`。
+新 handoff 路径含 attempt；兼容旧 `<module>.handoff.md` 时须更新时间不早于本轮开始，再记录来源与哈希。
+无 handoff 的旧回执仍可收存并警告，fresh 前必须补齐；不能只留临时 inbox 路径。
+snapshot 归档旧 CURRENT 后原子替换；相同快照幂等。主端另有可写状态目录时沿用同样单快照/历史分离原则。
 
-```bash
-cc-dispatch \
-  --cwd "$(pwd)" \                    # 默认＝主 session 自己的 cwd，勿写死项目名
-  --name "↳<module>@$RQ" \
-  --env FLEET_ROLE=worker --env FLEET_RQ="$RQ" --env FLEET_MODULE=<module> \
-  --env FLEET_BASE_BRANCH="$INT" \
-  --sid-file "$COORD/<module>.sid" \
-  --prompt-file /abs/<完整prompt>.md
-```
+回执 v2 保持 `version,rq,module,attempt,worktree,result,summary,commit,tests,risks,needsInput`。
+done 核验工作树仓库/基线、干净状态及测试；developer 至少一个 passed，回执提交和工作树 HEAD 均须已合入；author 要有提交和脚本证据，
+可以 not-run；最终 verify/integ/regression 所有项 passed，实际 SHA 同时等于工作树与当前集成 HEAD。
+当前 failed/blocked 留 tests；resolved_failures 保存已解决历史失败。机械校验不证明业务覆盖或测试真实性。
 
-- `--sid-file`：**必带**。没有 SID 名册，status 只能靠会变空的 session 名关联 → 已完成却被漏判 → 死等。
-- `--env FLEET_BASE_BRANCH="$INT"`：开发型 worker **必带**（联调/验收/scout 等只读角色可省）。
-- `--cwd`：多项目容器仓库务必指向**项目子目录**而非仓库根，否则 worker 读不到子目录 `CLAUDE.md`。
-- prompt 第一行必须是 `⟦FLEET-WORKER⟧ rq=<RQ> module=<module>`（preamble 模板已含）。
-- **默认不加 `--isolation worktree`**：preamble 已要求 worker 自开隔离 worktree，加了会叠两层。
-- `--join`：同一任务的后续批次；撞到 `exit 6`（复用别任务 RQ 的兜底闸）时才用。
-- **worker 模型 / 思考深度**：默认**不**继承 daemon 默认，而是固定用配置——取值链 `--model/--effort` >
-  `~/.claude/multi-session-dev.json` 的 `worker.{model,effort}` > 内置默认 `claude-opus-5` + `high`。
-  走 daemon 协议本身：flag 拼进 `launch.args`（claude argv）并同步写入 `respawnFlags`（daemon 自动重拉不丢）；
-  ⛔ 不用 `ANTHROPIC_MODEL` / `CLAUDE_CODE_EFFORT_LEVEL` 环境变量（会锁死 worker 的 `/model` `/effort`，且不稳定）。
-  effort 合法值 `low|medium|high|xhigh|max`，非法值或坏配置文件 → `exit 5` 不派发。`--no-worker-defaults`
-  回到旧行为（不带 flag）。派发成功行会回显 `model=… effort=…`。配置文件格式：
-  ```json
-  {"version": 1, "worker": {"model": "claude-opus-5", "effort": "high"},
-                 "spike":  {"model": "claude-fable-5-1", "effort": "xhigh"}}
-  ```
-- **`--profile spike`**（模式 C 打样先行段① 的骨架 worker）：改读配置文件 `spike` 块（内置默认 `claude-fable-5-1` +
-  `xhigh`）。⛔ 模型/深度只按配置档，不按任务卡逐张判断；要换模型改 JSON 不改命令。未知 profile `exit 5`。
-- `--dry-run` 只打印将发的 JSON。
-- 退出码：`2`=daemon 不可达（先 `claude agents --json` 拉起）/ `3`=协议不兼容（见 `PROTOCOL.md`）/ `6`=疑似复用别任务 RQ。
+原生 prepare 只支持 codex/native/inherit，可指定 --subdir。依赖由主端按 CURRENT 推进，不使用 --after/queue-reply。
+stop-guard/rescue-owners 仅为已有全局 hook 保留静默空入口；其余旧后端、面板、daemon 命令已移除。
+本地合入仍用 cc-fleet-land 的 Git CAS；E2E 统一计划在含当前集成版本的工作树执行：
+`cc-fleet-e2e-scope plan "$COORD" --project-dir <项目工作目录>`。计划固定比较 fleet.json 的 baseCommit 与 integrationBranch，
+不以调用目录的 HEAD 代替集成版本；执行测试仍用实际集成版本工作树。范围推导/登记与共享锁保留。
 
-Codex 后端把命令换成 `cc-dispatch-codex-app`，**参数完全一致**；它额外自己处理 worktree 预建、
-三层 CLAUDE.md 注入、App 侧栏可见性、后端就绪自愈。Codex 专有选项：
-`--keep-on-failure`（thread 建失败时保留 worktree 现场，默认自动回滚）、`--raw-prompt`、`--pin-policy`。
-
-结构化布局可批派：`cc-dispatch-batch <RQ>`（自动扫 `tasks/<RQ>/modules/*.md`）——但它**不自动拼
-preamble**，每张卡需自包含。
-
-### 派发后立刻机械验证（漏做＝没派）
-跑 `claude agents`（Codex 用 `cc-fleet-status-codex-app "$RQ"`），逐个模块确认看到 `↳<module>@<RQ>`。
-看不到（或只有一个无名 `source=spare` 的 running 条目）→ **你误用了 `Agent` 工具**，立刻改用 `cc-dispatch` 重派。
-
-### Codex 终端面板（自动分屏，无需你操心）
-
-Codex worker 是 app-server 里的 thread，**永远不会出现在 `claude agents` 里**。所以
-`cc-dispatch-codex-app` 派发成功后会自动做两件事：把本次 `$COORD` 登记进全局注册表（连带记下是哪个
-主 session 派的）、在当前 Ghostty 窗口右侧分屏拉起 `cc-fleet-panel-codex-app`。面板是**全局**的——
-跨 session、跨仓库派发的 worker 都汇总在同一块屏上；全部收工后面板自行退出、分屏随之关闭。
-
-面板按**任务组（RQ）**分组，组标题就是发起这批 worker 的主 session 名字，组内只分未完成（仍在跑：执行中 / 待输入）/ 已完成（其余一切）。栏头带数量与 Claude / Codex 拆分；
-**已完成栏默认折叠成一行汇总**，没落回执的状态（需核验 / 失败 / 已停止…）在汇总行里各自计数，折叠了也看得见：
-
-```
-4 未完成（Claude 2 · Codex 2） · 9 已完成（Claude 3 · Codex 6）
-多会话Codex虚拟OMS上线前检查清单                RQ-2026-0813-002 · qzc  4/6 完成
-  未完成 2 · Codex 2
-   ✳ ↳outbound     执行中 $ bash scripts/run-vitest.sh src/modules/inbound/…   10m
-   ⏳ ↳inbound      待输入 等待 approval / 输入                                 10m
-  ▸ 已完成 4 · Codex 4 · !需核验 1
-```
-
-光标停在汇总行按 `→` / `Enter` / 空格展开（变 `▾`，铺开各 worker 行），再按一次收起；`a` 一键展开 / 收起全部。
-想默认展开就 `--expand-done` 或 `CC_FLEET_PANEL_EXPAND_DONE=1`。
-
-执行中的 `✳` 是动画（和 `claude agents` 一样），detail 列显示 rollout 里最近一条活动（在跑的）或
-回执首行（已完成的）。
-
-```bash
-cc-fleet-panel-codex-app                 # 手动开（全局）
-cc-fleet-panel-codex-app --rq "$RQ"      # 只看一个 RQ
-cc-fleet-panel-open                      # 手动分屏拉起（幂等，已开则复用）
-cc-fleet-panel-open --ratio 0.25         # 面板占原面板 1/4 宽（默认 0.33；0=Ghostty 原生对半）
-cc-fleet-panel-open --close              # 手动关掉面板与分屏
-cc-fleet-panel-open --no-close-split     # 面板退出后保留分屏（默认退出即关，见下）
-cc-fleet-panel-register --list           # 看注册表里有哪些协调目录
-```
-
-面板交互：`↑↓` 选择 · `→` 进详情（汇总行上=展开/收起） · 空格 展开/收起 · `a` 全部展开/收起 · `←` 返回 · `PgUp/PgDn` 翻页 · `End` 跟随最新 · `r` 刷新 · `q` 退出。
-
-面板退出（自动收工 / 按 `q` / `--close`）时**分屏会一并关掉**，不留 "Process exited. Press any key
-to close the terminal."——Ghostty 自己不收 surface，收尾由命令串尾部的 `cc-fleet-panel-close-surface`
-完成。只有面板**异常退出**（退出码非 0）才保留分屏，好让你看见报错。全局关掉这个行为：
-`CC_FLEET_PANEL_CLOSE_SPLIT=0`。细节见 `codex-mode.md`。
-
-详情页读的是 Codex 的 rollout 日志而不是 `thread/read`——后者只给消息级 item，看不到命令与思考
-（实测 27 次命令的 thread 它只返回 3 条）。所以详情里能看到完整的思考 / 每次命令及其输出与退出码 /
-文件改动 / 回执正文。原因与解析细节见 `codex-mode.md`。
-
-面板**只读**，不会替你 resume / unarchive / 改元数据；编排决策仍以 `cc-fleet-status-codex-app` 与
-`cc-fleet-summary` 为准。不想要它：派发加 `--no-panel`，或全局 `export CC_FLEET_PANEL=0`。
-
-## 监控（零轮询，让 harness 推给你）
-
-派完**立刻**把 watch 交给 Claude Code 原生 **Monitor 工具**（`persistent: true`）：
-
-```
-command     = ~/.claude/skills/multi-session-dev/scripts/cc-fleet-watch <RQ>
-description = fleet <RQ> 各模块完成/异常推送
-persistent  = true
-```
-
-watch 阻塞监视，每模块一结束推一行，全部结束推总结并退出（exit 0=无异常 / 3=有持续异常）。
-推送种类：`✅ done` / `✅ 已完成 — 回执在案` / `💤 静默已结束需核验` / `❌ 持续异常` / `⏸ blocked` / ≤4min 心跳。
-
-参数：`--stall-idle`（判静默的空闲秒数，默认 240）/ `--heartbeat` / `--fail-checks`（默认 2 轮才判异常，吸收 API 抖动）/ `--grace` / `--wait`（静默模式，配 Bash `run_in_background` 作独立兜底）。
-
-⚠ `<RQ>` 必须是**本轮的 `$RQ`**，别在 Monitor 的 command 里手敲日期编号（2026-06-09 盯错 RQ 事故）。
-
-点查用 `cc-fleet-status <RQ>`：exit `0`=无在跑无异常 / `1`=进行中 / `2`=daemon 不可达 / `3`=异常终止态。
-`gone`（名册有、daemon 列表无）= 已结束，去收回执，不是「还在跑」。
-
-## 读 worker 最新状态（Codex 专有）
-
-```bash
-cc-fleet-read-codex-app <RQ> <module>          # thread/turn 状态 + 最近命令输出 + 最新回复
-cc-fleet-read-codex-app <RQ> <module> --json   # 稳定摘要
-cc-fleet-read-codex-app <RQ> <module> --raw    # 完整 thread/read 响应
-```
-Claude 后端没有对应命令——直接读它在 FleetView/通知里的最后一条消息。
-
-## 回话 / 纠偏
-
-```bash
-cc-fleet-reply <RQ> <module> "继续，按 X 改"
-```
-等价于在 FleetView 里回它话。worker `tempo=blocked` 等输入、或你要纠偏时用。
-`--short` / `--text-file` / stdin / `--dry-run`。Codex 后端用 `cc-fleet-reply-codex-app`：
-运行中走 `turn/steer`，空闲/已停止走 `turn/start` 新增 turn。
-
-## 终止 / 换新 session 重跑
-
-```bash
-cc-fleet-kill <RQ> <module>            # 只杀进程，不删已落盘回执
-cc-fleet-kill <RQ> --all               # 整个 RQ
-cc-fleet-kill <RQ> <module> --signal SIGKILL
-cc-fleet-kill-codex-app <RQ> --all --archive   # Codex：--archive 才从 App 侧栏隐藏
-```
-
-```bash
-cc-fleet-respawn <RQ> <module> --prompt-file <当初那张任务卡.md>
-```
-⭐ 灰度坏模型自救（见 `pitfalls.md`）：kill 旧 worker + 归档旧回执（防坏 worker 落了 `result:` 被回执
-闩锁误判完成）+ 用同卡另起全新 worker（自动 `--join`），一条原子操作。旧 worker 半成品从未
-`cc-fleet-land`、不进集成分支。**无需重挂 watch**（复用同一 `.sid`）。Codex 加 `--dispatch cc-dispatch-codex-app`。
-
-## 收回执
-
-```bash
-cc-fleet-summary <RQ>
-```
-**多通道兜底**：canonical 协调目录 + 主树 + 所有 git worktree 一起扫，worker 在自己 worktree 里写的
-回执也收得到。某模块 done/gone 但收不到回执 → 直接读它最后一条消息，**别回头死等文件**。
-
-每份回执下面自动附三行**机械核验**（主 session 不读 diff 的替代物）：
-- `🧷 落地核验 ✓ <sha> ∈ fleet/<RQ>   改动统计: N files changed, +a/-b` —— 回执「关键 commit」的 sha 真在集成分支祖先链上；
-  `⛔ 落地核验 ✗` = worker 自述 land 不可信，改动不在 `fleet/<RQ>`（worktree 若已清理则可能已丢），进 Step 5 派 fix 重做。
-- `📄 结果文件 ✓/✗ <path>` —— 回执「测试结果文件」列的落盘路径是否存在；✗ 按未自测处理。
-- 缺 sha / 缺结果文件各有 ⚠ 提示：开发型模块必须补，只读角色可忽略。
-
-## e2e 锁 / 长任务心跳（worker 侧，preamble 已要求）
-
-```bash
-cc-fleet-e2e-lock acquire "$COORD" <module> [--wait 7200] [--stale 5400] [--project-dir DIR] [--mode shared|exclusive]
-                                                                            # 跑 e2e 前抢锁；持有超 stale 秒视为死锁强制回收
-cc-fleet-e2e-lock release "$COORD" <module>                                 # 跑完立刻放（只放自己的）
-cc-fleet-e2e-lock status  "$COORD"                                          # 独占持有者 + 共享持有者
-touch "$COORD/<module>.alive"      # 等 nohup 长任务期间每 ≤3 分钟一次；status 报 aliveAge、watch 视为在跑不判 💤
-```
-退出码：0 成功 / 1 等锁超时（写「需主 session 裁决」，别硬跑）/ 3 release 时锁不是自己的。
-
-## e2e 范围收敛（worker 侧 suggest/record，主端侧 plan）
-
-开发 worker **不跑全量**（一轮几十分钟、吃满 CPU、锁下还堵住别人），只跑改动相关的最小集合；
-跨模块回归由主端在模块全部落地后统一派一张回归卡跑一次。规则见 `delivery-quality.md` §6。
-
-```bash
-# worker：推导本轮该跑哪些 spec（按改动文件反查，剔除无区分度的过宽词干，受预算上限截断）
-cc-fleet-e2e-scope suggest [--project-dir DIR] [--base fleet/<RQ>] [--max 6] [--quiet]
-# worker：跑完登记实际范围（可多次追加），主端据此合成回归集合、避免重复跑
-cc-fleet-e2e-scope record "$COORD" <module> <spec|组名>... [--minutes N] [--cmd "实际命令"]
-# 主端：合成一次性回归集合 = 各 worker 登记 ∪ 集成分支 diff 反推，并给出是否该升级全量的判据
-cc-fleet-e2e-scope plan "$COORD" [--project-dir DIR] [--base REF] [--max 0]
-```
-- `--base` 缺省取 `$FLEET_BASE_BRANCH`；`plan` 另会读 `<COORD>/task.meta` 的 `base_branch`。
-- 建议命令按项目适配：factory 出 `--project=setup --project=group-… --no-deps`（该项目文件过滤不作用于依赖组），
-  virtual-oms 出 `run-all-tests.sh --no-unit --shards …`（分片是最小可跑单位），其余出 spec 路径列表。
-- 输出是**建议**：靠文件名/内容词干匹配，worker 仍要按自己对改动的理解裁一遍（删无关的，⛔ 别反向加成全量）。
-- 退出码：0 正常 / 2 用法错 / 3 环境不满足（非 git 仓库、找不到项目根、COORD 不存在）。
-
-## worker 落地（worker 自己跑，不是主 session）
-
-```bash
-cc-fleet-land <RQ>
-```
-自测绿后把改动安全合入集成分支 `fleet/<RQ>`：CAS + 自动 merge 重试，多 worker 并发落地零丢更新，
-**绝不碰共享分支**。退出码：`7`=冲突（解决后重跑）/ `3`=脏树 / `2`=缺集成分支。
-`--push-backup <module>` 额外推远端备份。
-
-## 显示自愈
-
-`cc-fleet-fix-display <RQ>` / `--all` — 修 FleetView 显示退化三类：名字变 `bg`、时长变 `0s`（已完成 worker）、
-**名字丢 `↳` 变英文短语**（运行中就会发生，CC 2.1.231+ 内建自动取名器抢名）。运行中的 job 只补名字、不动时间戳。
-watch/summary 已自动调用，主会话 SessionStart 也会 `--all` 兜底，通常无需手动。
-
-`cc-fleet-name-guard --short <8hex>|--job-dir <DIR> --name <NAME> [--detach]` — **事前**守住 job 的显示名，
-盯着 `state.json` 一出生就把期望名写进 `.name`，抢在内建自动取名器前面。`cc-dispatch` 派发成功后自动拉起
-（`CC_FLEET_NAME_GUARD=0` 关闭），取名 hook 也会在 state.json 缺失时拉起，**正常流程无需手动跑**。
-两者根因与分层见 `fleet-display.md`。
-
-## Codex 后端维护（一般不用手动跑）
-
-```bash
-cc-codex-ensure                 # 后端就绪自愈：拉起 server / 收陈旧 pid / 配置变更后重启。正常时零输出
-cc-codex-ensure --verbose --json
-cc-codex-doctor                 # 逐项体检报告（人看的）
-cc-codex-session-config show|validate|select <target>   # 切换模型路由（由操作者执行，Agent 只读）
-```
-`cc-dispatch-codex-app` 已在内部自动调用 `cc-codex-ensure`，所以**派发前不需要先跑 doctor**。
-只有在派发报「Codex 后端未就绪」时，才用 `cc-codex-doctor` 看逐项明细。
+bind 若只因协调目录无写权限，会先核验实际仓库、隔离工作树和 attempt，再把 pending binding 写入临时 inbox，
+允许在已核验工作树继续；回执必须填该真实路径，主端 collect 后持久绑定。身份/仓库/基线校验错误不能绕过。
+E2E 锁超过 stale 只报告待核实，不按时间自动删除独占锁或共享登记。主端先原生核实持有者不再操作共享资源，
+再按原 owner 执行 release；不能因等待久就抢锁。

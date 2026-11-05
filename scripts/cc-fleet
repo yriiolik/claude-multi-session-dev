@@ -1,1273 +1,658 @@
 #!/usr/bin/env python3
-"""Cross-client fleet controller. Python stdlib; public CLIs, persistent receipts.
-Native Codex App operations are performed by the host, then registered here.
+"""Codex App native fleet: task cards, isolated worktrees, receipts and handoffs.
+The host owns thread creation, supervision and messaging. No background scheduler.
 """
-import argparse, concurrent.futures, contextlib, datetime, fcntl, glob, json, os, socket
+import argparse
+import contextlib
+import datetime
+import fcntl
+import hashlib
+import json
+import os
 from pathlib import Path
-import re, shlex, subprocess, sys, tempfile, time, uuid
+import re
+import shlex
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
 
 ROOT = Path(__file__).resolve().parent
-sys.path.insert(0, str(ROOT/'lib'))
-import session_ctx  # 上下文「热且小」才复用原会话，否则换新会话靠交接文件续上
-HOSTS =('codex-app', 'codex-cli', 'claude-code')
-TERMINAL = {'done', 'failed', 'blocked', 'stopped', 'needs-review', 'unknown', 'launch-uncertain'}
-STALE_AFTER = int(os.environ.get('CC_FLEET_STALE_AFTER', '600'))  # running with no observable activity
-# Claude worker 这一轮已停、无后台任务、state.json 超过该秒数未更新 → 判定会话已结束（末条漏打 result: 也算）。
-IDLE_GRACE = int(os.environ.get('CC_FLEET_IDLE_GRACE', '60'))
-# reply/复活后 state.json 刷新前的宽限：期间以本轮 activeSince 为准，仍视为 running。
-REPLY_GRACE = int(os.environ.get('CC_FLEET_REPLY_GRACE', '180'))
-JOBS_DIR = Path(os.environ.get('CLAUDE_JOBS_DIR', str(Path.home()/'.claude'/'jobs')))
-CLAUDE_STATES = {'done':'needs-review','failed':'failed','blocked':'blocked','stopped':'stopped','working':'running'}
-# 未派发/不派发的名册状态：prepared=待主端派发；queued=依赖满足后由编排器自动派发；self=主 session 自己开发的 worktree。
-NOT_LAUNCHED = ('prepared','queued','self','setting-up','launching','launch-uncertain','stopped')
-# 同一模块的人工 reply（纠偏/回修）超过该轮数须 --force：反复返工说明需求/契约/环境有问题，要先停下核对。
+ACCEPT_ROLES = ('verify', 'integ', 'regression')
 MAX_REPLIES = int(os.environ.get('CC_FLEET_MAX_REPLIES', '3'))
-ACCEPT_ROLES = ('verify','integ','regression')
-SETTLED = ('done','failed','blocked','needs-review')  # 这一轮已结束、可以接收下一条消息
-# Codex goal：app-server worker 的交付标准挂成线程目标，本轮提前停下时 Codex 自动续跑，直到模型自判完成/受阻或预算耗尽。
-# 关闭：CC_FLEET_CODEX_GOAL=0 或 fleet.json codexGoal=false；预算：CC_FLEET_CODEX_GOAL_BUDGET 或 fleet.json codexGoalBudget（token，0=不限）。
-GOAL_GRACE = int(os.environ.get('CC_FLEET_GOAL_GRACE', '90'))  # 上一轮收尾后等自动续跑开轮的宽限
-GOAL_STATES = {'blocked':'blocked','usageLimited':'blocked','budgetLimited':'needs-review','paused':'needs-review','complete':'needs-review'}
-GOAL_HINTS = {'blocked':'worker 判定同一阻塞反复出现并把目标标为 blocked，先 read 看阻塞原因',
-              'usageLimited':'账号用量上限，目标暂停；额度恢复后 reply 续上',
-              'budgetLimited':'目标 token 预算耗尽，自动续跑已停；read 核对进度后 reply（会重新激活目标）',
-              'paused':'目标被暂停（多半是用户在 Codex App 里接手了这个会话），先 read 再决定',
-              'complete':'worker 自判目标完成但没有本轮回执，先 read 核实'}
+NATIVE_SETTINGS_ACTION = ('Resolve model and thinking from the current parent session, preserving the full '
+    'provider-qualified model ID. Apply explicit conversation overrides field by field. '
+    'Pass both as native tool arguments; nativeSettings={} is unresolved, not App defaults. ')
 
-def run(argv, cwd=None, timeout=45, check=True, input=None, env=None):
-    p = subprocess.run([str(x) for x in argv], cwd=cwd, input=input, text=True, env=env,
-                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+
+def run(argv, cwd=None, check=True):
+    p = subprocess.run([str(x) for x in argv], cwd=cwd, text=True, capture_output=True, timeout=45)
     if check and p.returncode:
-        # CLI errors may contain authentication configuration; don't dump raw logs.
-        raise RuntimeError(f'{Path(str(argv[0])).name} {argv[1] if len(argv)>1 else ""} failed (exit {p.returncode})')
+        raise ValueError(f'{Path(str(argv[0])).name} {argv[1] if len(argv)>1 else ""} failed (exit {p.returncode})')
     return p
 
+
 def git(cwd, *args):
-    return run(['git', '-C', str(cwd), *args]).stdout.strip()
+    return run(['git', '-C', cwd, *args]).stdout.strip()
+
 
 def emit(obj):
     print(json.dumps(obj, ensure_ascii=False, indent=2), flush=True)
 
-def atomic(path, obj):
-    path = Path(path); path.parent.mkdir(parents=True, exist_ok=True)
+
+def atomic_text(path, text):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix='.' + path.name, dir=path.parent)
     try:
         with os.fdopen(fd, 'w') as f:
-            json.dump(obj, f, ensure_ascii=False, indent=2); f.write('\n')
-            f.flush(); os.fsync(f.fileno())
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, path)
     finally:
-        if os.path.exists(tmp): os.unlink(tmp)
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def atomic(path, obj):
+    atomic_text(path, json.dumps(obj, ensure_ascii=False, indent=2) + '\n')
+
 
 def name(value):
-    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,95}', value):
+    if not isinstance(value, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,95}', value):
         raise ValueError('RQ/module must use letters, digits, dot, underscore or hyphen (max 96)')
     return value
 
+
+def meta(c):
+    return json.loads((c/'fleet.json').read_text())
+
+
 def coord(value):
-    p = Path(value).expanduser().resolve()
-    if not (p/'fleet.json').is_file(): raise ValueError('not a v2 coordination directory')
-    return p
+    c = Path(value).expanduser().resolve()
+    f = meta(c)
+    if f.get('version') != 2:
+        raise ValueError('not a v2 coordination directory')
+    if f.get('owner', {}).get('host') != 'codex-app':
+        raise ValueError('this skill supports Codex App native sessions only')
+    return c
 
-def inbox(c,d):
-    f=meta(c)
-    root=Path(f.get('inboxRoot',str(Path(tempfile.gettempdir())/'fleet-v2-inbox'/f['rq'])))
-    return root/(d['module']+'-'+d['attempt']+'.receipt.json')
 
-def meta(c): return json.loads((c/'fleet.json').read_text())
-def record(c, m): return c/'v2'/f'{name(m)}.json'
-def load(c, m): return json.loads(record(c,m).read_text())
+def record(c, m):
+    return c/'v2'/f'{name(m)}.json'
+
+
+def load(c, m):
+    d = json.loads(record(c, m).read_text())
+    if d.get('backend') != 'codex' or d.get('transport') not in ('native', 'self'):
+        raise ValueError('legacy backend/transport removed; use the pre-update backup for old RQs')
+    return d
+
 
 @contextlib.contextmanager
 def lock(c, m):
-    p = c/'v2'; p.mkdir(exist_ok=True)
+    p = c/'v2'
+    p.mkdir(exist_ok=True)
     with (p/f'.{name(m)}.lock').open('a') as f:
-        fcntl.flock(f, fcntl.LOCK_EX); yield
+        fcntl.flock(f, fcntl.LOCK_EX)
+        yield
 
-def update(c, m, **fields):
-    with lock(c,m):
-        d=load(c,m); d.update(fields); atomic(record(c,m),d); return d
 
-def call(method, params, start=False, timeout=35):
-    argv=[os.environ.get('CODEX_APP_CALL_BIN', str(ROOT/'cc-codex-app-call'))]
-    if start: argv+=['--start-app-server']
-    argv+=['--timeout-ms', str(max(1000, (timeout-2)*1000)), method, '-']
-    return json.loads(run(argv, input=json.dumps(params), timeout=timeout).stdout)
+def native_settings():
+    if json.loads((ROOT.parent/'native-codex.json').read_text()) != {'inherit': 'parent'}:
+        raise ValueError('native-codex.json requires inherit=parent')
+    return {}
 
-_SERVER=None; _SERVER_AT=0.0
-SERVER_TTL = int(os.environ.get('CC_FLEET_SERVER_TTL', '600'))  # await 一挂几小时，期间 Codex 可能已自动更新
-def codex_server(restart=True):
-    """派 Codex worker 前让 daemon 跟上本机已安装的 Codex（Codex 自动更新后 daemon 仍是旧版 → 无进行中 turn 时重启），
-    App 没开就后台启动，并带回两边版本与「Codex App 是另一个 app-server」的事实。结果缓存 SERVER_TTL 秒；
-    失败不阻断派发（thread/start 会给出真实错误）。"""
-    global _SERVER, _SERVER_AT
-    if _SERVER is not None and restart and time.time()-_SERVER_AT<SERVER_TTL: return _SERVER
-    if os.environ.get('CC_FLEET_CODEX_ENSURE','1')=='0': _SERVER={}; _SERVER_AT=time.time(); return _SERVER
-    argv=[os.environ.get('CC_CODEX_ENSURE_BIN',str(ROOT/'cc-codex-ensure')),'--skip-routing','--json']+(['--allow-restart','--start-app'] if restart else [])
-    p=run(argv,timeout=150,check=False)
-    try: j=json.loads(p.stdout.strip().splitlines()[-1])
-    except (ValueError, IndexError): j={'warnings':[f'cc-codex-ensure 输出不可解析（rc={p.returncode}）']}
-    sv=j.get('servers') or {}
-    out=dict(daemon=(sv.get('daemon') or {}).get('version'),installed=(sv.get('installed') or {}).get('version'),
-             app=(sv.get('app') or {}).get('version'),actions=j.get('actions'),warnings=j.get('warnings'),appNote=sv.get('appNote'))
-    if not j.get('ok',False) and j.get('error'): out['error']=j['error']
-    out={k:v for k,v in out.items() if v}
-    if restart: _SERVER=out; _SERVER_AT=time.time()
-    return out
 
-def server(a):
-    """只读查看：fleet 用的 daemon、本机安装、Codex App 内置 codex 的版本与告警（不重启）。"""
-    emit(codex_server(restart=False))
+def clean_subdir(value):
+    value = (value or '').strip()
+    if value in ('', '.'):
+        return ''
+    if Path(value).is_absolute() or '..' in Path(value).parts:
+        raise ValueError('subdir must be relative inside the repository')
+    return Path(value).as_posix().rstrip('/')
 
-def permission_params(d, turn=False):
-    # Explicit user preference for fleet workers; legacy records adopt the new default.
-    if d.get('permissions', 'full') == 'inherit': return {}
-    return dict(approvalPolicy='never', **({'sandboxPolicy': {'type': 'dangerFullAccess'}}
-                                         if turn else {'sandbox': 'danger-full-access'}))
-
-def default_backend(host):
-    # 2026-10-30 用户要求：所有主端默认 Codex；能力不足不能静默换后端。
-    return 'codex'
-
-def clean_subdir(s):
-    s=(s or '').strip().strip('/')
-    if s in ('','.'): return ''
-    if Path(s).is_absolute() or '..' in Path(s).parts: raise ValueError('subdir must be relative inside the repository')
-    return Path(s).as_posix()
 
 def toplevel(p):
-    return str(Path(git(Path(p).resolve(),'rev-parse','--show-toplevel')).resolve())
+    return Path(git(Path(p).resolve(), 'rev-parse', '--show-toplevel')).resolve()
 
-def worktree_path(fleet, m):
-    # 不放 .git 内：Vite 等默认拒绝服务 **/.git/** 的文件；放仓库 .claude/worktrees 下沿用 Claude 目录信任。
-    return Path(fleet['repo'])/'.claude'/'worktrees'/f"fleet-{fleet['rq']}-{m}"
 
-def exclude_worktrees(fleet):
-    if run(['git','-C',fleet['repo'],'check-ignore','-q','.claude/worktrees/probe'],check=False).returncode==0: return
-    ex=Path(fleet['commonDir'])/'info'/'exclude'; ex.parent.mkdir(parents=True,exist_ok=True)
-    with ex.open('a') as f: f.write('\n.claude/worktrees/\n')
+def inbox(c, d):
+    root = Path(meta(c).get('inboxRoot', str(Path(tempfile.gettempdir())/'fleet-v2-inbox'/meta(c)['rq'])))
+    return root/f"{d['module']}-{d['attempt']}.receipt.json"
 
-def route(fleet):
-    # Claude 主端显式派 Codex 时的固定路由；never send an OpenAI model to a third-party provider.
-    if fleet['owner']['host']=='claude-code':
-        return dict(active='claude-main-gpt6-low',mode='fixed',model='gpt-6-astra',
-                    modelProvider='openai',reasoningEffort='low',providerType='openai')
-    return json.loads(run([ROOT/'cc-codex-session-config','resolve','--json']).stdout)
+
+def handoff_path(c, d, fallback=False):
+    parent = inbox(c, d).parent if fallback else c
+    return parent/f"{d['module']}-{d['attempt']}.handoff.md"
+
+
+def archive_dir(c, d):
+    return c/'history'/d['module']/d['attempt']
+
 
 def init(a):
-    repo=Path(git(a.cwd,'rev-parse','--show-toplevel')).resolve()
-    common=Path(git(repo,'rev-parse','--path-format=absolute','--git-common-dir')).resolve()
-    base=a.base or git(repo,'symbolic-ref','--short','HEAD')
-    sha=git(repo,'rev-parse','--verify',base+'^{commit}')
-    # 主 session 所在子目录（多项目仓库的子项目）；worker 默认在自己 worktree 的同一子目录启动，才能加载该目录规则。
-    try: subdir=clean_subdir(Path(a.cwd).resolve().relative_to(repo).as_posix())
-    except ValueError: subdir=''
-    rq=name(a.rq or ('RQ-'+datetime.datetime.now().strftime('%Y%m%d-%H%M%S')+'-'+uuid.uuid4().hex[:8]))
-    c=common/'fleet'/rq
-    c.mkdir(parents=True,exist_ok=False)
-    try: git(repo,'branch','fleet/'+rq,sha)
+    repo = toplevel(a.cwd)
+    common = Path(git(repo, 'rev-parse', '--path-format=absolute', '--git-common-dir')).resolve()
+    base = a.base or git(repo, 'symbolic-ref', '--short', 'HEAD')
+    sha = git(repo, 'rev-parse', '--verify', base+'^{commit}')
+    subdir = clean_subdir(Path(a.cwd).resolve().relative_to(repo).as_posix())
+    rq = name(a.rq or 'RQ-'+datetime.datetime.now().strftime('%Y%m%d-%H%M%S')+'-'+uuid.uuid4().hex[:8])
+    c = common/'fleet'/rq
+    c.mkdir(parents=True, exist_ok=False)
+    try:
+        git(repo, 'branch', 'fleet/'+rq, sha)
     except Exception:
-        c.rmdir(); raise
-    # Claude Code 注入的是 CLAUDE_CODE_SESSION_ID；只认 CLAUDE_SESSION_ID 会让主 session 身份一直取不到、面板判不了主 session 是否已退出
-    owner_id=a.owner_id or (os.environ.get('CODEX_THREAD_ID') if a.host.startswith('codex') else (os.environ.get('CLAUDE_CODE_SESSION_ID') or os.environ.get('CLAUDE_SESSION_ID')))
-    identity_source='session' if owner_id else 'generated-controller'
-    owner_id=owner_id or ('controller-'+uuid.uuid4().hex)
-    d=dict(version=2,rq=rq,repo=str(repo),commonDir=str(common),subdir=subdir,base=base,baseCommit=sha,
-           integrationBranch='fleet/'+rq,codexTransport='native-only',inboxRoot=str((Path(tempfile.gettempdir())/'fleet-v2-inbox'/rq).resolve()),owner={'host':a.host,'id':owner_id,'identitySource':identity_source},createdAt=time.time())
-    atomic(c/'fleet.json',d); (c/'base.ref').write_text(base+'\n')
-    # 建组即登记面板：任何后端/传输（含 native）、无论本 session 开不开分屏，全局面板都看得到这个任务组。
-    panel_register(c,rq)
-    emit(dict(d,coord=str(c),uncommittedChangesExcluded=bool(git(repo,'status','--porcelain'))))
+        c.rmdir()
+        raise
+    owner = a.owner_id or os.environ.get('CODEX_THREAD_ID')
+    d = dict(version=2, rq=rq, repo=str(repo), commonDir=str(common), subdir=subdir,
+        base=base, baseCommit=sha, integrationBranch='fleet/'+rq, codexTransport='native-only',
+        inboxRoot=str((Path(tempfile.gettempdir())/'fleet-v2-inbox'/rq).resolve()),
+        owner=dict(host='codex-app', id=owner or 'controller-'+uuid.uuid4().hex,
+                   identitySource='session' if owner else 'generated-controller'), createdAt=time.time())
+    atomic(c/'fleet.json', d)
+    atomic_text(c/'base.ref', base+'\n')
+    emit(dict(d, coord=str(c), uncommittedChangesExcluded=bool(git(repo, 'status', '--porcelain'))))
 
-def handoff_path(c,d,fallback=False):
-    if fallback: return inbox(c,d).parent/(d['module']+'.handoff.md')
-    return c/(d['module']+'.handoff.md')
 
-def preamble(c,d):
-    # 只放本任务独有的数据与不可推导的边界；项目规则交给客户端按启动目录自动加载的 CLAUDE.md / AGENTS.md。
-    fleet=meta(c); role=d['role']; rq=fleet['rq']
-    if d['transport']=='native':
-        where=(f"写文件或 Git 元数据前先用 App 原生 list_artifacts 核对隔离 worktree；没有合适工作树时用 "
-               f"create_worktree(ref={fleet['integrationBranch']}, sourceRoot={fleet['repo']}, allowAsync=true) 创建并附加，"
-               '有 operationId 则用 get_worktree_creation_status 等完成。不得在主 checkout 开发。'
-               f"显式使用返回的工作目录；已有隔离工作树基线不符时，确认干净后 git switch --detach {fleet['integrationBranch']}"
-               +(f"，再 cd {d['subdir']}" if d.get('subdir') else '')+'。切换后显式读取工作树根到当前子目录适用的 AGENTS.md / CLAUDE.md，不假定 App 重新加载了规则。')
-    else:
-        where=f"工作目录 {d['cwd']}（worktree 根 {d['worktree']}），不在主 checkout 改文件。"
-    if d.get('permissions')=='inherit': where+='Git 元数据写入需审批时用宿主审批工具申请，无通道则报 blocked。'
-    if role=='developer':
-        duty=f"developer：只在范围内开发，按用例自测并留证据，提交后运行 {shlex.quote(str(ROOT/'cc-fleet-land'))} {rq}。"
-    else:
-        duty=f'{role}：不改业务代码、不提交合回。'
-        if d.get('phase')=='author':
-            duty+=('当前是【编写阶段】：开发与你并行进行，实现尚未合入。只依据原始需求、用户用例与契约编写页面验收脚本、'
-                   '造数夹具和逐例检查清单（选择器/接口按契约与现有页面约定，未定的记为待执行时确认），在本 worktree 提交，不 land；'
-                   '不要等待实现、不跑依赖新功能的验收。完成即回执 done（tests 可 not-run，evidence 写 spec 路径与用例映射）。'
-                   '依赖合入后编排器会自动发来「执行阶段」消息，届时再在最新集成基线上执行。')
-        elif role in ('verify','integ'):
-            duty+=('在含全部改动的集成版本上用真实页面先连续跑核心主流程，再逐项验证适用分支/异常、幂等和事务；'
-                   'API/单测或 mock 自家业务 API 不能替代页面验收，纯接口/CLI 需求记录不适用理由；'
-                   '逐例记录操作、结果、截图或 trace 路径、基线 SHA/环境。')
-        if role=='regression':
-            duty+=('本 RQ 的成批 e2e 只由你这一张卡跑一次（开发 worker 各自只跑了改动相关的几条）：'
-                   '在集成基线上持独占 e2e 锁，按任务卡给定的回归集合一次跑完，结果落盘文件；'
-                   '任务卡没写「全量」就不要自行跑项目全量入口，失败逐条回报现象指向哪个模块。')
-    # 测试范围纪律：worker 各跑一遍全量是多 session 最大的隐性成本（几十分钟 + 吃满 CPU + e2e 锁下互相排队）。
-    cq=shlex.quote(str(c)); mq=d['module']
-    scope_bin=shlex.quote(str(ROOT/'cc-fleet-e2e-scope')); lock_bin=shlex.quote(str(ROOT/'cc-fleet-e2e-lock'))
-    if role=='scout': testing=''
-    elif role=='regression':
-        testing=(f'跑前 {lock_bin} acquire {cq} {mq} --mode exclusive、跑完 release；按任务卡给定的回归集合一次跑完并落盘结果，'
-                 f'任务卡没写「全量」就不跑项目全量入口。\n')
-    else:
-        testing=(f'测试只跑本卡改动相关的最小集合（范围见任务卡「E2E 范围」，缺则 {scope_bin} suggest 推导后裁剪；'
-                 f'≤6 spec 且 ≤15 分钟，超预算的写进 risks 交回归卡）；⛔ 不跑项目全量 e2e 入口，'
-                 f'跨模块回归由主 session 统一派 regression 卡跑一次。跑 e2e 前后 {lock_bin} acquire/release {cq} {mq}，'
-                 f'跑完 {scope_bin} record {cq} {mq} <spec…> 登记范围。\n')
-    return f'''⟦FLEET-WORKER⟧ rq={rq} module={d['module']} role={role} backend={d['backend']}
-你是独立 worker：不加载 multi-session-dev 编排技能、不再派发 worker，只做任务卡授权的范围。主 session：{fleet['owner']['id']}。
-协调目录 {c}；任务身份 {d['attempt']}（回执 attempt 须一致）；集成分支 {fleet['integrationBranch']}。
-{where}
-开工先运行 {shlex.quote(str(ROOT/'cc-fleet'))} bind --coord {shlex.quote(str(c))} --module {d['module']} --worktree "$PWD"；协调目录只读致失败时不阻断，回执里写真实 worktree。
-规则以启动目录适用的 CLAUDE.md / AGENTS.md 为准（客户端已按目录自动加载）；AGENTS.md 只是指针时按指针读取对应文件；任务涉及其他子项目时先读该子目录的规则文件。
-{duty}
-{testing}禁止 reset --hard、推远端、合回共享分支、删除或清理 worktree；范围/权限问题写 blocked 回执并说明所需输入。
-开工及压缩恢复后先读任务卡引用的原始需求、用户用例、契约（及本次参考资料）；实现/验收卡缺用例或必需输入时报告缺项，不自行缩减需求。
-失败如实写 tests.result=failed 且 result=failed/blocked，不藏进 risks、不改 not-run、不删断言；只做了计划不能报 done。
-每轮完成先覆写交接文件 {handoff_path(c,d)}（≤80 行：环境与坑、结论及 SHA、未关闭项），再把下列 JSON 原子写到 {c/(d['module']+'.receipt.json')}（tmp+rename）；该目录不可写就 mkdir -p 后改写 {inbox(c,d)} 及同目录交接文件；最后回复同一 JSON。
-{{"version":2,"rq":"{rq}","module":"{d['module']}","attempt":"{d['attempt']}","worktree":"worktree 根绝对路径","result":"done|failed|blocked","summary":"真实完成内容/问题","commit":"开发提交或实际验收的完整 SHA，scout 可空","tests":[{{"command":"实际执行的检查","result":"passed|failed|blocked|not-run","evidence":"结果文件路径或简短输出"}}],"risks":[],"needsInput":[]}}
-\n任务卡：\n'''
+def preamble(c, d):
+    f = meta(c)
+    fleet_bin = shlex.quote(str(ROOT/'cc-fleet'))
+    cq, mq = shlex.quote(str(c)), shlex.quote(d['module'])
+    bound = ('复用已绑定隔离工作树 '+d['worktree']+'；保留已有提交和未提交资产，不在其它工作树重做。'
+             if d.get('worktree') else
+             f"写入前用 App 原生 list_artifacts 核对隔离工作树；需要时 create_worktree(ref={f['integrationBranch']}, "
+             f"sourceRoot={f['repo']}, allowAsync=true)，有 operationId 就等待创建完成。不得在主 checkout 开发。")
+    return f'''⟦FLEET-WORKER⟧ rq={f['rq']} module={d['module']} role={d['role']} backend=codex
+你是独立 worker，不再编排子 session。只做本任务卡授权范围。
+先读稳定协议 {ROOT.parent/'reference'/'worker.md'}；开工/压缩恢复按协议重读原始需求、用例、契约和适用项目规则。
+协调目录：{c}；attempt：{d['attempt']}；集成分支：{f['integrationBranch']}；阶段：{d.get('phase') or 'implement'}。
+{bound}
+工作子目录：{d.get('subdir') or '.'}；显式读取工作树根到该目录适用的 AGENTS.md 及其指向的规则。
+在实际 worktree 运行：{fleet_bin} bind --coord {cq} --module {mq} --attempt {d['attempt']} --worktree "$PWD"
+协调目录不可写时，回执写真实 worktree，使用下列临时路径；不要为写回执扩大权限。
+先覆写交接文件 {handoff_path(c,d)}；不可写则用 {handoff_path(c,d,True)}。
+原子写回执 {c/(d['module']+'.receipt.json')}；不可写则用 {inbox(c,d)}。
+用 {fleet_bin} validate-receipt --coord {cq} --module {mq} --receipt-file '<实际回执路径>' 一次检查全部问题，修正后再报告。
+最后只回复同一 JSON；回执模板：
+{{"version":2,"rq":"{f['rq']}","module":"{d['module']}","attempt":"{d['attempt']}","worktree":"隔离工作树绝对路径","result":"done|failed|blocked","summary":"本轮实际结果","commit":"完整提交或验收SHA","tests":[{{"command":"实际检查","result":"passed|failed|blocked|not-run","evidence":"证据路径或简短输出"}}],"risks":[],"needsInput":[]}}
+
+任务卡：
+'''
+
 
 def prepare(a):
-    c=coord(a.coord); fleet=meta(c); m=name(a.module)
-    a.backend=a.backend or default_backend(fleet['owner']['host'])
-    transport=a.transport
-    if transport=='auto': transport='native' if a.backend=='codex' else 'claude-bg'
-    permissions=a.permissions or ('inherit' if transport=='native' else 'full')
-    if a.self_dev: transport='self'
-    if transport=='app-server' and fleet.get('codexTransport')=='native-only':
-        raise ValueError('new Codex tasks require native Codex App tools; app-server is retained only for existing legacy RQs')
-    if (a.backend=='claude' and transport!='claude-bg') or (a.backend=='codex' and transport not in ('native','app-server')):
-        if transport!='self': raise ValueError('backend/transport mismatch')
-    if transport=='native' and fleet['owner']['host']!='codex-app':
-        raise ValueError('Codex mode requires native Codex App tools; continue in Codex App or explicitly select --backend claude')
-    if transport=='native' and permissions=='full':
-        raise ValueError('native Codex tasks inherit App permissions; configure access in the App, not through app-server')
-    subdir=clean_subdir(fleet.get('subdir','') if a.subdir is None else a.subdir)
-    if subdir and run(['git','-C',fleet['repo'],'cat-file','-e',f"{fleet['integrationBranch']}:{subdir}"],check=False).returncode:
-        raise ValueError(f'subdir not found on integration branch: {subdir}')
-    after=[name(x) for x in re.split(r'[,\s]+',a.after or '') if x]
-    if a.self_dev:
-        if a.role!='developer' or after: raise ValueError('--self is a developer worktree for the main session; no --after')
-        transport='self'
-    if a.phase and a.role not in ('verify','integ'): raise ValueError('--phase only applies to verify/integ')
-    if transport=='native' and after:
-        raise ValueError('native dependencies are advanced by the host with create_thread/send_message_to_thread; record the graph in the controller, do not switch transports')
-    for x in after:
-        if x==m or not record(c,x).exists(): raise ValueError(f'--after module not registered: {x}')
-    task=Path(a.task).resolve().read_text() if a.task else ''
-    if not task.strip() and not a.self_dev: raise ValueError('empty task card')
-    with lock(c,m):
-        if record(c,m).exists(): raise ValueError('module already registered; use reply, or a new fix module')
-        d=dict(version=2,module=m,backend=a.backend,transport=transport,role=a.role,permissions=permissions,
-               attempt=uuid.uuid4().hex,state='self' if a.self_dev else ('queued' if after else 'prepared'),
-               name=f'↳{m}@{fleet["rq"]}',createdAt=time.time(),after=after,phase=a.phase,profile=a.profile,replies=0,
-               sessionId=None,shortId=None,worktree=None,branch=None,subdir=subdir,cwd=None,
-               baselineCommit=git(fleet['repo'],'rev-parse',fleet['integrationBranch']))
-        if transport!='native':
-            wt=worktree_path(fleet,m); exclude_worktrees(fleet)
-            branch=f'fleet-worker/{fleet["rq"]}/{m}'
-            git(fleet['repo'],'worktree','add','-b',branch,str(wt),fleet['integrationBranch'])
-            d.update(worktree=str(wt),branch=branch,cwd=str(wt/subdir) if subdir else str(wt))
-        atomic(record(c,m),d)
-        if a.self_dev:
-            emit(dict(d,coord=str(c),integrationBranch=fleet['integrationBranch'],
-                      next=f"主 session 在 {d['cwd']} 开发、提交后运行 {ROOT/'cc-fleet-land'} {fleet['rq']}；独立验收照常派 verify 卡")); return
-        prompt=preamble(c,d)+task
-        (c/f'{m}.prompt.md').write_text(prompt)
-    emit(dict(d,coord=str(c),promptFile=str(c/f'{m}.prompt.md'),integrationBranch=fleet['integrationBranch']))
+    c = coord(a.coord)
+    f, m = meta(c), name(a.module)
+    native_settings()  # validate before mutating the roster
+    if a.after:
+        raise ValueError('native dependencies belong in CURRENT; the host advances them after verified receipts')
+    if a.phase and a.role not in ('verify', 'integ'):
+        raise ValueError('--phase only applies to verify/integ')
+    if a.self_dev and a.role != 'developer':
+        raise ValueError('--self requires developer role')
+    subdir = clean_subdir(f.get('subdir', '') if a.subdir is None else a.subdir)
+    if subdir and run(['git', '-C', f['repo'], 'cat-file', '-e', f"{f['integrationBranch']}:{subdir}"], check=False).returncode:
+        raise ValueError('subdir not found on integration branch')
+    task = Path(a.task).resolve().read_text() if a.task else ''
+    if not task.strip():
+        raise ValueError('empty task card')
+    with lock(c, m):
+        if record(c, m).exists():
+            raise ValueError('module already registered; use reply')
+        d = dict(version=2, module=m, backend='codex', transport='self' if a.self_dev else 'native',
+            role=a.role, permissions='inherit', attempt=uuid.uuid4().hex,
+            state='self' if a.self_dev else 'prepared', name=f"↳{m}@{f['rq']}", createdAt=time.time(),
+            phase=a.phase, replies=0, sessionId=None, shortId=None, hostId=None, worktree=None,
+            branch=None, subdir=subdir, cwd=None, baselineCommit=git(f['repo'], 'rev-parse', f['integrationBranch']))
+        atomic(record(c, m), d)
+        atomic_text(c/f'{m}.task.md', task)
+        atomic_text(c/f'{m}.prompt.md', preamble(c, d)+task)
+    emit(dict(d, coord=str(c), integrationBranch=f['integrationBranch'], promptFile=str(c/f'{m}.prompt.md'),
+        nativeSettings=native_settings(), nativeSettingsPolicy='inherit-parent',
+        nextAction=NATIVE_SETTINGS_ACTION+('Use an App native isolated worktree, bind it, then develop here.' if a.self_dev else
+            'Call create_thread with the complete promptFile; immediately move each real thread to the resolved 子 session section, verify, then register.')))
+
+
+def check_attempt(a, d):
+    if getattr(a, 'attempt', None) and a.attempt != d['attempt']:
+        raise ValueError('stale attempt')
+    if d.get('previousSessions') and not getattr(a, 'attempt', None):
+        raise ValueError('--attempt required after fresh session handoff')
+
+
+def verify_worktree(c, d, value):
+    f, wt = meta(c), toplevel(value)
+    if wt == Path(f['repo']).resolve():
+        raise ValueError('worker must not use primary checkout')
+    if Path(git(wt, 'rev-parse', '--path-format=absolute', '--git-common-dir')).resolve() != Path(f['commonDir']).resolve():
+        raise ValueError('wrong repository')
+    if d.get('worktree') and Path(d['worktree']).resolve() != wt:
+        raise ValueError('worktree already bound elsewhere')
+    if run(['git', '-C', wt, 'merge-base', '--is-ancestor', d['baselineCommit'], 'HEAD'], check=False).returncode:
+        raise ValueError('worktree lacks prepared integration baseline')
+    return wt
+
 
 def bind(a):
-    # worker 在子项目目录启动，$PWD 可能是子目录；一律规整到 worktree 根。
-    c=coord(a.coord); f=meta(c); wt=Path(toplevel(a.worktree))
-    if wt==Path(f['repo']).resolve(): raise ValueError('worker must not use primary checkout')
-    if Path(git(wt,'rev-parse','--path-format=absolute','--git-common-dir')).resolve()!=Path(f['commonDir']): raise ValueError('wrong repository')
-    # Require the full current integration baseline, not simply a branch with a familiar name.
-    d=load(c,a.module)
-    if run(['git','-C',wt,'merge-base','--is-ancestor',d['baselineCommit'],'HEAD'],check=False).returncode:
-        raise ValueError('worker does not contain integration baseline')
-    if d.get('worktree') and Path(d['worktree']).resolve()!=wt: raise ValueError('worktree already bound elsewhere')
-    branch=git(wt,'rev-parse','--abbrev-ref','HEAD')
-    if d.get('worktree')==str(wt) and d.get('branch')==branch:
-        emit(d); return
-    emit(update(c,a.module,worktree=str(wt),branch=branch,cwd=str(wt/d['subdir']) if d.get('subdir') else str(wt)))
+    c = coord(a.coord)
+    def bound_record():
+        d = load(c, a.module)
+        check_attempt(a, d)
+        wt = verify_worktree(c, d, a.worktree)
+        d.update(worktree=str(wt), branch=git(wt, 'rev-parse', '--abbrev-ref', 'HEAD'),
+                 cwd=str(wt/d['subdir']) if d.get('subdir') else str(wt))
+        return d
+    try:
+        with lock(c, a.module):
+            d = bound_record()
+            atomic(record(c, a.module), d)
+    except PermissionError:
+        # A read-only coordination mount must not block isolated development.
+        # Still validate repository, worktree and attempt; defer only persistence.
+        d = bound_record()
+        path = inbox(c, d).with_suffix('.binding.json')
+        atomic(path, dict(rq=meta(c)['rq'], module=d['module'], attempt=d['attempt'],
+                          worktree=d['worktree'], branch=d['branch'], baselineCommit=d['baselineCommit']))
+        d.update(bindingPending=True, bindingFile=str(path),
+                 nextAction='Continue only in this verified worktree; put its real path in the receipt so collect can bind it durably')
+    emit(d)
+
 
 def register(a):
-    c=coord(a.coord); d=load(c,a.module)
-    if d['transport']!='native': raise ValueError('register is for native App tasks')
-    # clientThreadId represents pending setup, never a callable threadId.
-    if a.client_thread_id:
-        if d.get('sessionId'): raise ValueError('real threadId is already registered; do not replace it with a clientThreadId')
-        if a.sidebar_section_id: raise ValueError('sidebar placement requires a real threadId')
-        fields=dict(clientThreadId=a.client_thread_id,state='setting-up')
-        if a.host_id: fields['hostId']=a.host_id
-        emit(update(c,a.module,**fields)); return
-    if d.get('sessionId') and d['sessionId']!=a.session_id: raise ValueError('task already has a different threadId')
-    host_id=a.host_id or d.get('hostId') or 'local'
-    if d.get('sessionId') and d.get('hostId') and d['hostId']!=host_id: raise ValueError('task already belongs to a different host')
-    fields=dict(sessionId=a.session_id,hostId=host_id,state='running',clientThreadId=None)
-    if a.sidebar_section_id:
-        fields['sidebar']=dict(state='placed',sectionId=a.sidebar_section_id,source='codex-app-native')
-    emit(sidebar_attach(c,update(c,a.module,**fields)))
+    c = coord(a.coord)
+    with lock(c, a.module):
+        d = load(c, a.module)
+        check_attempt(a, d)
+        if d['transport'] != 'native':
+            raise ValueError('register requires a native worker')
+        if a.client_thread_id:
+            if d.get('sessionId') or a.sidebar_section_id:
+                raise ValueError('pending clientThreadId cannot replace real identity or prove sidebar placement')
+            if d.get('clientThreadId') and d['clientThreadId'] != a.client_thread_id:
+                raise ValueError('a different setup is already pending; reconcile instead of creating again')
+            d.update(clientThreadId=a.client_thread_id, state='setting-up')
+            if a.host_id:
+                d['hostId'] = a.host_id
+        else:
+            if d.get('sessionId') and d['sessionId'] != a.session_id:
+                raise ValueError('task already has a different threadId')
+            host = a.host_id or d.get('hostId') or 'local'
+            if d.get('hostId') and d['hostId'] != host:
+                raise ValueError('task already belongs to a different host')
+            if any(x.get('sessionId') == a.session_id and x.get('hostId', 'local') == host for x in d.get('previousSessions', [])):
+                raise ValueError('cannot register the retired thread as the fresh session')
+            d.update(sessionId=a.session_id, hostId=host, clientThreadId=None, state='running')
+            if a.sidebar_section_id:
+                d['sidebar'] = dict(state='placed', sectionId=a.sidebar_section_id, source='codex-app-native')
+            else:
+                d['sidebar'] = d.get('sidebar') or dict(state='pending', source='codex-app-native')
+        atomic(record(c, a.module), d)
+    emit(d)
 
-def workdir(d): return d.get('cwd') or d['worktree']
-def claude_bin(): return os.environ.get('CLAUDE_CLI_PATH','claude')
-def claude_jobs():
-    obj=json.loads(run([claude_bin(),'agents','--json','--all']).stdout)
-    if not isinstance(obj,list): raise ValueError('unsupported Claude agents JSON schema')
-    return obj
 
-def goal_enabled(c, d):
-    if d.get('backend')!='codex' or d.get('transport')!='app-server' or not d.get('sessionId'): return False
-    return os.environ.get('CC_FLEET_CODEX_GOAL','1')!='0' and meta(c).get('codexGoal',True) is not False
-
-def goal_attach(c, m, d):
-    """turn/start/steer 之后挂目标：先挂会让空闲线程自己按短目标开跑一轮，与任务卡那轮抢跑。挂不上不影响派发。"""
-    if not goal_enabled(c,d): return d
-    budget=int(os.environ.get('CC_FLEET_CODEX_GOAL_BUDGET') or meta(c).get('codexGoalBudget') or 0)
-    obj=(f"完成 fleet 任务卡 {c/(m+'.prompt.md')}（模块 {m}，attempt {d['attempt']}）及本线程后续消息：按卡开发/执行、自测，"
-         f"需要合入的 commit 用 cc-fleet-land 合入集成分支，再写好 attempt 为 {d['attempt']} 的回执 {c/(m+'.receipt.json')}"
-         f"（协调目录不可写时写临时回执 {inbox(c,d)}）。回执写好才算完成，随即把目标标为完成；"
-         '按规则判定为 blocked 时先写 result=blocked 的回执再标 blocked。')
+def receipt_errors(c, d, r):
+    """Collect all independently detectable schema/evidence errors; never launch anything."""
+    if not isinstance(r, dict):
+        return ['receipt must be a JSON object']
+    errors = []
+    for k, v in dict(version=2, rq=meta(c)['rq'], module=d['module'], attempt=d['attempt']).items():
+        if r.get(k) != v:
+            errors.append(f'{k}: stale or mismatched value')
+    if r.get('result') not in ('done', 'failed', 'blocked'):
+        errors.append('result: use done/failed/blocked')
+    if not isinstance(r.get('summary'), str) or not r['summary'].strip():
+        errors.append('summary: required nonempty string')
+    for k in ('risks', 'needsInput'):
+        if not isinstance(r.get(k, []), list):
+            errors.append(f'{k}: must be a list')
+    tests = r.get('tests')
+    if not isinstance(tests, list) or (r.get('result') == 'done' and not tests):
+        errors.append('tests: verification evidence list required')
+        tests = []
+    for i, t in enumerate(tests):
+        if not isinstance(t, dict):
+            errors.append(f'tests[{i}]: must be an object')
+            continue
+        if not isinstance(t.get('command'), str) or not t['command'].strip():
+            errors.append(f'tests[{i}].command: required')
+        if t.get('result') not in ('passed', 'failed', 'blocked', 'not-run'):
+            errors.append(f'tests[{i}].result: invalid')
+        if not t.get('evidence'):
+            errors.append(f'tests[{i}].evidence: required')
+    if r.get('result') != 'done':
+        return errors
+    if any(not isinstance(t, dict) or t.get('result') not in ('passed', 'not-run') for t in tests):
+        errors.append('done contains failed/blocked/invalid current checks')
+    accept = d['role'] in ACCEPT_ROLES and d.get('phase') != 'author'
+    if accept and any(not isinstance(t, dict) or t.get('result') != 'passed' for t in tests):
+        errors.append('acceptance has unexecuted verification')
+    if d['role'] == 'developer' and not any(isinstance(t, dict) and t.get('result') == 'passed' for t in tests):
+        errors.append('developer has no passing verification')
+    wt = None
     try:
-        g=call('thread/goal/set',dict(threadId=d['sessionId'],objective=obj,status='active',origin='user',
-                                      **({'tokenBudget':budget} if budget>0 else {})))['goal']
-        res=dict(state='attached',attempt=d['attempt'],tokenBudget=g.get('tokenBudget'))
-    except Exception as e:
-        res=dict(state='unavailable',reason=f'{type(e).__name__}: {e}'[:200])
-    return update(c,m,goal=res)
+        if not r.get('worktree') and not d.get('worktree'):
+            raise ValueError('missing independent worktree')
+        wt = verify_worktree(c, d, r.get('worktree') or d['worktree'])
+    except (ValueError, OSError, subprocess.TimeoutExpired) as e:
+        errors.append(str(e))
+    sha = r.get('commit', '')
+    if accept or d['role'] == 'developer' or d.get('phase') == 'author':
+        if not isinstance(sha, str) or not re.fullmatch(r'[a-f0-9]{40,64}', sha):
+            errors.append('missing full commit SHA')
+        else:
+            f = meta(c)
+            if d['role'] == 'developer':
+                if run(['git', '-C', f['repo'], 'merge-base', '--is-ancestor', sha, f['integrationBranch']], check=False).returncode:
+                    errors.append('commit not landed on integration branch')
+                if wt and run(['git', '-C', wt, 'merge-base', '--is-ancestor', sha, 'HEAD'], check=False).returncode:
+                    errors.append('commit not present in worker worktree')
+                if wt and run(['git', '-C', f['repo'], 'merge-base', '--is-ancestor', git(wt, 'rev-parse', 'HEAD'), f['integrationBranch']], check=False).returncode:
+                    errors.append('worktree HEAD not landed on integration branch')
+            if accept and (not wt or sha != git(wt, 'rev-parse', 'HEAD') or sha != git(f['repo'], 'rev-parse', f['integrationBranch'])):
+                errors.append('acceptance baseline changed; reverify current integration')
+            if d.get('phase') == 'author' and wt and sha != git(wt, 'rev-parse', 'HEAD'):
+                errors.append('author commit does not match worktree HEAD')
+    if wt and git(wt, 'status', '--porcelain'):
+        errors.append('done worktree has uncommitted changes; evidence must match committed version')
+    return errors
 
-def goal_pause(c, d):
-    """停/换会话时暂停目标：active 目标会在 resume、daemon 重启后恢复续跑，被停的 worker 不能自己复活。"""
-    if goal_enabled(c,d) and (d.get('goal') or {}).get('state')=='attached':
-        with contextlib.suppress(Exception): call('thread/goal/set',dict(threadId=d['sessionId'],status='paused',origin='user'))
 
-def goal_close(c, d, r):
-    """收到本轮有效回执即关目标：worker 写完回执常不标完成，放着会再续跑一轮、整段上下文重读一遍。每个 attempt 只关一次。"""
-    g=d.get('goal') or {}
-    if not goal_enabled(c,d) or g.get('state')!='attached' or g.get('closed')==d['attempt']: return
-    with contextlib.suppress(Exception):
-        call('thread/goal/set',dict(threadId=d['sessionId'],status='complete' if r.get('result')=='done' else 'paused',origin='user'))
-        update(c,d['module'],goal=dict(g,closed=d['attempt']))
-
-def goal_status(c, d, out, turns):
-    """用目标状态细化 Codex 运行态；回执仍是唯一交付凭据，目标 complete 也只到 needs-review。"""
-    if not goal_enabled(c,d) or (d.get('goal') or {}).get('state')!='attached': return
-    with contextlib.suppress(Exception):
-        g=call('thread/goal/get',dict(threadId=d['sessionId'])).get('goal')
-        if not g: return
-        out['goal']={k:g.get(k) for k in ('status','tokensUsed','tokenBudget','timeUsedSeconds')}
-        gs=g.get('status'); last=turns[-1] if turns else {}
-        if out['state']!='needs-review': return  # 还在跑或已失败/中断，目标状态只作展示
-        if gs=='active' and last.get('status')=='completed' and time.time()-float(last.get('completedAt') or 0)<GOAL_GRACE:
-            out['state']='running'  # 上一轮刚收尾，目标会自动续跑下一轮
-        elif gs in GOAL_STATES:
-            out['state']=GOAL_STATES[gs]; out['goalHint']=GOAL_HINTS[gs]
-
-def sidebar_attach(c, d):
-    """Use server-owned sections, never private desktop UI state or worker prompts."""
-    if d.get('backend') != 'codex' or not d.get('sessionId'): return d
-    if d.get('transport')=='native':
-        if (d.get('sidebar') or {}).get('state')=='placed': return d
-        return update(c,d['module'],sidebar=dict(state='pending',source='codex-app-native',
-            nextAction='Use list_threads + move_thread_to_sidebar_section for the unique 子 session section; then register --sidebar-section-id'))
-    if d.get('hostId', 'local') != 'local':
-        result = dict(state='pending', reason='remote host requires its own app-server connection')
-    else:
+def read_receipt(c, d, explicit=None):
+    paths = [Path(explicit)] if explicit else [c/(d['module']+'.receipt.json'), inbox(c, d)]
+    invalid = None
+    for p in paths:
+        if not p.is_file():
+            continue
         try:
-            sections=[]; cursor=None; seen=set()
-            while True:
-                page=call('threadSection/list', dict(limit=100, **({'cursor':cursor} if cursor else {})))
-                sections.extend(page['data']); cursor=page.get('nextCursor')
-                if not cursor: break
-                if cursor in seen: raise ValueError('repeated section cursor')
-                seen.add(cursor)
-            matches=[x for x in sections if x.get('name')=='子 session']
-            if len(matches)!=1: raise ValueError('expected one existing 子 session section')
-            section_id=matches[0]['id']
-            previous=d.get('sidebar', {})
-            if previous.get('state')=='placed' and previous.get('sectionId')==section_id:
-                return d
-            call('thread/section/move', dict(threadId=d['sessionId'],sectionId=section_id))
-            result=dict(state='placed',sectionId=section_id)
-        except Exception as e:
-            result=dict(state='pending',reason=str(e))
-    return update(c,d['module'],sidebar=result)
+            r = json.loads(p.read_text())
+            errors = receipt_errors(c, d, r)
+        except (ValueError, OSError, subprocess.TimeoutExpired) as e:
+            r, errors = {}, [str(e)]
+        if not errors:
+            return r, p, []
+        # A stale persistent file must not hide the current attempt's valid inbox receipt.
+        if invalid is None or (isinstance(r, dict) and r.get('attempt') == d['attempt']):
+            invalid = (r, p, errors)
+    return invalid or (None, None, [])
 
-def panel_register(c, rq, no_owner=False):
-    """登记面板全局注册表。与分屏开关无关、总是做：面板是全机一块，别的主 session 已开着的面板要看得到本任务组；
-    CC_FLEET_PANEL=0 只表示「本 session 不开分屏」。幂等（刷新 lastSeen 与 owner.meta），尽力而为，失败不影响编排。"""
-    bin_=os.environ.get('CC_FLEET_PANEL_REGISTER_BIN',str(ROOT/'cc-fleet-panel-register'))
-    try: return run([bin_,str(c),rq,*(['--no-owner'] if no_owner else [])],timeout=30,check=False).returncode==0
-    except Exception: return False
 
-def panel_attach(c, d, auto=False):
-    """CLI 旧任务登记全局注册表；只有 Claude 路径保留自动面板。
-    Codex（含旧 app-server）不打开终端，native 不走这里。
-    CC_FLEET_PANEL=0 关闭 Claude 自动面板但保留登记；失败不影响派发。"""
-    if d.get('transport') not in ('app-server','claude-bg'): return None
-    fleet=meta(c)
-    # 编排器自动派发可能跑在 watchdog（rescue-owners）进程里：不能以它的身份改写主端归属，也不在别处拉分屏。
-    out=dict(registered=panel_register(c,fleet['rq'],no_owner=auto),panelOpened=None)
-    # Codex workers never open a terminal surface, including legacy app-server RQs.
-    if d.get('backend')=='codex' or auto or os.environ.get('CC_FLEET_PANEL')=='0': return out
-    bin_=os.environ.get('CC_FLEET_PANEL_OPEN_BIN',str(ROOT/'cc-fleet-panel-open'))
-    try: out['panelOpened']=run([bin_,'--quiet'],timeout=30,check=False,env=dict(os.environ,CC_FLEET_PANEL_CWD=fleet['repo'])).returncode==0
-    except Exception: out['panelOpened']=False
+def validate_receipt(a):
+    c = coord(a.coord)
+    d = load(c, a.module)
+    r, path, errors = read_receipt(c, d, a.receipt_file)
+    if r is None:
+        errors = ['no receipt found']
+    emit(dict(valid=not errors, module=d['module'], attempt=d['attempt'], receiptFile=str(path) if path else None, errors=errors))
+    if errors:
+        raise SystemExit(1)
+
+
+def compact(c, d, r=None, path=None, errors=()):
+    state = ('needs-review' if errors else r['result']) if r is not None else (
+        d['state'] if d['state'] in ('prepared', 'setting-up', 'self', 'replying') else 'unknown')
+    out = dict(module=d['module'], role=d['role'], attempt=d['attempt'], state=state,
+               sessionId=d.get('sessionId'), hostId=d.get('hostId'), worktree=d.get('worktree'))
+    if r is not None and isinstance(r, dict):
+        out.update(summary=str(r.get('summary', ''))[:600], commit=r.get('commit'),
+            tests={k:sum(isinstance(t, dict) and t.get('result') == k for t in (r.get('tests') if isinstance(r.get('tests'), list) else []))
+                   for k in ('passed', 'failed', 'blocked', 'not-run')},
+            risks=r.get('risks', []), needsInput=r.get('needsInput', []), receiptFile=str(path) if path else None)
+    if errors:
+        out['validationErrors'] = list(errors)
+    if state == 'unknown':
+        out['nextAction'] = 'Use wait_threads for runtime state; no verified receipt yet'
     return out
 
-def profile_of(d,conf,explicit=None):
-    """显式 --profile > prepare 登记的 profile > 回归卡优先用 runner（只跑测试读结果，用便宜模型）> worker。"""
-    if explicit: return explicit
-    if d.get('profile'): return d['profile']
-    return 'runner' if d.get('role')=='regression' and 'runner' in conf else 'worker'
-
-def refresh_baseline(c,d):
-    """worktree 在 prepare 时按当时的集成分支建立；排队卡要等依赖合入后才派发。worker 还没动过 worktree 时
-    快进到集成分支最新提交，否则回归/验收会跑在不含依赖改动的旧基线上。"""
-    wt=d.get('worktree')
-    if not wt or not Path(wt).is_dir(): return
-    fleet=meta(c); tip=git(fleet['repo'],'rev-parse',fleet['integrationBranch'])
-    if tip==d['baselineCommit'] or git(wt,'rev-parse','HEAD')!=d['baselineCommit'] or git(wt,'status','--porcelain'): return
-    git(wt,'merge','--ff-only','-q',tip); d['baselineCommit']=tip
-
-def dispatch(a):
-    emit(launch(coord(a.coord),a.module,a.profile))
-
-def launch(c,m,profile=None,auto=False):
-    with lock(c,m):
-        d=load(c,m)
-        if d['state']=='self': raise ValueError('self module is developed by the main session; nothing to dispatch')
-        if d['state'] not in ('prepared','queued'): raise ValueError('already attempted; inspect/reconcile before retrying')
-        if d['transport']=='native':
-            return dict(d,nextAction='Use list_projects + create_thread, register the real threadId/hostId (or clientThreadId while pending), then move_thread_to_sidebar_section for 子 session.',promptFile=str(c/f'{m}.prompt.md'))
-        d['state']='launching'
-        if auto: d['autoDispatchedAt']=time.time()
-        refresh_baseline(c,d)
-        atomic(record(c,m),d)
-    d=start_session(c,m,d,(c/f'{m}.prompt.md').read_text(),profile)
-    return dict(d,panel=panel_attach(c,d,auto),nextWake=wake_hint(c))
-
-def start_session(c,m,d,prompt,profile=None,exclude=()):
-    """在 d 的 worktree 起一个新会话并落盘身份。exclude：换会话时排除旧会话（同名同目录的旧 job 仍在列表里）。"""
-    try:
-        if d['transport']=='claude-bg':
-            args=[claude_bin(),'--bg','--name',d['name']]
-            if d.get('permissions','full')=='full': args+=['--dangerously-skip-permissions']
-            # Existing backend config remains authoritative; no model-name substitution.
-            conf=Path(os.environ.get('CLAUDE_FLEET_CONFIG',str(Path.home()/'.claude/multi-session-dev.json')))
-            allp=json.loads(conf.read_text()) if conf.exists() else {}
-            profile=allp.get(profile_of(d,allp,profile),{})
-            if profile:
-                for field in ('model','effort'):
-                    if profile.get(field): args+=['--'+field,str(profile[field])]
-            # 只作展示（面板详情页的模型行）；不参与 reply/路由。
-            d['claudeProfile']={k:str(profile[k]) for k in ('model','effort') if profile.get(k)}
-            args += [prompt]
-            # 在子项目目录启动：Claude 按启动目录向上加载 CLAUDE.md，根目录启动会漏掉子项目规则。
-            p=run(args,cwd=workdir(d),timeout=55,check=False)
-            # Reconcile through public JSON, not localized launch output or session-name prefixes.
-            hits=[j for j in claude_jobs() if j.get('name')==d['name'] and j.get('id') not in exclude
-                  and Path(j.get('cwd','/')).resolve()==Path(workdir(d)).resolve()]
-            if len(hits)!=1 or not hits[0].get('id'):
-                raise RuntimeError('launch outcome uncertain; inspect claude agents --json --all; do not redispatch')
-            j=hits[0]; d.update(shortId=j['id'],sessionId=j.get('sessionId'),state='running',activeSince=time.time())
-        else:
-            routing=route(meta(c)); d['routing']=routing
-            d['codexServer']=codex_server()
-            # Apply fleet permission preference explicitly at thread and turn boundaries.
-            # Codex 只加载 git 根到 cwd 路径上的 AGENTS.md，cwd 必须是子项目目录。
-            params=dict(cwd=workdir(d),ephemeral=False,serviceName='multi-session-dev-v2',threadSource='user')
-            if routing.get('model'): params['model']=routing['model']
-            if routing.get('modelProvider'): params['modelProvider']=routing['modelProvider']
-            if routing.get('providerType')=='deepseek': params['serviceTier']=None
-            params.update(permission_params(d))
-            res=call('thread/start',params,start=True)
-            d['sessionId']=res['thread']['id']
-            # Persist ID before any subsequent RPC; a failed reply must never duplicate this thread.
-            update(c,m,sessionId=d['sessionId'],routing=routing)
-            call('thread/name/set',dict(threadId=d['sessionId'],name=d['name']))
-            turn=dict(threadId=d['sessionId'],cwd=workdir(d),input=[dict(type='text',text=prompt)])
-            if routing.get('reasoningEffort'): turn['effort']=routing['reasoningEffort']
-            if routing.get('providerType')=='deepseek': turn.update(serviceTier=None,summary='none')
-            turn.update(permission_params(d, turn=True))
-            res=call('turn/start',turn); d.update(state='running',turnId=res['turn']['id'],startedAt=time.time(),activeSince=time.time())
-        # Preserve a concurrently written bind/worktree update.
-        d=update(c,m,**{k:v for k,v in d.items() if k not in ('module','worktree','branch')})
-        d=goal_attach(c,m,d)
-        # 记录先落盘再开面板：面板第一次扫描就能看到这个 worker。
-        return sidebar_attach(c,d)
-    except Exception:
-        update(c,m,state='launch-uncertain')
-        raise
-
-def receipt(c,d):
-    p=c/(d['module']+'.receipt.json')
-    if not p.exists(): p=inbox(c,d)
-    if not p.exists(): return None
-    r=json.loads(p.read_text())
-    if any(r.get(k)!=v for k,v in [('version',2),('rq',meta(c)['rq']),('module',d['module']),('attempt',d['attempt'])]):
-        return dict(result='needs-review',summary='stale or mismatched receipt')
-    if r.get('result') not in ('done','failed','blocked') or not r.get('summary'):
-        return dict(result='needs-review',summary='invalid receipt')
-    if r['result']=='done':
-        wt=r.get('worktree') or d.get('worktree')
-        if wt and Path(wt).is_dir():
-            with contextlib.suppress(RuntimeError): wt=toplevel(wt)
-        f=meta(c)
-        if not wt or Path(wt).resolve()==Path(f['repo']).resolve():
-            return dict(result='needs-review',summary='missing independent worktree')
-        if d.get('worktree') and Path(wt).resolve()!=Path(d['worktree']).resolve():
-            return dict(result='needs-review',summary='receipt worktree does not match registry')
-        if Path(git(wt,'rev-parse','--path-format=absolute','--git-common-dir')).resolve()!=Path(f['commonDir']):
-            return dict(result='needs-review',summary='receipt belongs to another repository')
-        if run(['git','-C',wt,'merge-base','--is-ancestor',d['baselineCommit'],'HEAD'],check=False).returncode:
-            return dict(result='needs-review',summary='worktree lacks prepared integration baseline')
-        if not isinstance(r.get('tests'),list) or not r['tests']:
-            return dict(result='needs-review',summary='missing verification evidence')
-        if any(not isinstance(t,dict) or t.get('result') not in ('passed','not-run') or not t.get('evidence') for t in r['tests']):
-            return dict(result='needs-review',summary='invalid or failed verification evidence')
-        accept=d['role'] in ACCEPT_ROLES and d.get('phase')!='author'  # 编写阶段只交脚本与清单，不算验收
-        if accept and any(t.get('result')!='passed' for t in r['tests']):
-            return dict(result='needs-review',summary='acceptance has unexecuted verification')
-        if accept:
-            sha=r.get('commit','')
-            if not re.fullmatch('[a-f0-9]{40,64}',sha):
-                return dict(result='needs-review',summary='missing tested commit')
-            if sha!=git(wt,'rev-parse','HEAD') or sha!=git(f['repo'],'rev-parse',f['integrationBranch']):
-                return dict(result='needs-review',summary='acceptance baseline changed; reverify current integration')
-        if d['role']=='developer':
-            if not any(t.get('result')=='passed' for t in r['tests']):
-                return dict(result='needs-review',summary='developer has no passing verification')
-            sha=r.get('commit','')
-            if not re.fullmatch('[a-f0-9]{40,64}',sha): return dict(result='needs-review',summary='missing commit')
-            f=meta(c)
-            if run(['git','-C',f['repo'],'merge-base','--is-ancestor',sha,f['integrationBranch']],check=False).returncode:
-                return dict(result='needs-review',summary='commit not landed on integration branch')
-    return r
-
-def mtime(p):
-    try: return Path(p).stat().st_mtime
-    except (OSError, TypeError): return 0.0
-
-def last_activity(c,d):
-    """Filesystem proof of life. Backend status words keep saying 'working' after a session
-    already exited (a worker whose final message lacked `result:` never flips to done), so a
-    running claim is only trusted while something it would have touched is still moving.
-    The roster record itself is excluded: reply() writes it, which would fake activity."""
-    m=d['module']; ts=[mtime(c/(m+x)) for x in ('.alive','.summary.md','.receipt.json','.prompt.md')]
-    if d.get('worktree'):
-        ts.append(mtime(Path(d['worktree'])/'.git'))
-        with contextlib.suppress(Exception):
-            ts.append(float(git(d['worktree'],'log','-1','--format=%ct')))
-    if d.get('backend')=='claude' and d.get('shortId'):
-        j=JOBS_DIR/d['shortId']; ts.append(mtime(j/'state.json'))
-        with contextlib.suppress(Exception):
-            ts.append(mtime(json.loads((j/'state.json').read_text()).get('linkScanPath')))
-    with contextlib.suppress(Exception):
-        ts.append(mtime(inbox(c,d)))
-    return max(ts)
-
-def stale_check(c,d,out,stale_after):
-    """Annotate a running module that has shown no observable activity for too long."""
-    launched=out.pop('_launchedAt',0.0)
-    if out['state']!='running' or stale_after<=0: return out
-    seen=max(last_activity(c,d), float(d.get('activeSince') or d.get('startedAt') or 0), launched)
-    out['lastActivityAt']=seen or None
-    out['idleFor']=int(time.time()-seen) if seen else None
-    if seen and out['idleFor']>stale_after:
-        out['attention']='stalled'
-        out['attentionHint']=('backend still claims running but nothing moved for '
-                              f"{out['idleFor']}s; verify with read/worktree HEAD before replying "
-                              '(an exited session accepts no reply)')
-    return out
-
-def job_state(short):
-    with contextlib.suppress(Exception):
-        return json.loads((JOBS_DIR/short/'state.json').read_text())
-    return None
-
-def iso_ts(v):
-    with contextlib.suppress(Exception):
-        return datetime.datetime.fromisoformat(str(v).replace('Z','+00:00')).timestamp()
-    return 0.0
-
-def claude_ended(d,j,out):
-    """`claude agents` 的 state 在会话结束后可能一直停在 working（进程被回收后列表不刷新、末条漏打
-    `result:`），主端据此会死等到 stalled 兜底。job 自己的 state.json 与进程存活才是事实：
-    - state.json 已是终态 → 以它为准；
-    - 列表里没有 pid/status → 进程已退出；
-    - 本轮已停（tempo≠active）、无后台任务、state.json 超过 IDLE_GRACE 未更新 → 这一轮已结束且没人会再唤醒它。
-    后两种按 needs-review 报，交主端 read 核实，不再冒充 running。"""
-    js=job_state(d['shortId']) or {}
-    since=float(d.get('repliedAt') or 0)  # 只看 reply：dispatch 后 state.json 本就会很快刷新；updatedAt 只精确到秒，留 1 秒容差
-    if since and js and iso_ts(js.get('updatedAt'))+1<since and time.time()-since<REPLY_GRACE:
-        return  # state.json 还停在上一轮：刚发出的 reply / 复活尚未反映，别把新一轮误判成已结束（reply 后 await 秒退）
-    if CLAUDE_STATES.get(js.get('state')) not in (None,'running'):
-        out['state']=CLAUDE_STATES[js['state']]; out['backendState']=js['state']
-    if out['state']!='running': return
-    reason=None
-    if 'pid' not in j and 'status' not in j: reason='process-exited'
-    elif js and js.get('tempo')!='active' and not (js.get('inFlight') or {}).get('tasks') \
-            and time.time()-iso_ts(js.get('updatedAt'))>IDLE_GRACE:
-        reason='turn-ended-without-result'
-    if reason:
-        out.update(state='needs-review',attention=reason,
-                   attentionHint='worker 会话已不在工作（backend 仍报 working），先 read 核实结果再决定收回执或开 fix 卡')
-
-def status_one(c,d,jobs=None,stale_after=0):
-    out={k:d.get(k) for k in ('module','backend','transport','sessionId','shortId','state','worktree')}
-    for k in ('after','phase','queuedReply'):
-        if d.get(k): out[k]=d[k]
-    if d.get('sessionId') and d.get('transport') in ('claude-bg','app-server'):
-        x=context_of(c,d)  # 下一条回复会复用还是换新会话，主端/面板一眼可见
-        if x: out['context']={k:x[k] for k in ('tokens','idleFor','compactions','reuse','why')}
-    try:
-        r=receipt(c,d)
-        if r: out.update(state=r['result'],receipt=r); goal_close(c,d,r); return out
-        if d['state'] in NOT_LAUNCHED: return out
-        if d['transport']=='native':
-            out.update(state='unknown',nextAction='Use wait_threads or read_thread with the registered threadId and hostId; no verified receipt yet')
-            return out
-        if d['backend']=='claude':
-            j=next((x for x in (claude_jobs() if jobs is None else jobs) if x.get('id')==d['shortId']),None)
-            if j is None: out['state']='unknown'; return out
-            st=j.get('state'); out['backendState']=st; out['waitingFor']=j.get('waitingFor')
-            out['_launchedAt']=float(j.get('startedAt') or 0)/1000  # ms; floor for staleness
-            out['state']=CLAUDE_STATES.get(st,'unknown')
-            claude_ended(d,j,out)
-        else:
-            t=call('thread/read',dict(threadId=d['sessionId'],includeTurns=True))['thread']
-            st=t.get('status',{}); st=st if isinstance(st,dict) else {'type':st}
-            flags=str(st.get('activeFlags',[])).lower()
-            out['state']='blocked' if any(x in flags for x in ('waiting','approval','input')) else {'active':'running','idle':'needs-review','notLoaded':'needs-review','systemError':'failed'}.get(st.get('type'),'unknown')
-            turns=t.get('turns',[])
-            if turns and turns[-1].get('status') in ('failed','interrupted'):
-                out['state']='failed' if turns[-1]['status']=='failed' else 'stopped'
-            goal_status(c,d,out,turns)
-    except Exception as e:
-        out.update(state='unknown',error=type(e).__name__)
-    return stale_check(c,d,out,stale_after)
-
-def statuses(c,stale_after=STALE_AFTER):
-    ds=[json.loads(p.read_text()) for p in sorted((c/'v2').glob('*.json')) if not p.name.startswith('.')]
-    jobs=[]
-    if any(d['backend']=='claude' for d in ds):
-        try: jobs=claude_jobs()
-        except Exception: jobs=[]
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-        return list(pool.map(lambda d:status_one(c,d,jobs,stale_after),ds))
 
 def status(a):
-    rows=statuses(coord(a.coord),a.stale_after)
-    emit({'jobs':rows,'stalled':[r['module'] for r in rows if r.get('attention')=='stalled']})
+    c = coord(a.coord)
+    jobs = []
+    for p in sorted((c/'v2').glob('*.json')):
+        if p.name.startswith('.'):
+            continue
+        d = load(c, p.stem)
+        r, path, errors = read_receipt(c, d)
+        out = compact(c, d, r, path, errors)
+        if a.details:
+            out.update(record=d, receipt=r)
+        jobs.append(out)
+    emit(dict(jobs=jobs))
+
 
 def read(a):
-    c=coord(a.coord); d=load(c,a.module); r=receipt(c,d)
-    if r and not a.logs: emit(r); return
-    if d['transport']=='native':
-        emit(dict(sessionId=d.get('sessionId'),hostId=d.get('hostId'),nextAction='Use read_thread for native Codex tasks')); return
-    if d['backend']=='claude': print(run([claude_bin(),'logs',d['shortId']]).stdout)
-    else: emit(call('thread/read',dict(threadId=d['sessionId'],includeTurns=True)))
-
-def reply(a):
-    c=coord(a.coord); text=Path(a.text_file).read_text()
-    emit(send_reply(c,a.module,text,force=a.force,phase=a.phase,manual=True,session=a.session))
-
-def claude_send(d,text):
-    """经 daemon 给 Claude worker 投递一条消息。done 会话空闲约 10 分钟会被 watchdog 回收（ENOJOB）：
-    此时用 job 的 state.json 原地 resume 复活（同一 short/sessionId、上下文还在），再投递——回修交回原会话，
-    不必新开 fix 卡重新冷启动。"""
-    r=daemon_call(dict(op='reply',short=d['shortId'],text=text))
-    if r.get('ok'): return False
-    js=job_state(d['shortId'])
-    if r.get('code')!='ENOJOB' or not js: raise RuntimeError(f"reply {d['shortId']} rejected: {r.get('code')} {r.get('error')}")
-    revive(d['shortId'],js)
-    r=daemon_call(dict(op='reply',short=d['shortId'],text=text))
-    if not r.get('ok'): raise RuntimeError(f"reply {d['shortId']} after revive rejected: {r.get('code')} {r.get('error')}")
-    return True
-
-def context_of(c,d):
-    """会话当前上下文体量（见 lib/session_ctx.py）；测不到返回 None。"""
-    try:
-        if d.get('backend')=='claude':
-            js=job_state(d['shortId']) if d.get('shortId') else None
-            p=session_ctx.claude_transcript(d.get('sessionId'),workdir(d) if d.get('cwd') or d.get('worktree') else '',
-                                            (js or {}).get('linkScanPath',''))
-        else: p=session_ctx.codex_rollout(d.get('sessionId'))
-        if not p: return None
-        x=session_ctx.measure(p,'claude' if d.get('backend')=='claude' else 'codex',c/'v2'/'.ctx-cache.json')
-        reuse,why=session_ctx.decide(x)
-        return dict(x,idleFor=int(time.time()-x['lastAt']) if x.get('lastAt') else None,reuse=reuse,why=why)
-    except Exception:
-        return None
-
-def rotate(c,m,d,text,why,ctx):
-    """换新会话：停掉旧会话，同一 worktree、同一任务卡起新会话，靠交接文件与 worktree 现状续上。"""
-    if d['backend']=='claude' and d.get('shortId'):
-        with contextlib.suppress(Exception): run([claude_bin(),'stop',d['shortId']],timeout=30,check=False)
-    goal_pause(c,d)
-    prev=list(d.get('previousSessions') or [])+[dict(sessionId=d.get('sessionId'),shortId=d.get('shortId'),
-              transcript=(ctx or {}).get('path'),reason=why,rotatedAt=time.time())]
-    hp=next((p for p in (handoff_path(c,d),handoff_path(c,d,fallback=True)) if p.exists()),None)
-    card=(c/f'{m}.prompt.md').read_text().split('\n任务卡：\n',1)[-1]
-    brief=(f"\n\n【接续】本卡此前由别的会话执行，因{'、'.join(why)}换成你这个新会话接着做。先读"
-           +(f"交接文件 {hp}" if hp else '（没有交接文件）')+f'，再看 worktree 现状（git log、已写脚本、证据目录）与上一轮回执 {c/"v2"}/{m}.receipt-*.json.bak；'
-           +(f"细节缺失时可 grep 旧会话记录 {prev[-1]['transcript']}，⛔ 不要整篇读入。" if prev[-1].get('transcript') else '')
-           +'旧会话的结论只作线索，一律以本轮在当前基线上的实测为准；本轮结束同样更新交接文件。\n\n下面是本轮消息：\n')
-    d=dict(d,previousSessions=prev,sessionId=None,shortId=None,turnId=None)
-    return start_session(c,m,d,preamble(c,d)+card+brief+text,exclude={p.get('shortId') for p in prev if p.get('shortId')})
-
-def send_reply(c,m,text,force=False,phase=None,manual=False,session='auto'):
-    d=load(c,m)
-    if not text.strip(): raise ValueError('empty reply')
-    if d['state']=='self': raise ValueError('self module belongs to the main session')
-    if not d.get('sessionId') and not d.get('shortId'): raise ValueError('session not registered')
-    if manual and d.get('replies',0)>=MAX_REPLIES and not force:
-        raise ValueError(f"module {m} already got {d.get('replies',0)} replies; repeated rework means the requirement, "
-                         'contract or environment needs re-checking (with the user if semantic). Re-check first, '
-                         'then reply --force, or open a fresh fix card with full asset references')
-    cur=status_one(c,dict(d),stale_after=STALE_AFTER)
-    if cur.get('attention')=='stalled' and not force:
-        raise ValueError(f"module idle for {cur['idleFor']}s while claiming running; the session may "
-                         'have ended and would swallow this reply. Check read/worktree HEAD first, '
-                         'then use --force or dispatch a fix module instead')
-    # 复用还是换新会话：正在干活（running 且没卡住）的会话本身就热，不打断；其余按「热且小才复用」判定。
-    fresh,why,ctx=False,[],None
-    if d['transport'] in ('claude-bg','app-server') and session!='reuse':
-        ctx=context_of(c,d)
-        if session=='fresh': fresh,why=True,['主端指定 --session fresh']
-        elif cur.get('state')!='running' or cur.get('attention')=='stalled':
-            fresh,why=not (ctx or {}).get('reuse',True),(ctx or {}).get('why',[])
-    # Archive old receipts before a new attempt so stale done cannot win over resumed work.
-    with lock(c,m):
-        d=load(c,m); old=c/(m+'.receipt.json')
-        if old.exists(): old.rename(c/'v2'/(m+'.receipt-'+d['attempt']+'.json.bak'))
-        d['attempt']=uuid.uuid4().hex; d['state']='replying'
-        if manual: d['replies']=d.get('replies',0)+1
-        if phase: d['phase']=phase
-        atomic(record(c,m),d)
-    fleet=meta(c)
-    head=f"本轮 attempt={d['attempt']}；回执 attempt 更新为此值。协调目录不可写时，改写临时回执 {inbox(c,d)}，不要复用上一轮临时回执路径。\n"
-    if phase=='execute':
-        head+=(f"【执行阶段】依赖已合入集成分支 {fleet['integrationBranch']}：先把它合并进你的 worktree（保留已写的验收脚本），"
-               '在最新集成基线上启动真实服务，先连续跑核心主流程再逐条执行全部用例；验收脚本提交后用 cc-fleet-land 合入，'
-               '回执 commit 写合入后的集成分支 HEAD，tests 只有全部 passed 才能 done。\n')
-    text=head+text+'\n继续前重读任务卡及最新需求、用户用例与契约，以及本次参考资料（如有）；失败如实回执，修复后复测失败项和受影响的完整主流程。\n'
-    if d['transport']=='native':
-        return dict(d,nextAction='send_message_to_thread, then register the same threadId after acceptance',prompt=text)
-    if fresh:
-        try: d=rotate(c,m,d,text,why,ctx)
-        except Exception:
-            update(c,m,state='launch-uncertain'); raise
-        now=time.time(); d=update(c,m,activeSince=now,repliedAt=now)
-        return dict(d,revived=False,rotated=dict(reason=why,previous=d['previousSessions'][-1]),nextWake=wake_hint(c))
-    revived=False
-    try:
-        if d['backend']=='claude':
-            revived=claude_send(d,text)
-        else:
-            t=call('thread/read',dict(threadId=d['sessionId'],includeTurns=True))['thread']
-            turns=t.get('turns',[]); latest=turns[-1] if turns else {}
-            params=dict(threadId=d['sessionId'],input=[dict(type='text',text=text)])
-            if latest.get('status')=='inProgress':
-                params['expectedTurnId']=latest['id']; call('turn/steer',params)
-            else:
-                call('thread/resume',dict(threadId=d['sessionId'], **permission_params(d)))
-                if d.get('worktree'): params['cwd']=workdir(d)
-                routing=d.get('routing',{})
-                if routing.get('reasoningEffort'): params['effort']=routing['reasoningEffort']
-                if routing.get('providerType')=='deepseek': params.update(serviceTier=None,summary='none')
-                params.update(permission_params(d, turn=True))
-                call('turn/start',params)
-            goal_attach(c,m,d)  # 新 attempt 重新激活目标（之前可能已 complete/预算耗尽/暂停）
-        # activeSince anchors staleness: an exited session accepts the reply silently, so if
-        # nothing moves after this stamp, status/await surface it instead of claiming running.
-        now=time.time()
-        return dict(update(c,m,state='running',activeSince=now,repliedAt=now),revived=revived,nextWake=wake_hint(c))
-    except Exception:
-        update(c,m,state='launch-uncertain'); raise
-
-def queue_reply(a):
-    """登记一条「依赖全部 done 后自动发给本模块」的消息（典型：验收卡编写阶段完成后，等开发合入再自动进入执行阶段；
-    或开发回修后自动让验收复测）。触发由 await / rescue-owners 里的 advance 完成，主端不必醒来。"""
-    c=coord(a.coord); m=a.module; text=Path(a.text_file).read_text()
-    if not text.strip(): raise ValueError('empty reply')
-    after=[name(x) for x in re.split(r'[,\s]+',a.after) if x]
-    if not after: raise ValueError('--after is required')
-    for x in after:
-        if x==m or not record(c,x).exists(): raise ValueError(f'--after module not registered: {x}')
-    d=load(c,m)
-    if d['transport']=='native': raise ValueError('native followups use send_message_to_thread after the controller verifies dependencies')
-    if d['transport']=='self': raise ValueError('queue-reply needs a CLI-launched worker')
-    f=c/f'{m}.queued-reply.md'; f.write_text(text)
-    emit(update(c,m,queuedReply=dict(after=after,textFile=str(f),phase=a.phase,session=a.session,queuedAt=time.time())))
-
-def deps_ready(after,rows):
-    st={r['module']:r['state'] for r in rows}
-    return all(st.get(x)=='done' for x in after)
-
-def advance(c,rows=None):
-    """依赖图自动推进：queued 模块的依赖全部 done（回执已核验）→ 自动派发；queuedReply 的依赖全部 done 且本模块
-    当前这一轮已结束（SETTLED）→ 自动发出消息。单例（协调目录级 flock），失败的动作原样报告，交主端处理。"""
-    acts=[]
-    with open(c/'.advance.lock','w') as lk:
-        try: fcntl.flock(lk,fcntl.LOCK_EX|fcntl.LOCK_NB)
-        except OSError: return acts
-        rows=rows if rows is not None else statuses(c)
-        for r in rows:
-            m=r['module']
-            try:
-                d=load(c,m)
-                if d['state']=='queued' and deps_ready(d.get('after') or [],rows):
-                    out=launch(c,m,auto=True); acts.append(dict(module=m,action='dispatched',state=out.get('state')))
-                # 本模块这一轮已结束即可接续：验收发现缺陷时回执是 failed，依赖回修合入后旧回执又会变成基线过期的 needs-review。
-                elif d.get('queuedReply') and r['state'] in SETTLED and deps_ready(d['queuedReply']['after'],rows):
-                    q=d['queuedReply']; text=Path(q['textFile']).read_text()
-                    update(c,m,queuedReply=None,firedReply=dict(q,firedAt=time.time()))  # 先清再发，绝不重复投递
-                    out=send_reply(c,m,text,force=True,phase=q.get('phase'),session=q.get('session') or 'auto')
-                    acts.append(dict(module=m,action='replied',revived=out.get('revived',False),
-                                     **({'rotated':out['rotated']['reason']} if out.get('rotated') else {})))
-            except Exception as e:
-                acts.append(dict(module=m,action='error',error=f'{type(e).__name__}: {e}'))
-    return acts
-
-def auto_deps(c):
-    """done 时由编排器接续、不必唤醒主端的模块：被自动步骤消费的依赖，以及自己还排着下一条消息的模块
-    （验收卡编写阶段完成、等依赖合入后自动进入执行阶段）。"""
-    out=set()
-    for p in (c/'v2').glob('*.json'):
-        if p.name.startswith('.'): continue
-        with contextlib.suppress(Exception):
-            d=json.loads(p.read_text())
-            if d.get('queuedReply'): out.add(d['module'])
-            if d.get('after') and (d['state']=='queued' or d.get('autoDispatchedAt')): out|=set(d['after'])
-            for q in (d.get('queuedReply'),d.get('firedReply')):
-                if q: out|=set(q.get('after') or [])
-    return out
-
-def advance_cmd(a):
-    emit({'actions':advance(coord(a.coord))})
-
-def stop(a):
-    c=coord(a.coord); d=load(c,a.module)
-    if d['transport']=='native':
-        raise ValueError('native interrupt tool unavailable; pause the task in Codex App. Archive does not stop execution')
-    if d['backend']=='claude': run([claude_bin(),'stop',d['shortId']])
+    c = coord(a.coord)
+    d = load(c, a.module)
+    r, path, errors = read_receipt(c, d)
+    if r is not None:
+        emit(dict(receipt=r, validationErrors=errors) if errors else r)
     else:
-        t=call('thread/read',dict(threadId=d['sessionId'],includeTurns=True))['thread']
-        for turn in reversed(t.get('turns',[])):
-            if turn.get('status')=='inProgress':
-                call('turn/interrupt',dict(threadId=d['sessionId'],turnId=turn['id'])); break
-        goal_pause(c,d)
-    emit(update(c,a.module,state='stopped'))
+        emit(dict(sessionId=d.get('sessionId'), hostId=d.get('hostId'), nextAction='Use read_thread only to investigate missing receipt, failure, input or unknown state'))
 
-def wait(a):
-    c=coord(a.coord); end=time.monotonic()+a.timeout
-    while True:
-        rows=statuses(c)
-        if advance(c,rows): rows=statuses(c)  # Codex 主端靠有界 wait 循环，依赖图同样在这里推进
-        if not rows or all(r['state'] in TERMINAL for r in rows) or any(r['state'] in TERMINAL-{'done'} for r in rows):
-            emit({'reason':'attention-or-complete','jobs':rows}); return
-        remaining=end-time.monotonic()
-        if remaining<=0: emit({'reason':'timeout','jobs':rows}); return
-        time.sleep(min(a.interval,remaining))
 
-def wake_hint(c):
-    """Emitted on every dispatch/reply: the controller must not end its turn empty-handed."""
-    return (f'{ROOT/"cc-fleet"} await --coord {shlex.quote(str(c))}'
-            '  # 结束响应前用 run_in_background 挂上，否则没有任何东西会叫醒你')
-
-def pending(rows):
-    """Modules dispatched and not settled yet, plus queued ones the orchestrator will launch.
-    'prepared' (awaiting a manual dispatch) and 'self' (main session's own worktree) are not pending."""
-    return [r for r in rows if r['state'] not in TERMINAL and r['state'] not in ('prepared','self')]
-
-def owner_session():
-    return os.environ.get('CLAUDE_CODE_SESSION_ID') or os.environ.get('CLAUDE_SESSION_ID') or os.environ.get('CODEX_THREAD_ID') or ''
-
-def pid_alive(pid):
-    try: os.kill(int(pid),0); return True
-    except (OSError,ValueError,TypeError): return False
-
-def live_await(c):
-    """协调目录上仍在跑的 await（心跳文件 + 进程存活），Stop 守卫与单例判断共用。"""
-    with contextlib.suppress(Exception):
-        w=json.loads((c/'await.json').read_text())
-        if pid_alive(w.get('pid')) and time.time()-float(w.get('beatAt',0))<=2*float(w.get('interval',20))+30:
-            return w
+def find_handoff(c, d):
+    # New writers use attempt-specific paths. Legacy writers are accepted only with
+    # a timestamp from the active attempt, then stamped into a durable archive.
+    for p in (handoff_path(c, d), handoff_path(c, d, True)):
+        if p.is_file() and p.read_text().strip():
+            return p
+    since = max(d.get('repliedAt', 0), d.get('createdAt', 0))
+    for p in (c/(d['module']+'.handoff.md'), inbox(c, d).parent/(d['module']+'.handoff.md')):
+        if p.is_file() and p.stat().st_mtime >= since and p.read_text().strip():
+            return p
     return None
 
-def await_(a):
-    """Long-lived wake-up for the controlling session: block until a watched module changes
-    state, then exit so the host delivers the exit notification back to the main session.
-    不带 --modules 时，挂起期间新派发的模块自动纳入监视（增量派发不必重挂）；同一主 session 只留一个。"""
-    if not 60<=a.timeout<=86400: raise ValueError('--timeout must be 60..86400 seconds')
-    if not 5<=a.interval<=300: raise ValueError('--interval must be 5..300 seconds')
-    c=coord(a.coord); me=owner_session()
-    targets={x for x in re.split(r'[,\s]+',a.modules or '') if x}
-    advanced=advance(c)
-    rows=[r for r in statuses(c,a.stale_after) if not targets or r['module'] in targets]
-    base={r['module']:r['state'] for r in pending(rows)}
-    if not base:
-        emit({'reason':'nothing-to-await','label':a.label,'jobs':rows}); return
-    other=live_await(c)
-    if other and not targets and not other.get('modules') and other.get('session')==me and other.get('pid')!=os.getpid():
-        # 已有同一主 session 的全量 await 在盯（它会自动纳入新模块），不再叠一个。
-        emit({'reason':'already-awaiting','label':a.label,'pid':other['pid'],'watching':other.get('watching')}); return
-    # 挂上那一刻已 stalled 的模块不再触发唤醒（否则醒来重挂即秒退空转），只等它们状态变化。
-    known_stalled={r['module'] for r in rows if r.get('attention')=='stalled'}
-    end=time.monotonic()+a.timeout; hb=c/'await.json'
-    def beat():
-        atomic(hb,dict(pid=os.getpid(),session=me,label=a.label,modules=sorted(targets),watching=sorted(base),
-                       interval=a.interval,startedAt=started,beatAt=time.time(),deadline=time.time()+end-time.monotonic()))
-    started=time.time(); beat()
-    import signal
-    signal.signal(signal.SIGTERM,lambda *_: sys.exit(143))  # 被宿主终止时也走 finally 清心跳
-    try:
-        while True:
-            time.sleep(max(1,min(a.interval,end-time.monotonic())))
-            rows=statuses(c,a.stale_after)
-            acts=advance(c,rows)
-            if acts: advanced+=acts; rows=statuses(c,a.stale_after)
-            errors=[x for x in acts if x['action']=='error']
-            if not targets:
-                for r in pending(rows):
-                    if r['module'] not in base: base[r['module']]=r['state']  # 新派发的，纳入监视
-            rows=[r for r in rows if r['module'] in base]
-            seen={r['module'] for r in rows}
-            changed=[dict({'module':r['module'],'from':base[r['module']],'to':r['state'],
-                           'summary':(r.get('receipt') or {}).get('summary')},
-                          **({'attention':r['attention']} if r.get('attention') else {}))
-                     for r in rows if r['state']!=base[r['module']]]
-            changed+=[{'module':m,'from':base[m],'to':'gone','summary':None} for m in sorted(base.keys()-seen)]
-            # 由依赖图自动接续的变化不唤醒主端：依赖模块 done（下游会被自动派发/发消息）、queued→已派发、
-            # 自动消息发出后进入新一轮。只有失败/阻塞/待核实、无下游的完成、全部收尾、推进出错才叫醒。
-            quiet=auto_deps(c); moved={x['module'] for x in acts}
-            def routine(x):
-                # 已被下游验收消费的依赖：下游合入验收脚本使集成基线前移，它的旧证据随之 needs-review，以下游最终基线为准。
-                rebased=x['from']=='done' and x['to']=='needs-review' and (x.get('summary') or '').startswith('acceptance baseline changed')
-                return (x['to']=='done' and x['module'] in quiet) or (rebased and x['module'] in quiet) or \
-                       (x['module'] in moved and x['to'] in ('running','launching','replying'))
-            for x in [x for x in changed if routine(x)]: base[x['module']]=x['to']
-            changed=[x for x in changed if not routine(x)]
-            stalled=[r['module'] for r in rows if r.get('attention')=='stalled' and r['module'] not in known_stalled]
-            left=[r['module'] for r in pending(rows)]
-            if not changed and not stalled and not errors and base and not left:
-                changed=[{'module':m,'from':'auto','to':base[m],'summary':None} for m in sorted(base)]  # 流水线已全部收尾
-            if changed or stalled or errors:
-                head='; '.join(f"{x['module']} {x['from']}→{x['to']}" for x in changed)+(f"; stalled {','.join(stalled)}" if stalled else '')
-                head+=''.join(f"; advance-error {x['module']}" for x in errors)
-                stuck=[r['module'] for r in rows if r['state']=='queued' and
-                       any(next((y['state'] for y in rows if y['module']==z),None) in TERMINAL-{'done'} for z in r.get('after') or [])]
-                emit({'wake':head.strip('; '),'reason':'state-changed' if changed else ('stalled' if stalled else 'advance-error'),'label':a.label,
-                      'changed':changed,'stalled':stalled,'stillPending':left,'advanced':advanced,'errors':errors,
-                      **({'queueBlocked':stuck} if stuck else {}),
-                      'next':'先 status 再决策'+('；queueBlocked 的依赖未成功，回修依赖（reply 原模块）后它会自动派发' if stuck else '')
-                             +('；stillPending 非空，结束响应前重新挂 await' if left else '')}); return
-            if time.monotonic()>=end:
-                # 超时只是本次等待结束：退出码 0（别被当失败），输出一行即可，原命令原样重挂。
-                emit({'wake':'timeout','reason':'timeout','label':a.label,'waitedSeconds':a.timeout,'advanced':advanced,
-                      'stillPending':[r['module'] for r in pending(rows)],
-                      'next':'无变化；用同一命令重新挂 await（run_in_background），⛔ 不要改用自写轮询'}); return
-            beat()
-    finally:
-        with contextlib.suppress(Exception):
-            if json.loads(hb.read_text()).get('pid')==os.getpid(): hb.unlink()
 
-def fleet_home():
-    return Path(os.environ.get('CC_FLEET_HOME') or Path.home()/'.claude'/'fleet')
+def persist(c, d, r):
+    dest = archive_dir(c, d)
+    atomic(dest/'receipt.json', r)
+    hp = find_handoff(c, d)
+    if hp:
+        content = hp.read_text()
+        atomic_text(dest/'handoff.md', content)
+        atomic_text(handoff_path(c, d), content)
+        atomic_text(c/(d['module']+'.handoff.md'), content)  # compatibility alias
+        atomic(dest/'handoff-source.json', dict(rq=meta(c)['rq'], module=d['module'], attempt=d['attempt'],
+            source=str(hp), sha256=hashlib.sha256(content.encode()).hexdigest()))
+    return dest, hp
 
-def registry_coords():
-    reg=Path(os.environ.get('CC_FLEET_PANEL_REGISTRY') or fleet_home()/'codex-coords.json')
-    with contextlib.suppress(Exception):
-        return {Path(x['coord']) for x in json.loads(reg.read_text()).get('coords',[])}
-    return set()
-
-def owned_coords(session, cwd, max_age=7*86400):
-    """本 session 作为主端 init 的协调目录：面板注册表 ∪ cwd 所在仓库的 .git/fleet。"""
-    cands=registry_coords()
-    with contextlib.suppress(Exception):
-        common=Path(run(['git','-C',cwd,'rev-parse','--path-format=absolute','--git-common-dir'],timeout=5).stdout.strip())
-        cands|=set((common/'fleet').glob('*'))
-    out=[]
-    for c in sorted(cands):
-        with contextlib.suppress(Exception):
-            if time.time()-(c/'v2').stat().st_mtime>max_age and not (c/'await.json').exists(): continue
-            ids={json.loads((c/'fleet.json').read_text())['owner']['id']}
-            with contextlib.suppress(OSError):  # 面板登记时记下的真实主 session（owner.id 可能是 controller-*）
-                ids|={l.split('=',1)[1].strip() for l in (c/'owner.meta').read_text().splitlines() if l.startswith('owner_session_id=')}
-            if session in ids: out.append(c)
-    return out
-
-def stop_guard(a):
-    """Claude Code Stop hook：主端还有未终态 worker、却没挂 await 就想结束响应时拦下（SKILL.md §6 的强制版）。
-    任何异常一律放行，绝不因守卫自身故障卡住 session。"""
-    try:
-        h=json.loads(sys.stdin.read() or '{}')
-        session=h.get('session_id') or ''
-        if not session or os.environ.get('FLEET_ROLE')=='worker' or h.get('stop_hook_active'): return
-        miss=[]
-        for c in owned_coords(session, h.get('cwd') or os.getcwd()):
-            if live_await(c): continue
-            p=[r['module'] for r in pending(statuses(c))]
-            if p: miss.append((c,p))
-        if not miss: return
-        cmds='\n'.join(f'{ROOT/"cc-fleet"} await --coord {shlex.quote(str(c))} --label {shlex.quote("等 "+",".join(p))}' for c,p in miss)
-        print(json.dumps({'decision':'block','reason':
-            '多 session 编排：以下 worker 还在跑，但没有挂上能叫醒你的 await，结束响应后不会有任何东西通知你。'
-            '请用 Bash(run_in_background=true) 运行（每个协调目录一条，已挂的会自动复用），然后再结束响应：\n'+cmds},ensure_ascii=False))
-    except Exception as e:
-        print(f'cc-fleet stop-guard skipped: {type(e).__name__}: {e}',file=sys.stderr)
-
-# ---- 主端兜底唤醒（rescue-owners）----
-# await 跑在主 session 自己的进程树里：主 session 被回收/重启/OOM，await 随之消失，之后 worker 交回执
-# 没有任何东西会通知主端（2026-10-08 RQ-20261008-193532 主端停摆 12 小时）。本命令由常驻 watchdog 周期调用，
-# 独立于主 session：发现「有 worker 新进入终态 + 主端没有活着的 await + 主端最后活动早于这次完成」，
-# 就把主 session 拉起（已被回收则经 daemon 以 resume 原地复活，保持同一 short/sessionId）并注入唤醒消息。
-RESCUE_COOLDOWN = int(os.environ.get('CC_FLEET_RESCUE_COOLDOWN', '300'))
-RESCUE_MAX_AGE = int(os.environ.get('CC_FLEET_RESCUE_MAX_AGE', str(3*86400)))
-UUID_RE = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
-
-def daemon_call(req, timeout=20):
-    """daemon control socket（协议见 reference/PROTOCOL.md）；公开 CLI 的 --bg --resume 会 fork 出新 sessionId，
-    主端身份就对不上了，所以复活与注入只能走这里。"""
-    socks=[os.environ['CC_FLEET_DAEMON_SOCK']] if os.environ.get('CC_FLEET_DAEMON_SOCK') else \
-        sorted(glob.glob(f'/tmp/cc-daemon-{os.getuid()}/*/control.sock'))
-    key=os.environ.get('CLAUDE_DAEMON_CONTROL_KEY') or os.environ.get('CLAUDE_BG_CONTROL_AUTH')
-    if not key:
-        with contextlib.suppress(OSError): key=(Path.home()/'.claude'/'daemon'/'control.key').read_text().strip()
-    last=None
-    for path in socks:
-        try:
-            with socket.socket(socket.AF_UNIX) as sk:
-                sk.settimeout(timeout); sk.connect(path)
-                sk.sendall((json.dumps(dict(proto=1,**({'auth':key} if key else {}),**req))+'\n').encode())
-                buf=b''
-                while b'\n' not in buf:
-                    chunk=sk.recv(65536)
-                    if not chunk: break
-                    buf+=chunk
-                return json.loads(buf.split(b'\n',1)[0])
-        except (OSError,ValueError) as e: last=e
-    raise RuntimeError(f'daemon unreachable: {last}')
-
-def owner_job(c):
-    """主端（仅 claude-code 主端）的 job：返回 (short, state.json)；找不到返回 (None, None)。"""
-    with contextlib.suppress(Exception):
-        if meta(c).get('owner',{}).get('host')!='claude-code': return None,None
-    ids=[meta(c).get('owner',{}).get('id') or '']
-    with contextlib.suppress(OSError):
-        ids+=[l.split('=',1)[1].strip() for l in (c/'owner.meta').read_text().splitlines() if l.startswith('owner_session_id=')]
-    # daemon 刚 kill/复活时会改写 state.json，可能读到半截文件：每个 id 多扫几轮再换下一个，免得认错主端。
-    for sid in [x for x in ids if UUID_RE.fullmatch(x or '')]:
-        for _ in range(3):
-            for f in [JOBS_DIR/sid[:8]/'state.json',*JOBS_DIR.glob('*/state.json')]:
-                with contextlib.suppress(OSError,ValueError):
-                    js=json.loads(f.read_text())
-                    if sid in (js.get('sessionId'),js.get('resumeSessionId')): return f.parent.name,js
-            time.sleep(0.3)
-    return None,None
-
-def transcript_last_event(path):
-    """transcript 尾部最后一条带 timestamp 的事件时刻；mtime 会被元数据整体重写刷新，不可用。"""
-    best=0.0
-    with contextlib.suppress(OSError), open(path,'rb') as f:
-        f.seek(0,2); f.seek(max(0,f.tell()-262144))
-        for m in re.finditer(rb'"timestamp"\s*:\s*"([^"]+)"',f.read()): best=max(best,iso_ts(m.group(1).decode()))
-    return best
-
-def settled_at(c,r):
-    """模块进入终态的大致时刻：回执文件 > worker job state.json updatedAt > 现在。"""
-    t=mtime(c/(r['module']+'.receipt.json'))
-    if not t and r.get('shortId'): t=iso_ts((job_state(r['shortId']) or {}).get('updatedAt'))
-    return t or time.time()
-
-def wake_text(c,fresh,left):
-    lines='；'.join(f"{r['module']} → {r['state']}"+(f"（{(r.get('receipt') or {}).get('summary','')[:80]}）" if r.get('receipt') else '') for r in fresh)
-    return (f"⟦fleet 自动唤醒⟧ {meta(c).get('rq','')}：{lines}。你（主 session）当时没有挂着 await——多半是被回收/重启过，"
-            f"所以没收到通知。请先 {ROOT/'cc-fleet'} status --coord {shlex.quote(str(c))} 核对回执，按既定流程继续编排"
-            +(f"；仍在跑：{','.join(left)}，结束响应前用 Bash(run_in_background=true) 重新挂 await。" if left else '。'))
-
-def revive(short,js):
-    """已被回收的主 session：经 daemon 以 resume 原地复活（同一 short、同一 sessionId、同一对话），等它就绪。"""
-    sid=js.get('resumeSessionId') or js.get('sessionId'); flags=list(js.get('respawnFlags') or [])
-    d=dict(proto=1,short=short,sessionId=sid,createdAt=int(time.time()*1000),source='respawn',cwd=js.get('cwd') or str(Path.home()),
-           launch=dict(mode='resume',sessionId=sid,fork=False,flagArgs=flags),agent=js.get('template') or 'claude',
-           isolation='none',respawnFlags=flags)
-    if js.get('name'): d['seed']=dict(intent=js.get('intent') or js['name'],name=js['name'])
-    r=daemon_call(dict(op='dispatch',d=d,timeoutMs=15000),timeout=30)
-    if not r.get('ok'): raise RuntimeError(f"revive {short} rejected: {r.get('code')} {r.get('error')}")
-    end=time.time()+float(os.environ.get('CC_FLEET_RESCUE_READY_WAIT','60'))
-    while time.time()<end:
-        h=daemon_call(dict(op='has',short=short))
-        if h.get('ready') or (h.get('alive') and h.get('ready') is None): return
-        time.sleep(2)
-    raise RuntimeError(f'revive {short}: not ready in time')
-
-def rescue_one(c,dry):
-    snapf=c/'owner-wake.json'; snap={}
-    with contextlib.suppress(Exception): snap=json.loads(snapf.read_text())
-    prev=snap.get('states')
-    if prev is not None and all(v in TERMINAL for v in prev.values()) and max(mtime(c),mtime(c/'v2'))<=snap.get('at',0):
-        return None                                   # 早已全部收尾、此后没动过：不必再查
-    rows=statuses(c)
-    alive=live_await(c)
-    acts=[] if dry or alive else advance(c,rows)   # 主端不在：依赖图照样自动推进，流水线不因主端被回收而停
-    if acts: rows=statuses(c)
-    cur={r['module']:r['state'] for r in rows}
-    def save(**kw):
-        if not dry: atomic(snapf,dict(snap,states=cur,at=time.time(),**kw))
-    if prev is None or alive: save(); return None   # 首次见到只记基线；有 await 在盯就交给它
-    quiet=auto_deps(c)
-    newly=[r for r in rows if r['state'] in TERMINAL and prev.get(r['module'])!=r['state'] and not (r['module'] in quiet and
-           (r['state']=='done' or (prev.get(r['module'])=='done' and ((r.get('receipt') or {}).get('summary') or '').startswith('acceptance baseline changed'))))]
-    if any(x['action']=='error' for x in acts):
-        newly+=[r for r in rows if r['module'] in {x['module'] for x in acts if x['action']=='error'} and r not in newly]
-    if not newly and pending(rows)==[] and any(prev.get(m) not in TERMINAL for m in cur if m in prev):
-        newly=[r for r in rows if prev.get(r['module'])!=r['state']]   # 流水线刚全部收尾
-    if not newly: save(); return None
-    short,js=owner_job(c)
-    if not short: save(); return dict(coord=str(c),action='skip',reason='owner-not-claude-or-unknown')
-    last=transcript_last_event(js.get('linkScanPath') or '')
-    fresh=[r for r in newly if settled_at(c,r)>last]  # 不留容差：主端刚停几秒 worker 就完成也得叫
-    if not fresh: save(); return None                 # 主端在完成之后还活动过 = 已经看到了
-    live=next((j for j in (daemon_call(dict(op='list')).get('jobs') or []) if j.get('short')==short),None)
-    if live and live.get('tempo')=='active': return dict(coord=str(c),action='defer',reason='owner-busy',owner=short)
-    if time.time()-snap.get('wokeAt',0)<RESCUE_COOLDOWN: return dict(coord=str(c),action='defer',reason='cooldown',owner=short)
-    out=dict(coord=str(c),owner=short,modules=[r['module'] for r in fresh],revive=not live)
-    if dry: return dict(out,action='dry-run')
-    if not live: revive(short,js)
-    r=daemon_call(dict(op='reply',short=short,text=wake_text(c,fresh,[x['module'] for x in pending(rows)])))
-    if not r.get('ok'):
-        snap['wokeAt']=time.time(); atomic(snapf,dict(snap,at=snap.get('at',0)))   # 记冷却、不推进基线，下轮再试
-        raise RuntimeError(f"reply {short} rejected: {r.get('code')} {r.get('error')}")
-    save(wokeAt=time.time(),woke=out['modules']); return dict(out,action='woke')
-
-def rescue_owners(a):
-    """供 watchdog 周期调用：扫描注册表里近期的协调目录，叫醒没人在等的主 session。单例、任何单个目录出错不影响其余。"""
-    fleet_home().mkdir(parents=True,exist_ok=True)
-    with open(fleet_home()/'rescue-owners.lock','w') as lk:
-        try: fcntl.flock(lk,fcntl.LOCK_EX|fcntl.LOCK_NB)
-        except OSError: emit({'skipped':'another rescue-owners is running'}); return
-        cands=[coord(x) for x in a.coord] if a.coord else sorted(registry_coords())
-        res=[]
-        for c in cands:
-            try:
-                if not (c/'fleet.json').is_file() or time.time()-max(mtime(c),mtime(c/'v2'))>RESCUE_MAX_AGE: continue
-                r=rescue_one(c,a.dry_run)
-                if r: res.append(r)
-            except Exception as e:
-                res.append(dict(coord=str(c),action='error',error=f'{type(e).__name__}: {e}'))
-        emit({'at':datetime.datetime.now().isoformat(timespec='seconds'),'results':res})
 
 def collect(a):
-    c=coord(a.coord); d=load(c,a.module); r=receipt(c,d)
-    if not r or r['result']=='needs-review': raise ValueError('no verified receipt to collect')
-    if r.get('worktree') and not d.get('worktree'):
-        # receipt() has verified repository identity and prepared baseline for done.
-        if r['result']=='done':
-            wt=toplevel(r['worktree'])
-            update(c,a.module,worktree=wt,cwd=str(Path(wt)/d['subdir']) if d.get('subdir') else wt,branch=git(wt,'rev-parse','--abbrev-ref','HEAD'))
-    atomic(c/(d['module']+'.receipt.json'),r)
-    emit(dict(result=r['result'],receiptFile=str(c/(d['module']+'.receipt.json'))))
+    c = coord(a.coord)
+    with lock(c, a.module):
+        d = load(c, a.module)
+        r, path, errors = read_receipt(c, d)
+        if r is None or errors:
+            raise ValueError('no verified receipt to collect: '+ '; '.join(errors))
+        dest, hp = persist(c, d, r)
+        if r.get('worktree') and not d.get('worktree') and r['result'] == 'done':
+            wt = verify_worktree(c, d, r['worktree'])
+            d.update(worktree=str(wt), cwd=str(wt/d['subdir']) if d.get('subdir') else str(wt), branch=git(wt, 'rev-parse', '--abbrev-ref', 'HEAD'))
+            atomic(record(c, a.module), d)
+        atomic(c/(d['module']+'.receipt.json'), r)
+    out = compact(c, d, r, c/(d['module']+'.receipt.json'))
+    out.update(result=r['result'], archive=str(dest), handoffFile=str(dest/'handoff.md') if hp else None)
+    if not hp:
+        out['handoffWarning'] = 'No current-attempt handoff found; legacy receipt collected, fresh session requires a handoff'
+    if a.details:
+        out['receipt'] = r
+    emit(out)
 
 
-def reconcile(a):
-    c=coord(a.coord); d=load(c,a.module)
-    if d['transport']=='native':
-        emit(dict(d,nextAction='Use list_threads/read_thread to verify identity, then register the real threadId/hostId; move via App sidebar tools')); return
-    if d['backend']=='claude':
-        hits=[j for j in claude_jobs() if j.get('name')==d['name'] and Path(j.get('cwd','/')).resolve()==Path(workdir(d)).resolve()]
-        if len(hits)!=1: raise ValueError('cannot uniquely reconcile worker; inspect public session list')
-        # Finding the record only proves the worker exists. Its real state decides: a session
-        # that already ended must not be reported running (replies to it are silently lost).
-        j=hits[0]; d=update(c,a.module,shortId=j['id'],sessionId=j.get('sessionId'),state='running')
-        emit(update(c,a.module,state=status_one(c,d,[j])['state']))
-    else:
-        sid=a.session_id or d.get('sessionId')
-        if not sid: raise ValueError('supply --session-id from the verified Codex task list')
-        t=call('thread/read',dict(threadId=sid,includeTurns=False))['thread']
-        if d['transport']!='native' and Path(t.get('cwd','/')).resolve()!=Path(workdir(d)).resolve():
-            raise ValueError('thread cwd does not match prepared worktree')
-        d=update(c,a.module,sessionId=sid,state='running')
-        emit(sidebar_attach(c,update(c,a.module,state=status_one(c,d)['state'])))
+def reply(a):
+    c = coord(a.coord)
+    text = Path(a.text_file).read_text()
+    if not text.strip():
+        raise ValueError('empty reply')
+    native_settings()
+    with lock(c, a.module):
+        d = load(c, a.module)
+        if d['transport'] != 'native' or not d.get('sessionId'):
+            raise ValueError('reply requires an existing real native thread')
+        if d['state'] == 'replying':
+            raise ValueError('previous send outcome unresolved; use existing next-prompt and reconcile with native tools')
+        if d.get('replies', 0) >= MAX_REPLIES and not a.force:
+            raise ValueError('rework cap reached; re-check requirements/contract/environment before --force')
+        if a.phase and d['role'] not in ('verify', 'integ'):
+            raise ValueError('--phase execute only applies to verify/integ')
+        fresh = a.session == 'fresh'
+        # The CLI cannot infer liveness from a receipt. Require an explicit host
+        # observation of this exact thread; --force cannot bypass this safeguard.
+        if fresh and (a.observed_state not in ('completed', 'failed', 'interrupted', 'stopped') or a.observed_session_id != d['sessionId']):
+            raise ValueError('fresh requires host-confirmed old turn end: --observed-session-id and --observed-state; running/unknown/input waits are unsafe')
+        r, path, errors = read_receipt(c, d)
+        hp = find_handoff(c, d)
+        if fresh and not hp:
+            raise ValueError('fresh requires current-attempt handoff; write and collect it first')
+        old = dict(d)
+        if r is not None:
+            persist(c, d, r)  # archive invalid evidence too; do not reinterpret failure as success
+        if hp:
+            atomic_text(archive_dir(c, d)/'handoff.md', hp.read_text())
+        old_receipt = c/(d['module']+'.receipt.json')
+        if old_receipt.exists():
+            atomic_text(archive_dir(c, d)/'raw.receipt.json', old_receipt.read_text())
+            old_receipt.unlink()
+        old_prompt = c/(d['module']+'.prompt.md')
+        if old_prompt.exists():
+            atomic_text(archive_dir(c, d)/'prompt.md', old_prompt.read_text())
+        d.update(attempt=uuid.uuid4().hex, state='prepared' if fresh else 'replying',
+                 replies=d.get('replies', 0)+1, repliedAt=time.time())
+        if a.phase:
+            d['phase'] = a.phase
+        if fresh:
+            d['previousSessions'] = list(d.get('previousSessions', []))+[dict(
+                sessionId=old['sessionId'], hostId=old.get('hostId', 'local'), attempt=old['attempt'],
+                observedState=a.observed_state, observedAt=time.time(), handoffFile=str(archive_dir(c, old)/'handoff.md'))]
+            d.update(sessionId=None, hostId=None, clientThreadId=None, sidebar=None)
+        # Preserve the old baseline until the worker merges integration. Execute
+        # receipts must match the current integration HEAD regardless of this field.
+        head = f"本轮 attempt={d['attempt']}；回执和交接路径使用本轮身份。\n"
+        if a.phase == 'execute':
+            head += f"执行阶段：保留验收脚本，将最新 {meta(c)['integrationBranch']} 合入本工作树；脚本需要交付时先提交并 land，再记录实际验收 SHA。\n"
+        head += text+'\n继续前重读本卡、最新原始需求/用例/契约；复测失败项、受影响分支与完整主流程。\n'
+        task_path = c/(d['module']+'.task.md')
+        if task_path.exists():
+            task = task_path.read_text()
+        else:
+            # Existing native RQs predate .task.md: extract their business card
+            # once, rather than copying old attempts/protocol into future cards.
+            previous_prompt = old_prompt.read_text()
+            marker = '\n任务卡：\n'
+            task = previous_prompt.split(marker, 1)[-1] if marker in previous_prompt else previous_prompt
+            atomic_text(task_path, task)
+        handoff_ref = f"\n交接文件：{archive_dir(c,old)/'handoff.md'}\n" if hp else ''
+        current_prompt = preamble(c, d)+task+handoff_ref+'\n本轮变更：\n'+head
+        atomic_text(old_prompt, current_prompt)
+        if fresh:
+            prompt = current_prompt
+        else:
+            prompt = head+f"稳定 worker 协议：{ROOT.parent/'reference'/'worker.md'}\n当前完整任务卡：{old_prompt}\n"+(
+                f"交接写 {handoff_path(c,d)}，回执写 {c/(d['module']+'.receipt.json')}；不可写则分别写 {handoff_path(c,d,True)} 和 {inbox(c,d)}。\n"
+                f"完成前运行 {shlex.quote(str(ROOT/'cc-fleet'))} validate-receipt --coord {shlex.quote(str(c))} --module {d['module']}。\n")
+        atomic_text(c/(d['module']+'.next-prompt.md'), prompt)
+        atomic(record(c, a.module), d)
+    emit(dict(d, sessionPolicy='fresh' if fresh else 'reuse', nativeSettings=native_settings(), nativeSettingsPolicy='inherit-parent',
+        prompt=prompt, promptFile=str(c/(d['module']+'.next-prompt.md')),
+        nextAction=NATIVE_SETTINGS_ACTION+('Call create_thread; move and register the new real identity with --attempt. Reuse the existing worktree; do not archive/stop the old thread automatically.' if fresh else
+            'Call send_message_to_thread for the existing identity; after acceptance register the same identity. If outcome is uncertain, inspect before retrying.')))
 
-def events(a):
-    c=coord(a.coord); d=load(c,a.module)
-    if d['transport']=='native': raise ValueError('use wait_threads for native Codex tasks; app-server subscriptions are not supported')
-    if d['backend']!='codex' or not d.get('sessionId'): raise ValueError('events requires a registered Codex worker')
-    # This is an active controller subscription, never used by a read-only UI panel.
-    argv=[os.environ.get('CODEX_APP_CALL_BIN',str(ROOT/'cc-codex-app-call')),
-          '--watch-ms',str(a.timeout*1000),'thread/resume','-']
-    p=subprocess.run(argv,input=json.dumps(dict(threadId=d['sessionId'])),text=True,timeout=a.timeout+40)
-    if p.returncode: raise RuntimeError('event connection interrupted; reconcile through status')
+
+def snapshot(a):
+    c = coord(a.coord)
+    text = Path(a.file).read_text().strip()
+    if not text:
+        raise ValueError('empty current snapshot')
+    with lock(c, 'CURRENT'):
+        p = c/'CURRENT.md'
+        if p.exists():
+            old = p.read_text()
+            if old.strip() == text:
+                emit(dict(currentFile=str(p), changed=False))
+                return
+            path = c/'history'/'current'/(datetime.datetime.now().strftime('%Y%m%d-%H%M%S-')+uuid.uuid4().hex[:8]+'.md')
+            atomic_text(path, old)
+        atomic_text(p, text+'\n')
+    emit(dict(currentFile=str(p), changed=True))
+
+
+def dispatch(a):
+    c = coord(a.coord)
+    d = load(c, a.module)
+    if d['state'] not in ('prepared', 'setting-up'):
+        raise ValueError('already attempted; inspect registered native identity before retrying')
+    emit(dict(d, promptFile=str(c/(d['module']+'.prompt.md')), nativeSettings=native_settings(), nativeSettingsPolicy='inherit-parent',
+        nextAction=NATIVE_SETTINGS_ACTION+'Use native create_thread only if not already pending; move, verify and register.'))
+
+
+def retired_hook(a):
+    # External settings still invoke these old hooks. A silent no-op removes the
+    # legacy machinery without editing unrelated global configuration.
+    return
 
 
 def parser():
-    p=argparse.ArgumentParser(description=__doc__); s=p.add_subparsers(dest='cmd',required=True)
-    q=s.add_parser('init'); q.add_argument('--cwd',required=True); q.add_argument('--host',choices=HOSTS,required=True)
-    q.add_argument('--owner-id'); q.add_argument('--base'); q.add_argument('--rq'); q.set_defaults(fn=init)
-    s.add_parser('server',help='查看 fleet 的 Codex daemon / 本机安装 / Codex App 内置 codex 版本与告警（只读）').set_defaults(fn=server)
-    s.add_parser('stop-guard',help='Claude Code Stop hook: block ending a turn while workers run unawaited').set_defaults(fn=stop_guard)
-    q=s.add_parser('rescue-owners',help='watchdog 周期调用：worker 已结束而主 session 没挂 await（被回收/重启）时复活并唤醒主 session')
-    q.add_argument('--coord',action='append',help='只查这些协调目录（可重复）；默认扫描注册表')
-    q.add_argument('--dry-run',action='store_true',help='只报告将唤醒谁，不复活、不注入、不推进基线'); q.set_defaults(fn=rescue_owners)
-    for cmd,fn in [('prepare',prepare),('dispatch',dispatch),('register',register),('bind',bind),('status',status),('read',read),('reply',reply),('stop',stop),('wait',wait),('await',await_),('reconcile',reconcile),('events',events),('collect',collect),('queue-reply',queue_reply),('advance',advance_cmd)]:
-        q=s.add_parser(cmd); q.add_argument('--coord',required=True); q.set_defaults(fn=fn)
-        if cmd not in ('status','wait','await','advance'): q.add_argument('--module',required=True,type=name)
-        if cmd=='queue-reply':
-            q.add_argument('--after',required=True,help='comma separated modules that must all be done first')
-            q.add_argument('--text-file',required=True); q.add_argument('--phase',choices=('execute',),help='switch a verify card from author to execute phase')
-        if cmd in ('reply','queue-reply'):
-            q.add_argument('--session',choices=('auto','reuse','fresh'),default='auto',
-                           help='auto: reuse only when the session is hot and small (idle<1h, ctx<150k, never compacted), else a fresh session with handoff')
-        if cmd in ('status','await'):
-            q.add_argument('--stale-after',type=int,default=STALE_AFTER,metavar='SECONDS',
-                           help='flag a running module with no observable activity for this long (0 disables)')
-        if cmd=='await':
-            q.add_argument('--modules',help='comma/space separated subset; default: everything still running')
-            q.add_argument('--label',help='note echoed back on wake-up so the controller regains context')
-            q.add_argument('--timeout',type=int,default=7200,metavar='60..86400')
-            q.add_argument('--interval',type=int,default=20,metavar='5..300')
-        if cmd=='prepare':
-            q.add_argument('--permissions',choices=('full','inherit'),help='default: inherit for native Codex; full for Claude/legacy workers')
-            q.add_argument('--backend',choices=('codex','claude'),help='default: codex (requires native Codex App tools); Claude must be selected explicitly')
-            q.add_argument('--transport',default='auto',choices=('auto','native','app-server','claude-bg'))
-            q.add_argument('--subdir',help='worker start dir relative to repo root (default: subdir of init --cwd; "" for repo root)')
-            q.add_argument('--task'); q.add_argument('--role',default='developer',choices=('developer','scout','verify','integ','regression'))
-            q.add_argument('--after',help='comma separated modules; the card is queued and auto-dispatched once all are done')
-            q.add_argument('--self',dest='self_dev',action='store_true',help='solo mode: worktree for the main session itself, never dispatched')
-            q.add_argument('--phase',choices=('author',),help='verify/integ: write acceptance specs in parallel with development')
-            q.add_argument('--profile',help='Claude profile in multi-session-dev.json (default: runner for regression if defined, else worker)')
-        if cmd=='read': q.add_argument('--logs',action='store_true',help='read backend logs even when a receipt exists (including invalid receipts)')
-        if cmd=='dispatch': q.add_argument('--profile')
-        if cmd=='register':
-            g=q.add_mutually_exclusive_group(required=True); g.add_argument('--session-id'); g.add_argument('--client-thread-id'); q.add_argument('--host-id')
-            q.add_argument('--sidebar-section-id',help='record a verified native App sidebar move; does not call a server')
-        if cmd=='reconcile': q.add_argument('--session-id')
-        if cmd=='events': q.add_argument('--timeout',type=int,choices=range(1,56),default=50,metavar='1..55')
-        if cmd=='bind': q.add_argument('--worktree',required=True)
-        if cmd=='reply':
-            q.add_argument('--text-file',required=True)
-            q.add_argument('--force',action='store_true',help='reply even when the module looks stalled or exceeded the rework cap')
-            q.add_argument('--phase',choices=('execute',),help='switch a verify card from author to execute phase')
-        if cmd=='wait':
-            q.add_argument('--timeout',type=int,choices=range(0,56),default=50,metavar='0..55'); q.add_argument('--interval',type=int,choices=range(2,31),default=5,metavar='2..30')
+    p = argparse.ArgumentParser(description=__doc__)
+    subs = p.add_subparsers(dest='cmd', required=True)
+    q = subs.add_parser('init')
+    q.add_argument('--cwd', required=True)
+    q.add_argument('--host', choices=('codex-app',), default='codex-app')
+    for arg in ('owner-id', 'base', 'rq'):
+        q.add_argument('--'+arg)
+    q.set_defaults(fn=init)
+    for cmd, fn in [('prepare', prepare), ('bind', bind), ('register', register), ('dispatch', dispatch),
+                    ('status', status), ('read', read), ('collect', collect), ('validate-receipt', validate_receipt),
+                    ('reply', reply), ('snapshot', snapshot)]:
+        q = subs.add_parser(cmd)
+        q.add_argument('--coord', required=True)
+        q.set_defaults(fn=fn)
+        if cmd not in ('status', 'snapshot'):
+            q.add_argument('--module', required=True, type=name)
+        if cmd in ('bind', 'register'):
+            q.add_argument('--attempt')
+        if cmd == 'prepare':
+            q.add_argument('--task', required=True)
+            q.add_argument('--role', default='developer', choices=('developer', 'scout', *ACCEPT_ROLES))
+            q.add_argument('--phase', choices=('author',))
+            q.add_argument('--self', dest='self_dev', action='store_true')
+            q.add_argument('--subdir')
+            q.add_argument('--backend', choices=('codex',), default='codex')
+            q.add_argument('--transport', choices=('auto', 'native'), default='native')
+            q.add_argument('--permissions', choices=('inherit',), default='inherit')
+            q.add_argument('--after', help=argparse.SUPPRESS)  # explicit diagnostic for existing prompts
+        if cmd == 'bind':
+            q.add_argument('--worktree', required=True)
+        if cmd == 'register':
+            g = q.add_mutually_exclusive_group(required=True)
+            g.add_argument('--session-id')
+            g.add_argument('--client-thread-id')
+            q.add_argument('--host-id')
+            q.add_argument('--sidebar-section-id')
+        if cmd in ('status', 'collect'):
+            q.add_argument('--details', action='store_true')
+        if cmd == 'validate-receipt':
+            q.add_argument('--receipt-file')
+        if cmd == 'reply':
+            q.add_argument('--text-file', required=True)
+            q.add_argument('--phase', choices=('execute',))
+            q.add_argument('--force', action='store_true')
+            q.add_argument('--session', choices=('auto', 'reuse', 'fresh'), default='auto')
+            q.add_argument('--observed-session-id')
+            q.add_argument('--observed-state', choices=('completed', 'failed', 'interrupted', 'stopped', 'running', 'unknown', 'waiting'))
+        if cmd == 'snapshot':
+            q.add_argument('--file', required=True)
+    for cmd in ('stop-guard', 'rescue-owners'):
+        subs.add_parser(cmd, help=argparse.SUPPRESS).set_defaults(fn=retired_hook)
     return p
 
-if __name__=='__main__':
+
+if __name__ == '__main__':
     try:
-        args=parser().parse_args(); args.fn(args)
-    except (RuntimeError, ValueError, OSError, KeyError, subprocess.TimeoutExpired) as e:
-        print(json.dumps({'error':str(e)},ensure_ascii=False),file=sys.stderr); sys.exit(2)
+        args = parser().parse_args()
+        args.fn(args)
+    except (ValueError, OSError, KeyError, TypeError, subprocess.TimeoutExpired) as e:
+        print(json.dumps(dict(error=str(e)), ensure_ascii=False), file=sys.stderr)
+        sys.exit(2)

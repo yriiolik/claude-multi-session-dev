@@ -5,7 +5,7 @@
 模型有时不加载 multi-session-dev，或者把「子 session」理解成 Agent 工具的 subagent。
 技能 description 只是软匹配，这里做确定性兜底：命中关键词就注入 additionalContext。
 
-Claude Code 与 Codex 的 hooks.json 都挂它；stdin 为 hook JSON（取 .prompt），stdout 为注入 JSON。
+stdin 为宿主 hook JSON（取 .prompt），stdout 为注入 JSON。
 worker（⟦FLEET-WORKER⟧ / ⟦CODEX-THREAD-WORKER⟧ / FLEET_ROLE=worker）与已显式调用技能时不注入。
 """
 import json, os, re, sys
@@ -23,18 +23,11 @@ WORKER = re.compile(r'⟦(?:FLEET-WORKER|CODEX-THREAD-WORKER)⟧')
 EXPLICIT = re.compile(r'^\s*[/$]multi-session-dev\b')
 
 HINT = (
-    '【multi-session-dev 触发提醒】用户这条消息提到了多 session / 子 session。'
-    '如果用户是要你用多 session（子 session、独立 session、fleet）去执行任务——哪怕只是在长需求末尾带一句'
-    '「多 session 模式完成」「让子 session 去做」——必须先加载并按 multi-session-dev 技能执行'
-    '（Claude Code 用 Skill 工具调用 multi-session-dev）。默认 Codex，使用 Codex App 原生 '
-    'create_thread / wait_threads / read_thread / send_message_to_thread 管理独立 session；'
-    '取得真实 threadId 后，用原生侧边栏工具放入「子 session」分区，禁止自动打开终端进度面板。'
-    'cc-fleet 负责协调与回执；只有明确选择 Claude 才用 cc-fleet dispatch。宿主没有原生工具时说明缺口，不静默回退 app-server。'
-    '「子 session」≠ Agent 工具的 subagent / 子 agent，禁止用 Agent / Task 子代理替代开发 worker；'
-    '也不得自建或借用其它派发器（claude -p、codex exec、项目自带或本次新写的调度器）起 session，'
-    '调研/数据分析类子任务同样遵守此路由；不设并发上限，能并行的卡一次全部派出。'
-    '只有当用户是在讨论、排查或修改这个技能本身，或只是顺带提及时，才不用进入编排流程；'
-    '你若是首条任务带 ⟦FLEET-WORKER⟧ 的 worker，忽略本提醒。'
+    '【multi-session-dev 触发提醒】如用户要求多 session / 子会话执行任务，先读 multi-session-dev。'
+    '仅使用 Codex App 原生独立会话；子 session 不是内部 subagent。cc-fleet 仅协调任务卡/回执。'
+    '创建后立即归入“子 session”分区，不打开终端面板。不自建调度器，不静默切换后端。'
+    '调研/数据任务同样适用；不设并发上限，按依赖与文件归属并行。'
+    '讨论、审计、修改技能本身或仅顺带提及时不进入编排；worker 不再编排。'
 )
 
 

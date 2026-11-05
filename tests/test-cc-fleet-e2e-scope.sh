@@ -82,7 +82,7 @@ eq "追加不覆盖" "$(command grep -c 'spec\.ts' "$C/e2e-scope/m1.txt")" "2"
 "$SCOPE" record "$C" m2 >/dev/null 2>&1; eq "缺 spec 参数 rc=2" "$?" 2
 
 echo "[7] plan 汇总各 worker 登记，默认判定「不要全量」"
-printf 'rq=RQ-TEST\nbase_branch=%s\n' "$BASE" > "$C/task.meta"
+python3 -c 'import json,sys; json.dump({"baseCommit":sys.argv[1]},open(sys.argv[2],"w"))' "$BASE" "$C/fleet.json"
 OUT="$(cd "$P" && "$SCOPE" plan "$C" 2>&1)"; eq "plan rc" "$?" 0
 has "列出 worker 已测范围" "$OUT" "tests/e2e/pricing-gate.spec.ts"
 has "含 diff 反推段" "$OUT" "集成分支相对 base"

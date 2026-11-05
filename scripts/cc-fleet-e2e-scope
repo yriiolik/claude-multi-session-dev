@@ -11,11 +11,11 @@
 #   plan     （主 session 侧）汇总各 worker 登记 ∪ 集成分支 diff 反推 → 一次性回归集合 + 是否该升级全量
 #
 # 用法：
-#   cc-fleet-e2e-scope suggest [--project-dir DIR] [--base REF] [--max N] [--quiet]
+#   cc-fleet-e2e-scope suggest [--project-dir DIR] [--base REF] [--head REF] [--max N] [--quiet]
 #   cc-fleet-e2e-scope record  <COORD_DIR> <module> <spec|组名> [...] [--minutes N] [--cmd "实际命令"]
 #   cc-fleet-e2e-scope plan    <COORD_DIR> [--project-dir DIR] [--base REF] [--max N]
 #
-# 约定：--base 缺省取 $FLEET_BASE_BRANCH（派发时注入的集成分支）；plan 另会读 <COORD>/task.meta 的 base_branch。
+# 约定：--base 缺省取 $FLEET_BASE_BRANCH（派发时注入的集成分支）；plan 读取 <COORD>/fleet.json 的 baseCommit 与 integrationBranch，不依赖主 checkout HEAD。
 #   预算上限 --max 缺省 6（$FLEET_E2E_MAX_SPECS 可改），plan 用 0 表示不截断。
 #   建议只是建议：命中靠文件名/内容词干匹配，worker 仍须按自己对改动的理解裁一遍（删无关的，别加全量）。
 #
@@ -27,7 +27,7 @@ MAX_DEFAULT="${FLEET_E2E_MAX_SPECS:-6}"
 
 usage() {
   cat >&2 <<'EOF'
-用法: cc-fleet-e2e-scope suggest [--project-dir DIR] [--base REF] [--max N] [--quiet]
+用法: cc-fleet-e2e-scope suggest [--project-dir DIR] [--base REF] [--head REF] [--max N] [--quiet]
       cc-fleet-e2e-scope record  <COORD_DIR> <module> <spec...> [--minutes N] [--cmd "命令"]
       cc-fleet-e2e-scope plan    <COORD_DIR> [--project-dir DIR] [--base REF] [--max N]
 EOF
@@ -48,9 +48,13 @@ find_project_root() {
   return 1
 }
 
-# ── 改动文件：base...HEAD 的提交 + 工作树未提交 + 未跟踪，全部限定在项目根内、输出相对项目根 ──
+# ── 改动文件：plan 用 base→集成ref；suggest 默认 HEAD 加本地改动。输出相对项目根 ──
 changed_files() {
-  local root="$1" base="$2"
+  local root="$1" base="$2" target="${3:-}"
+  if [ -n "$target" ]; then
+    git -C "$root" diff --name-only --relative "$base" "$target" -- .
+    return
+  fi
   {
     if [ -n "$base" ] && git -C "$root" rev-parse --verify --quiet "$base" >/dev/null 2>&1; then
       git -C "$root" diff --name-only --relative "$base"...HEAD -- . 2>/dev/null
@@ -190,11 +194,12 @@ suggest_command() {
 }
 
 cmd_suggest() {
-  local pdir="$PWD" base="${FLEET_BASE_BRANCH:-}" max="$MAX_DEFAULT" quiet=0
+  local pdir="$PWD" base="${FLEET_BASE_BRANCH:-}" target="" max="$MAX_DEFAULT" quiet=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --project-dir) pdir="${2:-}"; shift 2 || { usage; exit 2; } ;;
       --base) base="${2:-}"; shift 2 || { usage; exit 2; } ;;
+      --head) target="${2:-}"; shift 2 || { usage; exit 2; } ;;
       --max) max="${2:-}"; shift 2 || { usage; exit 2; } ;;
       --quiet) quiet=1; shift ;;
       *) echo "未知参数: $1" >&2; usage; exit 2 ;;
@@ -203,8 +208,13 @@ cmd_suggest() {
   local root; root="$(find_project_root "$pdir")" || { echo "❌ 找不到项目根（需含 package.json 且有 tests/ 或 scripts/run-tests.sh）：$pdir" >&2; exit 3; }
   git -C "$root" rev-parse --git-dir >/dev/null 2>&1 || { echo "❌ 不是 git 仓库：$root" >&2; exit 3; }
 
+  if [ -n "$target" ]; then
+    [ -n "$base" ] && git -C "$root" rev-parse --verify "$base^{commit}" >/dev/null 2>&1 && git -C "$root" rev-parse --verify "$target^{commit}" >/dev/null 2>&1 || {
+      echo "❌ 集成范围需要有效的 --base 和 --head 提交" >&2; return 3;
+    }
+  fi
   local tmp; tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' RETURN
-  changed_files "$root" "$base" > "$tmp/files"
+  changed_files "$root" "$base" "$target" > "$tmp/files"
   local nfiles; nfiles="$(wc -l < "$tmp/files" | tr -d ' ')"
   if [ "$nfiles" -eq 0 ]; then
     echo "⚠ 相对 base「${base:-（未给 --base，只看了工作树未提交改动）}」没有改动文件——无从推导范围。"
@@ -221,6 +231,10 @@ cmd_suggest() {
     [ -d "$c" ] || continue
     [ -n "$(find "$c" -type f \( -name '*.spec.ts' -o -name '*.spec.js' \) 2>/dev/null | head -1)" ] && { e2e_dir="$c"; break; }
   done
+  if [ -z "$e2e_dir" ] && [ -n "$target" ] && [ -s "$tmp/files.spec" ]; then
+    # New integration specs may not exist in the calling checkout yet.
+    e2e_dir="$tmp/empty-e2e"; mkdir -p "$e2e_dir"
+  fi
   if [ -z "$e2e_dir" ]; then
     echo "ℹ 本项目没有 e2e 目录（如 product-center / wms-mock）：只跑改动相关单测即可"
     echo "  npx vitest related --run \$(git diff --name-only --relative ${base:-HEAD})"
@@ -232,8 +246,19 @@ cmd_suggest() {
   limit=$((nspecs / 8)); [ "$limit" -lt 8 ] && limit=8
   drop_broad_stems "$tmp/stems.raw" "$tmp/specs.names" "$tmp/stems" "$tmp/stems.drop" "$limit"
   narrow_content_stems "$tmp/stems" "$tmp/specs.all" "$tmp/stems.content" "$limit"
-  score_specs "$root" "$tmp/stems" "$e2e_dir" "$tmp/files.spec" "$tmp/stems.content" \
-    | LC_ALL=C sort -t"$(printf '\t')" -k1,1nr -k2,2 > "$tmp/scored"
+  {
+    score_specs "$root" "$tmp/stems" "$e2e_dir" "$tmp/files.spec" "$tmp/stems.content"
+    if [ -n "$target" ]; then
+      local prefix rel
+      prefix="$(git -C "$root" rev-parse --show-prefix)"
+      while IFS= read -r rel; do
+        [ -n "$rel" ] && [ ! -f "$root/$rel" ] || continue
+        if git -C "$root" cat-file -e "$target:$prefix$rel" 2>/dev/null; then
+          printf '10\t%s\t集成分支新增\n' "$rel"
+        fi
+      done < "$tmp/files.spec"
+    fi
+  } | LC_ALL=C sort -t"$(printf '\t')" -k1,1nr -k2,2 > "$tmp/scored"
 
   local total; total="$(wc -l < "$tmp/scored" | tr -d ' ')"
   if [ "$quiet" -eq 0 ]; then
@@ -283,16 +308,24 @@ cmd_record() {
 cmd_plan() {
   local coord="${1:-}"; shift 2>/dev/null || { usage; exit 2; }
   [ -n "$coord" ] && [ -d "$coord" ] || { echo "❌ COORD_DIR 不存在: $coord" >&2; exit 3; }
-  local pdir="$PWD" base="" max=0
+  local pdir="$PWD" pdir_set=0 base="" target="" max=0
   while [ $# -gt 0 ]; do
     case "$1" in
-      --project-dir) pdir="${2:-}"; shift 2 || { usage; exit 2; } ;;
+      --project-dir) pdir="${2:-}"; pdir_set=1; shift 2 || { usage; exit 2; } ;;
       --base) base="${2:-}"; shift 2 || { usage; exit 2; } ;;
       --max) max="${2:-}"; shift 2 || { usage; exit 2; } ;;
       *) echo "未知参数: $1" >&2; usage; exit 2 ;;
     esac
   done
-  [ -z "$base" ] && [ -f "$coord/task.meta" ] && base="$(awk -F= '/^base_branch=/{print $2}' "$coord/task.meta" | head -1)"
+  if [ -f "$coord/fleet.json" ]; then
+    if [ -z "$base" ]; then
+      base="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["baseCommit"])' "$coord/fleet.json")" || return 3
+    fi
+    target="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("integrationBranch",""))' "$coord/fleet.json")" || return 3
+    if [ "$pdir_set" -eq 0 ]; then
+      pdir="$(python3 -c 'import json,sys,pathlib; f=json.load(open(sys.argv[1])); print(pathlib.Path(f.get("repo",sys.argv[2]))/f.get("subdir",""))' "$coord/fleet.json" "$pdir")" || return 3
+    fi
+  fi
 
   echo "═══ 回归范围合成（RQ 协调目录：${coord}）═══"
   echo
@@ -304,13 +337,15 @@ cmd_plan() {
   fi
   echo
   echo "② 集成分支相对 base「${base:-未知}」的改动反推（不截断）："
-  cmd_suggest --project-dir "$pdir" --base "$base" --max "$max" --quiet | sed 's/^/  /'
+  if ! cmd_suggest --project-dir "$pdir" --base "$base" --head "$target" --max "$max" --quiet | sed 's/^/  /'; then
+    return 3
+  fi
   echo
   echo "③ 是否升级为全量回归（默认否——只跑上面合成的集合）："
   local root hits=""
   root="$(find_project_root "$pdir")" || root="$pdir"
   if [ -n "$base" ]; then
-    hits="$(changed_files "$root" "$base" | command grep -E 'schema\.prisma|prisma/migrations/|seed|middleware|auth|guard|interceptor|app\.module|global|\.env' || true)"
+    hits="$(changed_files "$root" "$base" "$target" | command grep -E 'schema\.prisma|prisma/migrations/|seed|middleware|auth|guard|interceptor|app\.module|global|\.env' || true)"
   fi
   if [ -n "$hits" ]; then
     echo "  ⚠ 命中「公共基座」改动，建议升级为全量，并在状态索引写明理由："

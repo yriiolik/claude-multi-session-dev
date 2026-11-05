@@ -15,7 +15,8 @@
 #
 # 实现：独占 = `mkdir <COORD>/e2e.lock` 原子抢占；共享 = `<COORD>/e2e.shared/<module>` 登记文件。
 #   独占者先占住 e2e.lock（新来的共享者见到它就让路，防独占者饿死），再等已有共享者全部放锁。
-#   过期回收：持有超过 --stale 秒（默认 5400 = 90 分钟，覆盖 70 分钟全量 e2e）视为持有者已死。
+#   超过 --stale 秒（默认5400）只报告需核实；时间不证明持有者死亡，不自动抢锁。
+#   由主端用原生状态确认持有者不再操作共享资源，再按原 owner 执行 release。
 #
 # 用法（在 worker 内）：
 #   cc-fleet-e2e-lock acquire <COORD_DIR> <module> [--wait SEC] [--stale SEC] [--project-dir DIR] [--mode M]
@@ -24,7 +25,7 @@
 #
 # 退出码：0 成功 / 1 等锁超时 / 2 用法错 / 3 release 时锁不是自己的（不放，避免误放别人的锁）
 #
-# 与心跳的关系：跑长 e2e 时另按 preamble 定期 `touch <COORD_DIR>/<module>.alive`，本脚本不替你做。
+# 原生线程运行态由宿主监督；此锁只协调测试共享资源。
 
 set -uo pipefail
 
@@ -83,14 +84,13 @@ try_take() {
   return 1
 }
 
-# 共享持有者（排除 $1），顺手回收过期登记
+# 共享持有者（排除 $1）；保留长时登记，不能按时间推断死亡
 shared_holders() {
   local f s out=""
   [[ -d "${SHARED}" ]] || { echo ""; return; }
   for f in "${SHARED}"/*; do
     [[ -f "$f" ]] || continue
     s="$(cut -d' ' -f2 "$f" 2>/dev/null)"; [[ "$s" =~ ^[0-9]+$ ]] || s=0
-    if (( $(now) - s >= STALE )); then rm -f "$f"; continue; fi
     [[ "$(basename "$f")" == "${1:-}" ]] && continue
     out="${out:+$out,}$(basename "$f")"
   done
@@ -126,9 +126,9 @@ acquire_shared() {
   local reason="$1" deadline=$(( $(now) + WAIT ))
   mkdir -p "${SHARED}"
   while :; do
-    if [[ -d "${LOCK}" && "$(lock_age)" -ge "${STALE}" ]]; then
-      echo "⚠ e2e 独占锁被 $(lock_owner) 持有 $(lock_age)s ≥ stale=${STALE}，判持有者已死，强制回收" >&2
-      rm -rf "${LOCK}"
+    if [[ -d "${LOCK}" && "$(lock_owner)" != "${MODULE}" && "$(lock_age)" -ge "${STALE}" ]]; then
+      echo "⚠ e2e 独占锁被 $(lock_owner) 持有 $(lock_age)s ≥ stale=${STALE}，需主端核实原生状态；不自动抢锁" >&2
+      exit 1
     fi
     if [[ ! -d "${LOCK}" ]]; then
       printf '%s %s\n' "${MODULE}" "$(now)" > "${SHARED}/${MODULE}"
@@ -168,9 +168,8 @@ acquire_exclusive() {
       fi
     else
       if [[ "$(lock_age)" -ge "${STALE}" ]]; then
-        echo "⚠ e2e 锁被 $(lock_owner) 持有 $(lock_age)s ≥ stale=${STALE}，判持有者已死，强制回收" >&2
-        rm -rf "${LOCK}"
-        continue
+        echo "⚠ e2e 锁被 $(lock_owner) 持有 $(lock_age)s ≥ stale=${STALE}，需主端核实原生状态；不自动抢锁" >&2
+        exit 1
       fi
       if [[ "$(now)" -ge "$deadline" ]]; then
         echo "❌ 等 e2e 锁超时（${WAIT}s），仍被 $(lock_owner) 持有 $(lock_age)s。别硬跑：写进回执「需主 session 裁决」。" >&2

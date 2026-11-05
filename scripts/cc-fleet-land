@@ -2,7 +2,7 @@
 # cc-fleet-land — worker 把自己 worktree 里【已提交】的改动安全合入本 RQ 的集成分支 fleet/<RQ>。
 #
 # 为什么需要它（本技能的隔离模型，2026-06-13 起）：
-#   每个 RQ 有一条独立【集成分支】 fleet/<RQ>（主 session 用 `cc-fleet-coord --init-base <RQ>` 在
+#   每个 RQ 有一条独立【集成分支】 fleet/<RQ>（主 session 用 `cc-fleet init --cwd <repo>` 在
 #   发起任务时的当前分支上创建）。worker 的 worktree base 锚定 fleet/<RQ>、改动也只合回 fleet/<RQ>，
 #   **绝不碰共享开发分支（dev/<name> / main）**——共享分支只在主 session 整体验收通过后、由它把
 #   fleet/<RQ> 合回一次。这样「单个模块完成但整体需求没做完」时，半成品被关在 fleet/<RQ> 里，
@@ -22,7 +22,7 @@
 #   cc-fleet-land <RQ> --dry-run             # 只打印将做什么，不改任何 ref
 #
 # 退出码: 0 成功（已落地 / 本就最新）
-#         2 用法错 / 不在 git 仓库 / 集成分支不存在（主 session 还没 --init-base）
+#         2 用法错 / 不在 git 仓库 / 集成分支不存在（主 session 还没 init）
 #         3 工作树不干净（先把改动 commit / 解决未完成的合并再来）
 #         5 CAS 重试耗尽（fleet/<RQ> 被持续高频推进，极少见）
 #         7 与 fleet/<RQ> 合并冲突（解决冲突→git add→git commit→重跑 cc-fleet-land）
@@ -62,9 +62,9 @@ git rev-parse --git-dir >/dev/null 2>&1 || { echo "❌ 不在 git 仓库里。" 
 
 INT_REF="refs/heads/$INT_BRANCH"
 
-# 集成分支必须已存在（主 session 用 cc-fleet-coord --init-base <RQ> 建）
+# 集成分支必须已存在（主 session 用 cc-fleet init --cwd <repo> 建）
 if ! git show-ref --verify --quiet "$INT_REF"; then
-  echo "❌ 集成分支 $INT_BRANCH 不存在。主 session 应先跑：cc-fleet-coord --init-base $RQ" >&2
+  echo "❌ 集成分支 $INT_BRANCH 不存在。主 session 应先跑：cc-fleet init --cwd <repo>" >&2
   echo "   （它会在发起任务时的当前分支上创建 fleet/${RQ}，并把 base 记进协调目录 base.ref）" >&2
   exit 2
 fi

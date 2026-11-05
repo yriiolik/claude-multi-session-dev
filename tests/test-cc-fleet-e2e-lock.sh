@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# cc-fleet-e2e-lock 单测（确定性，无需 daemon）：抢占 / 互斥 / 重入 / 超时 / 过期回收 / 只放自己的锁。
-# 测试铁律：断言只增强不削弱；失败一律是脚本 bug，改脚本不改断言。
+# cc-fleet-e2e-lock 单测（确定性，无需 daemon）：抢占 / 互斥 / 重入 / 超时 / 长时持有保护 / 只放自己的锁。
+# 时间不能证明原生线程已死；超时锁必须保留到持有者/主端核实后释放。
 set -u
 
 LOCK="$(cd "$(dirname "$0")/.." && pwd)/scripts/cc-fleet-e2e-lock"
@@ -34,11 +34,14 @@ echo "[4] 只放自己的锁：m2 release → exit 3 且锁还在；m1 release �
 [ ! -d "$C/e2e.lock" ] && ok "锁已释放" || no "锁未释放"
 "$LOCK" release "$C" m1 | grep -q '本就空闲' && ok "重复 release 幂等" || no "重复 release 非幂等"
 
-echo "[5] 过期回收：持有时间 ≥ stale 的锁被后来者强制回收"
-mkdir "$C/e2e.lock"; printf 'dead %s\n' "$(( $(date +%s) - 10000 ))" > "$C/e2e.lock/owner"
-OUT="$("$LOCK" acquire "$C" m3 --wait 0 --poll 0 --stale 5400 2>&1)"; eq "m3 回收后抢到 rc=0" "$?" 0
-printf '%s' "$OUT" | grep -q '强制回收' && ok "提示强制回收" || no "未提示回收: $OUT"
-eq "锁归 m3" "$(cut -d' ' -f1 "$C/e2e.lock/owner")" "m3"
+echo "[5] 长时验收不被超时抢锁；主端核实并释放后才可接续"
+mkdir "$C/e2e.lock"; printf 'long-verify %s\n' "$(( $(date +%s) - 10000 ))" > "$C/e2e.lock/owner"
+OUT="$("$LOCK" acquire "$C" m3 --wait 0 --poll 0 --stale 5400 2>&1)"; eq "长时独占仍拒绝后来者 rc=1" "$?" 1
+printf '%s' "$OUT" | grep -q '不自动抢锁' && ok "提示核实而非抢锁" || no "未提示核实: $OUT"
+eq "锁仍归 long-verify" "$(cut -d' ' -f1 "$C/e2e.lock/owner")" "long-verify"
+"$LOCK" acquire "$C" m3 --mode shared --wait 0 --poll 0 --stale 5400 >/dev/null 2>&1; eq "共享申请也不能抢旧独占 rc=1" "$?" 1
+"$LOCK" release "$C" long-verify >/dev/null
+"$LOCK" acquire "$C" m3 --wait 0 --poll 0 >/dev/null; eq "明确释放后可接续 rc=0" "$?" 0
 "$LOCK" release "$C" m3 >/dev/null
 
 echo "[6] 未过期的锁不被回收（stale 很大）"
@@ -90,10 +93,14 @@ printf '%s' "$OUT" | grep -q 'proj/schema/schema.prisma 与主检出不同' && o
 [ -d "$S/e2e.lock" ] && ok "改了 schema 走独占锁目录" || no "改了 schema 仍未占独占锁"
 "$LOCK" release "$S" x2 >/dev/null
 
-echo "[12] 共享登记过期被回收：独占申请不被死掉的共享者卡住"
-mkdir -p "$S/e2e.shared"; printf 'ghost %s\n' "$(( $(date +%s) - 10000 ))" > "$S/e2e.shared/ghost"
-"$LOCK" acquire "$S" x3 --wait 0 --poll 0 --mode exclusive --stale 5400 >/dev/null 2>&1; eq "x3 独占 rc=0" "$?" 0
-[ ! -f "$S/e2e.shared/ghost" ] && ok "过期共享登记已回收" || no "过期共享登记未回收"
+echo "[12] 长时共享者不能被状态查询或独占申请按时间删除"
+mkdir -p "$S/e2e.shared"; printf 'long-shared %s\n' "$(( $(date +%s) - 10000 ))" > "$S/e2e.shared/long-shared"
+"$LOCK" status "$S" >/dev/null
+[ -f "$S/e2e.shared/long-shared" ] && ok "查询保留长时共享登记" || no "查询删除了共享登记"
+"$LOCK" acquire "$S" x3 --wait 0 --poll 0 --mode exclusive --stale 5400 >/dev/null 2>&1; eq "独占仍被长时共享者阻止 rc=1" "$?" 1
+[ -f "$S/e2e.shared/long-shared" ] && ok "长时共享登记仍在" || no "长时共享登记被抢走"
+"$LOCK" release "$S" long-shared >/dev/null
+"$LOCK" acquire "$S" x3 --wait 0 --poll 0 --mode exclusive >/dev/null; eq "释放共享后独占成功 rc=0" "$?" 0
 "$LOCK" release "$S" x3 >/dev/null
 
 echo "[13] 无声明的项目（不在 git 里）仍走独占（旧行为）"

@@ -8,7 +8,7 @@
 # 子命令：
 #   suggest  （worker 侧）按本次改动文件反查候选 spec，按相关度排序、受预算上限截断，并给出项目适配的命令
 #   record   （worker 侧）登记本轮实际跑过的范围 → <COORD>/e2e-scope/<module>.txt
-#   plan     （主 session 侧）汇总各 worker 登记 ∪ 集成分支 diff 反推 → 一次性回归集合 + 是否该升级全量
+#   plan     （回归 worker 侧）汇总各 worker 登记 ∪ 集成分支 diff 反推 → 一次性回归集合 + 是否该升级全量
 #
 # 用法：
 #   cc-fleet-e2e-scope suggest [--project-dir DIR] [--base REF] [--head REF] [--max N] [--quiet]
@@ -138,7 +138,7 @@ score_specs() {
 suggest_command() {
   local root="$1"; shift
   local specs="$*"
-  [ -z "$specs" ] && { echo "  （无候选：手工指定，或问主 session 要范围）"; return; }
+  [ -z "$specs" ] && { echo "  （无候选：手工指定，或报告需要范围裁定）"; return; }
   if [ -f "$root/scripts/e2e-shards.mjs" ]; then          # virtual-oms：分片声明是唯一事实源
     local shards="" sh
     while IFS= read -r sh; do

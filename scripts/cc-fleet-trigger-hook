@@ -1,55 +1,50 @@
 #!/usr/bin/env python3
-"""UserPromptSubmit hook：用户口头要求「多 session / 子 session」时强制提醒加载本技能。
-
-背景（2026-10-26 用户反馈）：长需求末尾一句「多 session 模式完成」、或「让子 session 去 xxx」，
-模型有时不加载 multi-session-dev，或者把「子 session」理解成 Agent 工具的 subagent。
-技能 description 只是软匹配，这里做确定性兜底：命中关键词就注入 additionalContext。
-
-stdin 为宿主 hook JSON（取 .prompt），stdout 为注入 JSON。
-worker（⟦FLEET-WORKER⟧ / ⟦CODEX-THREAD-WORKER⟧ / FLEET_ROLE=worker）与已显式调用技能时不注入。
-"""
-import json, os, re, sys
+"""UserPromptSubmit compatibility reminder; no scheduling or external configuration writes."""
+import json
+import os
+import re
+import sys
 
 TRIGGER = re.compile(
-    r'多\s*(?:个\s*)?(?:session|会话|窗口)'
-    r'|子\s*(?:session|会话)'
-    r'|(?:独立|并行|后台)\s*(?:session|会话)'
-    r'|(?:session|会话)\s*并行'
+    r'多\s*(?:个\s*)?(?:session|会话|窗口)|子\s*(?:session|会话)'
+    r'|(?:独立|并行|后台)\s*(?:session|会话)|(?:session|会话)\s*并行'
     r'|开\s*[几多两二三四五六七八九十\d]+\s*个?\s*(?:session|会话|worker)'
-    r'|multi[\s_-]*sessions?|sub[\s_-]*sessions?'
-    r'|\bfleet\b|cc-fleet',
-    re.I)
-WORKER = re.compile(r'⟦(?:FLEET-WORKER|CODEX-THREAD-WORKER)⟧')
+    r'|multi[\s_-]*sessions?|sub[\s_-]*sessions?|\bfleet\b|cc-fleet'
+    r'|子智能体|多智能体|\bsubagents?\b|\bmulti[\s_-]*agents?\b', re.I)
+WORKER = re.compile(r'^\s*⟦(?:FLEET-WORKER|CODEX-THREAD-WORKER)⟧')
 EXPLICIT = re.compile(r'^\s*[/$]multi-session-dev\b')
-
+MAINTENANCE = re.compile(r'(?:维护|修改|改进|审计|讨论|评审|迁移|更新).{0,35}(?:本技能|这个技能|multi-session-dev|多.?session.?技能)', re.I|re.S)
+DELEGATION = re.compile(r'(?:让|派|委派|交给|使用|用|调用|请).{0,12}(?:子智能体|多智能体|subagents?|子会话|子\s*session).{0,18}(?:处理|执行|调查|检查|审核|实现|做|完成|审|查|分工)', re.I|re.S)
 HINT = (
-    '【multi-session-dev 触发提醒】如用户要求多 session / 子会话执行任务，先读 multi-session-dev。'
-    '仅使用 Codex App 原生独立会话；子 session 不是内部 subagent。cc-fleet 仅协调任务卡/回执。'
-    '创建后立即归入“子 session”分区，不打开终端面板。不自建调度器，不静默切换后端。'
-    '调研/数据任务同样适用；不设并发上限，按依赖与文件归属并行。'
-    '讨论、审计、修改技能本身或仅顺带提及时不进入编排；worker 不再编排。'
+    '【multi-session-dev 触发提醒】用户要求多 session/子会话/fleet 或明确子智能体/多智能体委派时先读技能；'
+    '旧调用词统一使用主端原生 subagents。新建默认显式 fork_context=false；主历史短而聚焦、任务高度相关且转述遗漏风险/整理成本明显更高时，PM 可自主 true，register --context-reason 记一句理由，不问用户。'
+    'true 仅复制主端当前历史，不复制旧 worker 历史；噪声多、清除旧假设的重新诊断和独立验收执行用 false。author 准备可按收益选择，继承过主历史则 execute 前 fresh false。'
+    '身份选择与继承分开，fresh 不按阶段机械禁 true，清除旧假设时 false；继承不替代完整任务卡/完成条件/写入范围/交接。默认省略模型/深度以继承；reuse 保留 agent 自身历史。'
+    '主端做 PM 与必要精简证据核对，实际执行委派；独立成果新身份，关联回修优先 reuse，fresh 需实际收益与旧者停止/资产交接。'
+    '按真实宿主容量并行，脚本仅协调任务/回执；不自建后台调度器或切换后端。'
+    '普通单任务、顺带提及、讨论/维护本技能不自动业务编排；维护时明确要求委派则遵从。worker 不递归派发。'
 )
 
 
-def should_hint(prompt: str) -> bool:
-    if os.environ.get('FLEET_ROLE') == 'worker':
+def should_hint(prompt):
+    if os.environ.get('FLEET_ROLE') == 'worker' or WORKER.search(prompt) or EXPLICIT.search(prompt):
         return False
-    if WORKER.search(prompt) or EXPLICIT.search(prompt):
+    if MAINTENANCE.search(prompt) and not DELEGATION.search(prompt):
         return False
     return bool(TRIGGER.search(prompt))
 
 
-def main() -> int:
+def main():
     try:
         payload = json.load(sys.stdin)
     except ValueError:
         return 0
+    if not isinstance(payload, dict):
+        return 0
     prompt = payload.get('prompt') or ''
     if not isinstance(prompt, str) or not should_hint(prompt):
         return 0
-    json.dump({'hookSpecificOutput': {'hookEventName': 'UserPromptSubmit',
-                                      'additionalContext': HINT}},
-              sys.stdout, ensure_ascii=False)
+    json.dump({'hookSpecificOutput': {'hookEventName': 'UserPromptSubmit', 'additionalContext': HINT}}, sys.stdout, ensure_ascii=False)
     return 0
 
 

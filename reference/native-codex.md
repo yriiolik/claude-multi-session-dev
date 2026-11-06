@@ -1,61 +1,67 @@
-# 原生会话操作
+# 原生子智能体操作
 
-仅用宿主实际提供的原生线程/工作树工具；先发现工具并读 schema，不编造参数、projectId、startingState 或分支。
+工具名和字段以主端当次定义为准。以下是 2026-11-06 主端实际 schema 的窄映射，不是私有 SDK 或永久恢复承诺。
+本地脚本只收存 `{module,attempt,tool,args,result}` 证据封装；前两个是本地绑定字段，不能当 native 参数发送。
+首次派发前读实际 schema，后续宿主不兼容时报告并调整映射，不能猜参数。
 
-## 当前配置、创建与工作树
+## 创建、隔离与身份
 
-每次 create_thread/send_message_to_thread 前读取当前主 session 的可信运行元数据；必要时只读最新 turn 的配置。
-模型自述、全局 config 默认或上一批 worker 值不能替代当前会话。完整 model ID 保留 provider/自定义来源，
-思考深度用宿主支持的 thinking 值；会话中明确覆盖按字段与作用范围执行，未覆盖字段仍继承。
-把两个值显式作为工具参数传入；`nativeSettings={}` 只是无固定覆盖，不是已解析配置。
-缺字段时报告实际缺失并确认该字段，不猜值、不省略或借旧后端查询。不按角色自动降档，不改变窗口或压缩设置。
-父会话配置变化后下次创建/续聊用最新值，不中断运行中 turn。原生接口拒绝组合时报告真实错误。
+- `spawn_agent({message:<完整prompt>, fork_context:false})` 为默认，message/items 二选一；有连接器提及时按 schema 使用结构化 items。
+  默认不传 model/reasoning_effort，继承父模型/深度；明确用户覆盖才按当次字段传。返回 agent_id/nickname，只有 agent_id 用于身份。
+  true forks current thread history；false 或省略只给 initial prompt。本技能要求证据中显式布尔值，默认 false。
+  仅当主端历史短而聚焦、任务高度相关，且转述遗漏风险/整理成本明显更高时，PM 自主 true，以 register --context-reason 记录一句理由，不问用户。
+  历史噪声多、为清除旧假设重新诊断、独立验收执行均 false；继承不替代完整任务卡/完成条件/写入范围/交接。
+  独立执行复用现有判定：verify/integ/regression 且 phase != author；author 资产准备可选 true，进入 execute 时已有主历史则 fresh false。
+  true 复制主端当前历史，不复制旧 worker 历史；reuse 不 spawn，保留该 agent 自身历史。身份选择与继承选择分开。
+- prepare→主端 spawn→register --agent-id --attempt --evidence-file。worker 在写回执前读已登记 agentId；登记尚未到达不猜 ID。
+  spawn 未知是否成功时先记录 defer uncertain，核实原结果，不重复创建。没有公开查询接口时保留缺口，不调用 App 线程工具兜底。
+- 聊天不提供文件/权限隔离。代码在同仓库、含集成基线的独立 Git worktree 写入，正确子目录 bind；主 checkout 与用户改动受保护。
+  Git worktree 可由授权 worker 使用 Git 或已确认的宿主能力创建；不编造 spawn 的 cwd/worktree/sandbox 参数。
+  非代码写独立产物目录；只读卡可以共享读取来源，写交付物仍绑定独立目录。共享文件/端口/数据库/生成物有唯一 owner/锁。
 
-1. 用 list_projects 定位真实仓库对应的唯一项目；无匹配则说明缺口，不猜 ID。
-2. 创建首个线程前用 list_threads 查唯一“子 session”分区并缓存 sectionId。没有分区时按明确归类要求创建一次，
-   重名则先解决歧义。读取 prepare 生成的完整 promptFile，title 用名册 name。
-3. 遵守当前 create_thread schema 的工作树约束：用户明确要求 worktree 才传 worktree 环境；否则 local 创建，
-   让 worker 在任何写入前用 list_artifacts 检查隔离工作树，需要时 create_worktree(ref="fleet/<RQ>", sourceRoot=<repo>, allowAsync=true)。
-   有 operationId 用 get_worktree_creation_status 等完成，显式使用返回目录并进入正确子目录 bind。
-4. App 已创建的隔离工作树基线不符时，先确认干净再 switch --detach 到集成分支，读取实际目录项目规则；
-   有改动就保留现场，不 reset 或覆盖。solo 由主端用同样原生隔离能力建树再 bind --self 模块。
-   fresh 复用任务卡已绑定的工作树，不让新线程自动新建一套替代资产；新线程先核实旧线程确实不再执行。
+## 有界等待与真实状态
 
-## 侧栏与身份
+当前 `wait_agent({targets:[agent_id,...],timeout_ms:30000})` 等任一结束；timeout_ms 当前最小10000、最大3600000。
+主端通常 30000–60000ms 有界续等，按真实容量公平推进，不沿用 App 的 cursor/每批8条/0ms 规则。
+返回 status 按 ID 映射，可能为 pending_init/running/interrupted/shutdown/not_found，或 `{completed:string|null}` / `{errored:string}`。
+检查所有状态与 timed_out；空 status 加超时只记本次等待超时，不能把全体改成 running/failed/done。
+send_input 接受后的首次或多次 wait 可能仍返回上一轮 completed 全文。register 保存本轮 submission_id、派发证据和旧 completion 关联；本地 module/attempt 封装及时间戳不能证明返回属于新轮。
+completed 正文必须是 worker 最终完整 v2 JSON，rq/module/attempt/agent_id 与本轮登记一致，且与当前有效回执完全一致；observe 才记录经核实的 endProof。旧重复、错身份、null、摘要或缺回执只存原始事件，不授予结束/接管/交付资格。有回执或 handoff 本身也不证明停止。
 
-create_thread 返回真实 threadId/hostId 后，**下一步立即 move_thread_to_sidebar_section** 到已解析的分区；
-每条并行创建链各自立即移动，不能等整批完成。不在创建和移动之间登记、重新查分区或汇报。
-移动后可合并 list_threads 核验 section 的 itemKeys，再 register --session-id --host-id --sidebar-section-id。
-移动失败仍登记真实身份但不传分区参数，保留 pending，有界重试同一线程，不重建。
-只返回 clientThreadId 时登记 setting-up，按 host/项目/唯一标题解析真实 ID 后先移动再登记；不阻塞其它线程。
-client ID 不能用于 read/wait/message/move，不因 setup 慢重复创建。
+| 真实状态/事件 | 本地解释及行动 |
+|---|---|
+| pending_init/running | 仍可能执行；不建新 attempt，不把独立工作排给它 |
+| completed | raw 状态，仍需上述当前轮 JSON/回执核验；通过才确认本轮结束，业务验收另判 |
+| errored/interrupted/shutdown | 无当前轮关联证明只存原始状态并保留缺口，不凭封装授予接管/释放；可核当前失败 JSON或已有同轮 endProof 才确认结束，不补造业务完成 |
+| 孤立 not_found/未知/工具错误 | 可见性缺口；不认定停止/释放，不向同资产派新写者；有界核实后报告具体阻塞 |
+| close_agent 成功返回 | previous_status 只是旧快照；已有同轮真实结束证据再成功 close，才派生 closed/released；缺结束证明则 closing/releasing，继续核实 |
+| 已确认关闭后 wait not_found | 保留关闭证明与释放结论，nativeState=not_found；不是孤立 not_found，不伪造 shutdown |
 
-当前侧栏是平级项，分区不代表有父子容器；创建与移动非原子，不能保证零闪现。禁止私有 UI 状态、额外终端面板。
-成功创建后按宿主要求在最终响应单独输出 created-thread 指令，真实 threadId 或仍 pending 的 clientThreadId 二选一。
+正常只消费结果摘要和回执；异常/缺回执/证据矛盾才委派相应负责人定向查证，不能主端全量读日志重做调查。
+保存 CURRENT 的当前 agent/attempt、native 状态证据、业务结果、容量、问题与下一步；状态变化才更新用户，不逐条转述过程。
+业务问题先用原文/已答事项裁定，确需用户再合并问；实际工具审批走宿主，send_input 不代批。
 
-## 监督、接续与异常
+## 关联接续、关闭与恢复
 
-- wait_threads 每批最多8个真实 hostId/threadId，cursor 增量读取；批次大小不限制开发并发。
-  每轮全部未完成批次先 timeoutMs:0 即时扫描，独立批次可并行；处理事件后对仍可执行线程做一次≤30秒等待，
-  多批轮换，随后重新扫描全部。不能只长等一个批次而漏其它输入。
-- 检查 wake、全部 polls、errors；超时也可带事件。先保存问题与动作，再推进 cursor；cursor 不代表问题已解决。
-- 回执先 status/collect；done 必须同时核实宿主本轮已结束，避免回执写完但仍在改成果。
-  read_thread 只查异常/输入/无回执结束，先 turnLimit:1、includeOutputs:false，再按需要扩大，已解释且无变化不重复读。
-- 无活动约60秒且无法解释时读一次确认是否漏输入；真实长计算有证据则继续有界等待，不按时间自动判失败。
-  未知/离线/读取错误有界重试并记录，不伪装 running，也不靠文件 mtime 推断原生执行状态。
-- 依赖通过后主端原生创建/消息接续。新交付轮次先 reply 生成 attempt；原生消息被接受后 register 同一身份。
-  活跃 turn 内补答案不新建 attempt；发送不确定先核实，沿用已有 next-prompt，不重复 reply 或盲目再发。
-- fresh 先取得旧目标线程 ended 状态，再 reply --session fresh 并原生创建；绑定新身份必须带 --attempt。
-  旧名册、回执、handoff 按 attempt 保留；不自动归档/暂停旧线程。没有原生 interrupt 时请用户在 App 暂停，归档不等于停止。
+- 活跃执行只补本任务必要澄清或安全停点。`send_input({target:agent_id,message:...})` 返回 submission_id 只证明接受/入队，
+  不证明执行结束；默认 interrupt=false/省略会排队。不要把独立新轮排在仍执行任务后。
+  必须立即停点时按实际支持 `interrupt:true`，中断后仍等待终态并核资产，不把“已请求”当“已停止”。
+- 关联 reuse：先 observe 并取得经核实的本轮 endProof；reply --session reuse --reuse-reason 生成当前完整卡和运行说明；
+  向相同 agent send_input，register 同 ID 和实际接受证据。它保留自身上下文，模型参数不在 send_input schema 中。
+- fresh：先确认旧轮停止、持久交接与真实工作树/产物目录，记录具体 fresh-reason；同 module reply fresh 新 attempt。
+  旧执行者不再写后才让新 agent 接管原资产。spawn 按上述新建策略，默认 false，满足条件可 true；不按阶段名称机械禁 true，清除旧假设时须 false。
+  新旧身份与提交/脏资产均保留，true 不能取代旧 worker 交接。
+  可先关闭旧者再换新释放容量，或旧轮终态后先完成交接再换；关闭旧者的观察属于旧 attempt，不冒充新 agent 状态。
+- 结果与 handoff 收存后及时 `close_agent({target:agent_id})`；返回 previous_status 是关闭请求前状态，已有同轮结束证据且 close 实际成功即可确认关闭并释放；宿主实测卸载后 wait 返回 not_found，不能强制等不存在的 shutdown。
+  未知执行态下只收到 close 响应仍先保存关闭请求与缺口，不用 previous_status 冒充先前执行完成。已完成且仍开放者也占容量；不要囤积无当前用途的 agent。
+  reply、deliveryReady 与 close 使用同一当前轮证明；旧 completed 缓存后再 close 仍是未核实的 closing，不会转成 closed/released。
+- 已关闭但需要 reuse：`resume_agent({id:agent_id})`，核实际返回状态与同 ID；若旧轮已真实结束、close 已确认，且之后只有恢复，没有新提交，resume 的 pending_init 表示恢复初始化；可向同 ID 排入本任务接续，保留旧终态及恢复证据。
+  若无上述证明，pending_init/running 仍需等到可安全接续，不能据此排新轮。
+  shutdown/not_found 未证明恢复时不称成功；保留已确认旧者关闭的证据，可在有交接时 fresh。孤立 not_found 无关闭证明仍阻断接管。恢复后实际终态可重新裁定续做；
+  不能靠磁盘名册恢复真实 agent，不保证跨客户端重启恢复。失败时可在确认原执行者停止后按 fresh 接管资产，并记录原因。
 
-## 输入与审批
+## 容量与工具缺口
 
-业务问题 worker 在本轮 blocked 回执的 needsInput 汇总，主端先查原始要求、已答问题和授权，能裁定就继续，
-缺用户决定才合并提问。实际审批仍走宿主真实通道，普通线程消息不能答另一个尚未完成的审批工具。
-
-快照的 activeFlags、输入/审批工具标记、明确求助或 blocked 回执出现时核实正文；异步输入工具 completed 不代表用户已答。
-缺正文就记 unknown 可见性缺口，不猜要批准什么。问题按 request/turn ID 或原文指纹去重，保存 CURRENT 未解决问题及证据。
-已答业务问题可消息通知 worker 记录继续，但不能声称关闭旧弹卡；无公开答卡接口时明确指出线程和 App 操作入口。
-
-确定等待输入/审批的线程移出长等集合，仍纳入每轮即时扫描；其它卡继续。全部剩余都等用户时明确交接后结束，
-不空转，不宣称后台自动唤醒。收到答案后先即时快照核实真实恢复，再放回运行集合。
+按宿主真实容量并行；无业务固定并发上限不等于无限创建。容量拒绝用 defer capacity 保存实际错误，先收存和关闭已完成者，
+确认释放后再派；占用都为必要执行时有界等待。缺 native 工具用 defer tools，不能后台 CLI/外部调度器或 App 独立线程替换。
+resume 受容量限制也同样处理。全部剩余都需用户输入时交接，不宣称主端结束后仍会自动被唤醒。

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Codex App native fleet: task cards, isolated worktrees, receipts and handoffs.
-The host owns thread creation, supervision and messaging. No background scheduler.
+"""Native subagent task assets: isolated worktrees, receipts and handoffs.
+Only the parent calls native tools; this script records their evidence, never schedules agents.
 """
 import argparse
 import contextlib
@@ -21,9 +21,127 @@ import uuid
 ROOT = Path(__file__).resolve().parent
 ACCEPT_ROLES = ('verify', 'integ', 'regression')
 MAX_REPLIES = int(os.environ.get('CC_FLEET_MAX_REPLIES', '3'))
-NATIVE_SETTINGS_ACTION = ('Resolve model and thinking from the current parent session, preserving the full '
-    'provider-qualified model ID. Apply explicit conversation overrides field by field. '
-    'Pass both as native tool arguments; nativeSettings={} is unresolved, not App defaults. ')
+NATIVE_SETTINGS_ACTION = ('Parent: discover the current native tool schema. Choose agent identity separately from parent-history inheritance; reuse retains that agent\'s own history. '
+    'omit model/reasoning_effort by default to inherit. Never infer sandbox isolation from chat isolation. ')
+TERMINAL = ('completed', 'errored', 'interrupted', 'shutdown', 'closed')  # closed is a derived successful-close confirmation
+
+
+def independent_acceptance(d):
+    return d['role'] in ACCEPT_ROLES and d.get('phase') != 'author'
+
+
+def spawn_policy(d):
+    return dict(defaultForkContext=False, allowForkContext=not independent_acceptance(d))
+
+
+def spawn_action(d):
+    action = 'Call spawn_agent with the complete promptFile and explicit fork_context=false by default. '
+    if independent_acceptance(d):
+        return action+'Independent acceptance requires false. '
+    return action+('PM may choose true without asking the user only when the current parent history is short/focused, '
+        'the task is highly related, and restating it risks significant omissions or costs more; '
+        'register with --context-reason containing one sentence. True copies current parent history, never an old worker\'s history. '
+        'Use false for noisy history or diagnosis/fresh intended to clear old assumptions. '
+        'Inheritance never replaces the complete task card, completion criteria, write scope or handoff. ')
+
+
+def is_agent(d):
+    return d.get('executionKind') == 'subagent'
+
+
+def require_agent(d):
+    if not is_agent(d):
+        raise ValueError('legacy App roster is read-only; never reinterpret sessionId as agentId. '
+                         'Preserve assets, verify old writer stopped, then prepare a new native task as documented')
+
+
+def evidence(path):
+    p = Path(path).resolve()
+    content = p.read_bytes()
+    if not content.strip():
+        raise ValueError('empty native evidence')
+    return dict(path=str(p), sha256=hashlib.sha256(content).hexdigest()), content
+
+
+def native_event(path, tool, d):
+    ref, content = evidence(path)
+    e = json.loads(content)
+    if not isinstance(e, dict) or not isinstance(e.get('tool'), str) or e['tool'].split('__')[-1] != tool:
+        raise ValueError('evidence must be one {tool,args,result} event for '+tool)
+    if e.get('module') != d['module'] or e.get('attempt') != d['attempt']:
+        raise ValueError('native evidence wrapper must bind exact module and attempt (not native tool args)')
+    if not isinstance(e.get('args'), dict) or not isinstance(e.get('result'), dict):
+        raise ValueError('native event requires actual args and result objects')
+    return ref, e['args'], e['result']
+
+
+def native_status(value):
+    if isinstance(value, dict):
+        if set(value) == {'completed'} and (value['completed'] is None or isinstance(value['completed'], str)):
+            return 'completed'
+        if set(value) == {'errored'} and isinstance(value['errored'], str):
+            return 'errored'
+    elif isinstance(value, str) and value in ('pending_init', 'running', 'interrupted', 'shutdown', 'not_found'):
+        return value
+    raise ValueError('unrecognized native status; preserve raw evidence and inspect current host schema')
+
+
+def execution_scope(d):
+    return dict(agentId=d.get('agentId'), attempt=d['attempt'], submissionId=d.get('submissionId'),
+                dispatchSha256=(d.get('dispatchEvidence') or {}).get('sha256'))
+
+
+def proved_end(d, rt=None):
+    rt = d.get('runtime', {}) if rt is None else rt
+    return (rt.get('executionEnded') is True and rt.get('attempt') == d['attempt']
+            and rt.get('endProof', {}).get('scope') == execution_scope(d))
+
+
+def resumed_idle(d, rt=None):
+    rt = d.get('runtime', {}) if rt is None else rt
+    proof = rt.get('resumeProof', {})
+    return (rt.get('state') == 'pending_init' and rt.get('resumeAfterEnded') is True
+            and proof.get('scope') == execution_scope(d)
+            and proof.get('priorEndProof', {}).get('scope') == execution_scope(d))
+
+
+def json_hash(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+
+
+def current_end_proof(d, rt=None):
+    rt = d.get('runtime', {}) if rt is None else rt
+    return (rt['endProof'] if proved_end(d, rt) else
+            rt['resumeProof']['priorEndProof'] if resumed_idle(d, rt) else None)
+
+
+def worker_end_proof(c, d, raw, state, ref):
+    """The host may cache the previous turn. Local wrappers never attest turn identity."""
+    try:
+        final = json.loads(raw[state])
+    except (ValueError, TypeError):
+        return None, 'terminal payload is not a complete worker JSON receipt'
+    if not d.get('dispatchEvidence') or (d.get('dispatch') or {}).get('scope') != execution_scope(d):
+        return None, 'no matching current dispatch/submission registration'
+    known = current_end_proof(d)
+    if known and state == known['nativeState'] and json_hash(final) == known['payloadSha256']:
+        return dict(known, evidence=ref), None  # same already verified end, no new submission
+    if 'transport' not in d:
+        return None, 'retired identity requires its previously verified completion proof'
+    errors = receipt_errors(c, d, final)
+    if errors:
+        return None, 'worker JSON identity/receipt invalid: ' + '; '.join(errors)
+    receipt, _, errors = read_receipt(c, d)
+    if receipt is None or errors or receipt != final:
+        return None, 'worker JSON must equal the valid current receipt; receipt alone never proves end'
+    digest = json_hash(final)
+    if digest == ((d.get('dispatch') or {}).get('previousCompletion') or {}).get('payloadSha256'):
+        return None, 'cached previous completion for this accepted submission'
+    if state == 'errored' and final['result'] == 'done':
+        return None, 'errored payload cannot attest a done result'
+    return dict(scope=execution_scope(d), nativeState=state, evidence=ref,
+                payloadSha256=digest, result=final['result']), None
+
 
 
 def run(argv, cwd=None, check=True):
@@ -76,7 +194,7 @@ def coord(value):
     if f.get('version') != 2:
         raise ValueError('not a v2 coordination directory')
     if f.get('owner', {}).get('host') != 'codex-app':
-        raise ValueError('this skill supports Codex App native sessions only')
+        raise ValueError('unrecognized coordination owner; no backend fallback')
     return c
 
 
@@ -133,52 +251,83 @@ def archive_dir(c, d):
     return c/'history'/d['module']/d['attempt']
 
 
+def persist_event(c, d, ref):
+    content = Path(ref['path']).read_bytes()
+    if hashlib.sha256(content).hexdigest() != ref['sha256']:
+        raise ValueError('native evidence changed during operation')
+    dest = archive_dir(c, d)/'native-events'/(ref['sha256']+'.json')
+    atomic_text(dest, content.decode())
+    return dict(path=str(dest), source=ref['path'], sha256=ref['sha256'])
+
+
+def bound_assets(c, d, value):
+    wt = verify_worktree(c, d, value)
+    return dict(worktree=str(wt), branch=None if meta(c).get('assetKind') == 'artifacts' else git(wt, 'rev-parse', '--abbrev-ref', 'HEAD'),
+                cwd=str(wt/d['subdir']) if d.get('subdir') else str(wt))
+
+
 def init(a):
-    repo = toplevel(a.cwd)
-    common = Path(git(repo, 'rev-parse', '--path-format=absolute', '--git-common-dir')).resolve()
-    base = a.base or git(repo, 'symbolic-ref', '--short', 'HEAD')
-    sha = git(repo, 'rev-parse', '--verify', base+'^{commit}')
-    subdir = clean_subdir(Path(a.cwd).resolve().relative_to(repo).as_posix())
     rq = name(a.rq or 'RQ-'+datetime.datetime.now().strftime('%Y%m%d-%H%M%S')+'-'+uuid.uuid4().hex[:8])
-    c = common/'fleet'/rq
-    c.mkdir(parents=True, exist_ok=False)
-    try:
-        git(repo, 'branch', 'fleet/'+rq, sha)
-    except Exception:
-        c.rmdir()
-        raise
+    if a.workspace:
+        repo = Path(a.cwd).resolve()
+        if not repo.is_dir() or a.base:
+            raise ValueError('workspace init needs an existing directory and no --base')
+        common, base, sha, subdir = repo/'.fleet', None, None, ''
+        c = common/rq
+        c.mkdir(parents=True, exist_ok=False)
+    else:
+        repo = toplevel(a.cwd)
+        common = Path(git(repo, 'rev-parse', '--path-format=absolute', '--git-common-dir')).resolve()
+        base = a.base or git(repo, 'symbolic-ref', '--short', 'HEAD')
+        sha = git(repo, 'rev-parse', '--verify', base+'^{commit}')
+        subdir = clean_subdir(Path(a.cwd).resolve().relative_to(repo).as_posix())
+        c = common/'fleet'/rq
+        c.mkdir(parents=True, exist_ok=False)
+        try:
+            git(repo, 'branch', 'fleet/'+rq, sha)
+        except Exception:
+            c.rmdir()
+            raise
     owner = a.owner_id or os.environ.get('CODEX_THREAD_ID')
     d = dict(version=2, rq=rq, repo=str(repo), commonDir=str(common), subdir=subdir,
-        base=base, baseCommit=sha, integrationBranch='fleet/'+rq, codexTransport='native-only',
+        base=base, baseCommit=sha, integrationBranch=None if a.workspace else 'fleet/'+rq,
+        assetKind='artifacts' if a.workspace else 'git', executionKind='subagent', codexTransport='native-subagents',
         inboxRoot=str((Path(tempfile.gettempdir())/'fleet-v2-inbox'/rq).resolve()),
         owner=dict(host='codex-app', id=owner or 'controller-'+uuid.uuid4().hex,
                    identitySource='session' if owner else 'generated-controller'), createdAt=time.time())
     atomic(c/'fleet.json', d)
-    atomic_text(c/'base.ref', base+'\n')
-    emit(dict(d, coord=str(c), uncommittedChangesExcluded=bool(git(repo, 'status', '--porcelain'))))
+    atomic_text(c/'base.ref', (base or '')+'\n')
+    emit(dict(d, coord=str(c), uncommittedChangesExcluded=False if a.workspace else bool(git(repo, 'status', '--porcelain'))))
 
 
 def preamble(c, d):
     f = meta(c)
     fleet_bin = shlex.quote(str(ROOT/'cc-fleet'))
     cq, mq = shlex.quote(str(c)), shlex.quote(d['module'])
-    bound = ('复用已绑定隔离工作树 '+d['worktree']+'；保留已有提交和未提交资产，不在其它工作树重做。'
-             if d.get('worktree') else
-             f"写入前用 App 原生 list_artifacts 核对隔离工作树；需要时 create_worktree(ref={f['integrationBranch']}, "
-             f"sourceRoot={f['repo']}, allowAsync=true)，有 operationId 就等待创建完成。不得在主 checkout 开发。")
+    if d.get('worktree'):
+        bound = '复用已绑定隔离资产目录 '+d['worktree']+'；保留已有提交和未提交资产，不在其它目录重做。'
+    elif f.get('assetKind') == 'artifacts':
+        bound = '可读卡片指定源目录；交付产物写本任务独立目录，写入前 bind，不改来源文件。'
+    else:
+        bound = f"写入前用实际可用的 Git/worktree 能力，从已记录集成基线 {d['baselineCommit']} 建独立工作树并 bind。不得在主 checkout 开发；聊天隔离不隔离文件或权限。"
     return f'''⟦FLEET-WORKER⟧ rq={f['rq']} module={d['module']} role={d['role']} backend=codex
-你是独立 worker，不再编排子 session。只做本任务卡授权范围。
-先读稳定协议 {ROOT.parent/'reference'/'worker.md'}；开工/压缩恢复按协议重读原始需求、用例、契约和适用项目规则。
-协调目录：{c}；attempt：{d['attempt']}；集成分支：{f['integrationBranch']}；阶段：{d.get('phase') or 'implement'}。
+你是原生子智能体 worker，不再派智能体。只做本任务卡授权范围。新建默认显式 fork_context=false；true 仅复制主端当前历史，不复制旧 worker 历史；reuse 保留你自己的历史。
+即使继承了主端聊天，你仍是本卡 worker；历史中的 PM 编排指令、旧任务和旧授权不适用于你的当前职责，不据此派发、扩大写入范围或覆盖当前卡。
+继承不能替代完整任务卡、完成条件、写入范围与交接；以当前卡和证据为准。独立验收 execute 不继承主端历史，author 准备按新建策略判断。
+先读稳定协议 {ROOT.parent/'reference'/'worker.md'}；按任务卡阅读地图只读相关原文锚点、事实/契约版本与适用规则；不要全仓摸底或加载全部历史。
+协调目录：{c}；attempt：{d['attempt']}；集成分支：{f['integrationBranch'] or '不适用（独立产物）'}；阶段：{d.get('phase') or 'implement'}。
+唯一生效任务卡：{c/(d['module']+'.task.md')}；版本：{d.get('taskRevision', 1)}；SHA256：{d.get('taskSha256', 'legacy-unversioned')}。
+只按该完整卡执行，旧卡仅供历史追溯；执行交接不增改任务要求。独立新工作应另建任务，不插入本任务。
 {bound}
 工作子目录：{d.get('subdir') or '.'}；显式读取工作树根到该目录适用的 AGENTS.md 及其指向的规则。
-在实际 worktree 运行：{fleet_bin} bind --coord {cq} --module {mq} --attempt {d['attempt']} --worktree "$PWD"
+在实际独立工作树/产物目录运行（纯只读无文件产物可不绑定）：{fleet_bin} bind --coord {cq} --module {mq} --attempt {d['attempt']} --worktree "$PWD"
 协调目录不可写时，回执写真实 worktree，使用下列临时路径；不要为写回执扩大权限。
 先覆写交接文件 {handoff_path(c,d)}；不可写则用 {handoff_path(c,d,True)}。
+回执前读名册 {record(c,d["module"])} 的 agentId；未登记时请主端登记，不猜 ID。
 原子写回执 {c/(d['module']+'.receipt.json')}；不可写则用 {inbox(c,d)}。
 用 {fleet_bin} validate-receipt --coord {cq} --module {mq} --receipt-file '<实际回执路径>' 一次检查全部问题，修正后再报告。
-最后只回复同一 JSON；回执模板：
-{{"version":2,"rq":"{f['rq']}","module":"{d['module']}","attempt":"{d['attempt']}","worktree":"隔离工作树绝对路径","result":"done|failed|blocked","summary":"本轮实际结果","commit":"完整提交或验收SHA","tests":[{{"command":"实际检查","result":"passed|failed|blocked|not-run","evidence":"证据路径或简短输出"}}],"risks":[],"needsInput":[]}}
+最后只回复与有效回执完全一致、包含本轮 rq/module/attempt/agent_id 的完整 JSON；不要只回摘要或 null，主端据此排除上轮 completed 缓存。回执模板：
+{{"version":2,"agent_id":"从当前名册读取真实agentId","rq":"{f['rq']}","module":"{d['module']}","attempt":"{d['attempt']}","worktree":"隔离工作树/产物目录绝对路径；纯只读可为null","result":"done|failed|blocked","summary":"本轮实际结果","commit":"代码用完整提交或验收SHA；非代码可为空","tests":[{{"command":"实际检查","result":"passed|failed|blocked|not-run","evidence":"证据路径或简短输出"}}],"risks":[],"needsInput":[]}}
 
 任务卡：
 '''
@@ -195,26 +344,29 @@ def prepare(a):
     if a.self_dev and a.role != 'developer':
         raise ValueError('--self requires developer role')
     subdir = clean_subdir(f.get('subdir', '') if a.subdir is None else a.subdir)
-    if subdir and run(['git', '-C', f['repo'], 'cat-file', '-e', f"{f['integrationBranch']}:{subdir}"], check=False).returncode:
+    if f.get('assetKind') != 'artifacts' and subdir and run(['git', '-C', f['repo'], 'cat-file', '-e', f"{f['integrationBranch']}:{subdir}"], check=False).returncode:
         raise ValueError('subdir not found on integration branch')
     task = Path(a.task).resolve().read_text() if a.task else ''
     if not task.strip():
         raise ValueError('empty task card')
     with lock(c, m):
         if record(c, m).exists():
-            raise ValueError('module already registered; use reply')
+            raise ValueError('module already registered; independent work needs a new module; reply only for tightly related continuation')
         d = dict(version=2, module=m, backend='codex', transport='self' if a.self_dev else 'native',
             role=a.role, permissions='inherit', attempt=uuid.uuid4().hex,
             state='self' if a.self_dev else 'prepared', name=f"↳{m}@{f['rq']}", createdAt=time.time(),
-            phase=a.phase, replies=0, sessionId=None, shortId=None, hostId=None, worktree=None,
-            branch=None, subdir=subdir, cwd=None, baselineCommit=git(f['repo'], 'rev-parse', f['integrationBranch']))
+            phase=a.phase, replies=0, executionKind='subagent', agentId=None, sessionId=None,
+            runtime=dict(state='unknown', capacity='unknown'), readOnly=a.read_only, worktree=None,
+            branch=None, subdir=subdir, cwd=None, baselineCommit=None if f.get('assetKind') == 'artifacts' else git(f['repo'], 'rev-parse', f['integrationBranch']),
+            taskRevision=1, taskSha256=hashlib.sha256(task.encode()).hexdigest())
         atomic(record(c, m), d)
         atomic_text(c/f'{m}.task.md', task)
         atomic_text(c/f'{m}.prompt.md', preamble(c, d)+task)
     emit(dict(d, coord=str(c), integrationBranch=f['integrationBranch'], promptFile=str(c/f'{m}.prompt.md'),
         nativeSettings=native_settings(), nativeSettingsPolicy='inherit-parent',
-        nextAction=NATIVE_SETTINGS_ACTION+('Use an App native isolated worktree, bind it, then develop here.' if a.self_dev else
-            'Call create_thread with the complete promptFile; immediately move each real thread to the resolved 子 session section, verify, then register.')))
+        **({} if a.self_dev else dict(spawnPolicy=spawn_policy(d))),
+        nextAction=NATIVE_SETTINGS_ACTION+('Only with explicit user instruction, bind isolated assets for self execution.' if a.self_dev else
+            spawn_action(d)+'Register the returned agent_id using its actual evidence event. No App thread or sidebar action.')))
 
 
 def check_attempt(a, d):
@@ -225,7 +377,24 @@ def check_attempt(a, d):
 
 
 def verify_worktree(c, d, value):
-    f, wt = meta(c), toplevel(value)
+    f = meta(c)
+    requested = Path(value).resolve()
+    for rp in (c/'v2').glob('*.json'):
+        other = json.loads(rp.read_text())
+        if other.get('module') != d['module'] and other.get('worktree'):
+            owned = Path(other['worktree']).resolve()
+            if requested == owned or requested in owned.parents or owned in requested.parents:
+                raise ValueError('asset directory overlaps another module; preserve unique writer ownership')
+    if f.get('assetKind') == 'artifacts':
+        wt = requested
+        if not wt.is_dir() or wt == Path(f['repo']).resolve():
+            raise ValueError('use an existing independent artifact directory, not source root')
+        if wt == c or c in wt.parents or wt in c.parents:
+            raise ValueError('artifact directory must not overlap coordination assets')
+        if d.get('worktree') and Path(d['worktree']).resolve() != wt:
+            raise ValueError('artifact directory already bound elsewhere')
+        return wt
+    wt = toplevel(value)
     if wt == Path(f['repo']).resolve():
         raise ValueError('worker must not use primary checkout')
     if Path(git(wt, 'rev-parse', '--path-format=absolute', '--git-common-dir')).resolve() != Path(f['commonDir']).resolve():
@@ -241,13 +410,13 @@ def bind(a):
     c = coord(a.coord)
     def bound_record():
         d = load(c, a.module)
+        require_agent(d)
         check_attempt(a, d)
         wt = verify_worktree(c, d, a.worktree)
-        d.update(worktree=str(wt), branch=git(wt, 'rev-parse', '--abbrev-ref', 'HEAD'),
-                 cwd=str(wt/d['subdir']) if d.get('subdir') else str(wt))
+        d.update(bound_assets(c, d, wt))
         return d
     try:
-        with lock(c, a.module):
+        with lock(c, 'ROSTER'), lock(c, a.module):
             d = bound_record()
             atomic(record(c, a.module), d)
     except PermissionError:
@@ -264,32 +433,206 @@ def bind(a):
 
 def register(a):
     c = coord(a.coord)
-    with lock(c, a.module):
+    # Serialize cross-module identity checks too, not just the individual record.
+    with lock(c, 'ROSTER'), lock(c, a.module):
         d = load(c, a.module)
+        require_agent(d)
         check_attempt(a, d)
         if d['transport'] != 'native':
             raise ValueError('register requires a native worker')
-        if a.client_thread_id:
-            if d.get('sessionId') or a.sidebar_section_id:
-                raise ValueError('pending clientThreadId cannot replace real identity or prove sidebar placement')
-            if d.get('clientThreadId') and d['clientThreadId'] != a.client_thread_id:
-                raise ValueError('a different setup is already pending; reconcile instead of creating again')
-            d.update(clientThreadId=a.client_thread_id, state='setting-up')
-            if a.host_id:
-                d['hostId'] = a.host_id
+        if a.client_thread_id or a.host_id or a.sidebar_section_id:
+            raise ValueError('App thread setup/sidebar arguments are retired; use actual native agent evidence')
+        aid = a.agent_id or a.session_id
+        if not aid or not aid.strip():
+            raise ValueError('nonempty agent ID required')
+        if not a.evidence_file:
+            raise ValueError('register requires --evidence-file with actual native args/result')
+        op = 'send_input' if d['state'] == 'replying' else d.get('dispatch', {}).get('tool', 'spawn_agent')
+        ref, args, result = native_event(a.evidence_file, op, d)
+        reason = (a.context_reason or '').strip()
+        if op == 'spawn_agent':
+            if type(args.get('fork_context')) is not bool or result.get('agent_id') != aid:
+                raise ValueError('spawn evidence requires explicit boolean fork_context and exact returned agent_id')
+            if args['fork_context']:
+                if independent_acceptance(d):
+                    raise ValueError('independent acceptance requires fork_context=false; author preparation is separate')
+                if not reason or len(reason.splitlines()) != 1:
+                    raise ValueError('fork_context=true requires --context-reason with one nonempty line explaining the benefit')
+            elif a.context_reason is not None:
+                raise ValueError('--context-reason applies only to spawn with fork_context=true')
         else:
-            if d.get('sessionId') and d['sessionId'] != a.session_id:
-                raise ValueError('task already has a different threadId')
-            host = a.host_id or d.get('hostId') or 'local'
-            if d.get('hostId') and d['hostId'] != host:
-                raise ValueError('task already belongs to a different host')
-            if any(x.get('sessionId') == a.session_id and x.get('hostId', 'local') == host for x in d.get('previousSessions', [])):
-                raise ValueError('cannot register the retired thread as the fresh session')
-            d.update(sessionId=a.session_id, hostId=host, clientThreadId=None, state='running')
-            if a.sidebar_section_id:
-                d['sidebar'] = dict(state='placed', sectionId=a.sidebar_section_id, source='codex-app-native')
-            else:
-                d['sidebar'] = d.get('sidebar') or dict(state='pending', source='codex-app-native')
+            if a.context_reason is not None or 'fork_context' in args:
+                raise ValueError('reuse retains agent history; context-reason/fork_context apply only to spawn')
+            if args.get('target') != aid or not result.get('submission_id') or d.get('agentId') != aid:
+                raise ValueError('reuse requires accepted send_input to the exact existing agent')
+            if independent_acceptance(d) and d.get('spawnContext', {}).get('forkContext') is True:
+                raise ValueError('independent acceptance cannot reuse parent-inherited history; use fresh with fork_context=false')
+        if d.get('agentId') and d['state'] != 'replying':
+            # Registration replay is idempotent only for the same native event.
+            if (d['agentId'] == aid and d.get('dispatchEvidence', {}).get('sha256') == ref['sha256']
+                    and (op != 'spawn_agent' or d.get('spawnContext', {}).get('reason') == (reason or None))):
+                emit(d)
+                return
+            raise ValueError('already registered; do not overwrite identity or replay a new dispatch')
+        for p in (c/'v2').glob('*.json'):
+            other = json.loads(p.read_text())
+            identities = [other.get('agentId')]+[x.get('agentId') for x in other.get('previousSessions', [])]
+            if aid in identities and (other['module'] != d['module'] or aid != d.get('agentId')):
+                raise ValueError('agent identity already belongs to a different result or retired attempt')
+        ref = persist_event(c, d, ref)
+        if op == 'spawn_agent':
+            d['spawnContext'] = dict(forkContext=args['fork_context'], reason=reason or None)
+        d.update(agentId=aid, sessionId=aid, state='dispatched', dispatchEvidence=ref,
+                 submissionId=result.get('submission_id') if op == 'send_input' else None,
+                 runtime=dict(state='pending_init' if op == 'spawn_agent' else 'unknown', capacity='occupied',
+                              evidence=ref, observedAt=time.time(), attempt=d['attempt']))
+        d['dispatch'] = dict(tool=op, scope=execution_scope(d), evidence=ref,
+                             previousCompletion=d.get('lastCompletion') if op == 'send_input' else None)
+        atomic(record(c, a.module), d)
+    emit(d)
+
+
+def observe(a):
+    """Ingest one actual host event. No native tools are called here."""
+    c = coord(a.coord)
+    with lock(c, a.module):
+        current = load(c, a.module)
+        require_agent(current)
+        retired = None
+        if a.agent_id == current.get('agentId'):
+            d = current
+            check_attempt(a, d)
+        else:
+            retired = next((x for x in current.get('previousSessions', [])
+                            if x.get('agentId') == a.agent_id and x['attempt'] == a.attempt), None)
+            if not retired or a.tool == 'resume_agent':
+                raise ValueError('observation requires exact registered agent/attempt; retired agents cannot resume')
+            d = dict(retired, module=current['module'])
+        def save_observation():
+            if retired is not None:
+                retired.update({k:v for k,v in d.items() if k != 'module'})
+            atomic(record(c, a.module), current)
+
+        ref, args, result = native_event(a.evidence_file, a.tool, d)
+        prior = d.get('runtime', {})
+        closure = d.get('closure')
+        close_confirmed = False
+        if a.tool == 'wait_agent':
+            if a.agent_id not in args.get('targets', []):
+                raise ValueError('agent not in wait targets')
+            statuses = result.get('status')
+            if not isinstance(statuses, dict):
+                raise ValueError('wait result requires status map')
+            if a.agent_id not in statuses:
+                if result.get('timed_out') is not True:
+                    raise ValueError('missing target state without timeout')
+                ref = persist_event(c, d, ref)
+                d['lastWait'] = dict(timedOut=True, evidence=ref, observedAt=time.time())
+                save_observation()
+                emit(d)
+                return  # timeout does not invent running/completed/failed
+            raw = statuses[a.agent_id]
+        elif a.tool == 'resume_agent':
+            if args.get('id') != a.agent_id:
+                raise ValueError('resume target mismatch')
+            raw = result.get('status')
+        else:
+            if args.get('target') != a.agent_id:
+                raise ValueError('close target mismatch')
+            # previous_status alone is not shutdown. A successful close plus
+            # already recorded end of this exact execution confirms release.
+            native_status(result.get('previous_status'))
+            close_confirmed = current_end_proof(d, prior) is not None
+            raw = 'closed' if close_confirmed else 'closing'
+        state = raw if raw in ('closing', 'closed') else native_status(raw)
+        native_state = native_status(result['previous_status']) if a.tool == 'close_agent' else state
+        closure_valid = (closure and closure.get('scope') == execution_scope(d)
+                         and closure.get('endProof', {}).get('scope') == execution_scope(d))
+        if state == 'not_found' and closure_valid:
+            state = 'closed'  # closure proof, never isolated not_found, supports release
+        ref = persist_event(c, d, ref)
+        end_proof, end_problem = None, None
+        if a.tool != 'close_agent' and native_state in ('completed', 'errored'):
+            end_proof, end_problem = worker_end_proof(c, d, raw, native_state, ref)
+        if state in ('closed', 'shutdown', 'interrupted', 'errored') and end_proof is None:
+            if close_confirmed:
+                end_proof = current_end_proof(d, prior)
+            elif closure_valid:
+                end_proof = closure['endProof']
+            elif proved_end(d, prior):
+                end_proof = prior['endProof']
+        capacity = ('released' if state in ('shutdown', 'closed') and end_proof else
+                    'unknown' if state in ('shutdown', 'not_found') else
+                    'releasing' if state == 'closing' else 'occupied')
+        resume_scope = execution_scope(d)
+        resume_proof = None
+        if (a.tool == 'resume_agent' and state == 'pending_init'
+                and proved_end(d, prior)
+                and prior.get('state') in ('shutdown', 'closed')):
+            resume_proof = dict(scope=resume_scope, resumeEvidence=ref,
+                                priorEndEvidence=(closure or {}).get('priorEndEvidence', prior.get('evidence')),
+                                closeEvidence=(closure or {}).get('evidence'), priorEndProof=prior['endProof'])
+        elif (a.tool == 'wait_agent' and state == prior.get('state') == 'pending_init'
+                and prior.get('attempt') == d['attempt'] and resumed_idle(d, prior)
+                and not prior.get('executionEnded') and not prior.get('resumeFailed')
+                and prior.get('resumeProof', {}).get('scope') == resume_scope):
+            # Same idle recovery, not a new execution: retain the original
+            # end/close/resume proof across waits, including timed-out waits.
+            resume_proof = prior['resumeProof']
+        resume_idle = resume_proof is not None
+        if close_confirmed:
+            d['closure'] = dict(attempt=d['attempt'], agentId=d['agentId'], evidence=ref,
+                                scope=execution_scope(d), endProof=end_proof, priorEndEvidence=end_proof['evidence'])
+        elif a.tool == 'resume_agent' and native_state not in ('not_found', 'shutdown'):
+            d.pop('closure', None)
+        elif a.tool == 'wait_agent' and native_state in ('pending_init', 'running'):
+            d.pop('closure', None)  # active evidence supersedes an earlier close observation
+        rt = dict(state=state, nativeState=native_state, nativeStateSource='previous_status' if a.tool == 'close_agent' else 'status', capacity=capacity, evidence=ref, observedAt=time.time(), attempt=d['attempt'])
+        if resume_idle:
+            rt['resumeAfterEnded'] = True
+            rt['resumeProof'] = resume_proof
+        if state in TERMINAL and end_proof:
+            rt['executionEnded'] = True
+            rt['endProof'] = end_proof
+            d['lastCompletion'] = dict(agentId=d['agentId'], attempt=d['attempt'],
+                                       payloadSha256=end_proof['payloadSha256'], evidence=end_proof['evidence'])
+        elif state in TERMINAL:
+            rt['endVerification'] = end_problem or 'no current execution proof; raw terminal status may be cached'
+        if d.get('closure'):
+            rt['closureEvidence'] = d['closure']['evidence']
+        if a.tool == 'resume_agent' and native_state in ('not_found', 'shutdown'):
+            rt['resumeFailed'] = True
+        if end_proof and end_proof['nativeState'] == 'completed':
+            d['completedAttempt'] = d['attempt']
+        elif not resume_idle:
+            d.pop('completedAttempt', None)
+        d['runtime'] = rt
+        if state in TERMINAL and end_proof:
+            d['state'] = 'closed' if state in ('shutdown', 'closed') else 'ended'
+        elif state in TERMINAL:
+            d['state'] = 'terminal-unverified'
+        elif state in ('not_found', 'closing'):
+            d['state'] = 'visibility-blocked' if state == 'not_found' else 'closing'
+        else:
+            d['state'] = 'dispatched'
+        save_observation()
+    emit(d)
+
+
+def defer(a):
+    c = coord(a.coord)
+    ref, _ = evidence(a.evidence_file)
+    with lock(c, a.module):
+        d = load(c, a.module)
+        require_agent(d)
+        check_attempt(a, d)
+        if d.get('agentId') or d['state'] not in ('prepared', 'blocked-capacity', 'blocked-tools', 'dispatch-uncertain'):
+            raise ValueError('cannot defer an already registered dispatch')
+        ref = persist_event(c, d, ref)
+        if d['state'] == 'dispatch-uncertain' and a.reason != 'uncertain':
+            raise ValueError('uncertain dispatch cannot be downgraded to retryable; reconcile actual result first')
+        d.update(state={'capacity':'blocked-capacity','tools':'blocked-tools','uncertain':'dispatch-uncertain'}[a.reason],
+                 dispatchBlock=dict(reason=a.reason, evidence=ref, at=time.time()))
         atomic(record(c, a.module), d)
     emit(d)
 
@@ -302,6 +645,9 @@ def receipt_errors(c, d, r):
     for k, v in dict(version=2, rq=meta(c)['rq'], module=d['module'], attempt=d['attempt']).items():
         if r.get(k) != v:
             errors.append(f'{k}: stale or mismatched value')
+    if is_agent(d) and d['transport'] == 'native' and (not d.get('agentId') or r.get('agent_id') != d['agentId']
+            or 'agentId' in r and r['agentId'] != d['agentId']):
+        errors.append('agent_id: missing, wrong agent or unregistered native dispatch')
     if r.get('result') not in ('done', 'failed', 'blocked'):
         errors.append('result: use done/failed/blocked')
     if not isinstance(r.get('summary'), str) or not r['summary'].strip():
@@ -324,23 +670,30 @@ def receipt_errors(c, d, r):
         if not t.get('evidence'):
             errors.append(f'tests[{i}].evidence: required')
     if r.get('result') != 'done':
+        if r.get('worktree'):
+            try:
+                verify_worktree(c, d, r['worktree'])
+            except (ValueError, OSError, subprocess.TimeoutExpired) as e:
+                errors.append(str(e))
         return errors
     if any(not isinstance(t, dict) or t.get('result') not in ('passed', 'not-run') for t in tests):
         errors.append('done contains failed/blocked/invalid current checks')
-    accept = d['role'] in ACCEPT_ROLES and d.get('phase') != 'author'
+    accept = independent_acceptance(d)
     if accept and any(not isinstance(t, dict) or t.get('result') != 'passed' for t in tests):
         errors.append('acceptance has unexecuted verification')
     if d['role'] == 'developer' and not any(isinstance(t, dict) and t.get('result') == 'passed' for t in tests):
         errors.append('developer has no passing verification')
     wt = None
     try:
-        if not r.get('worktree') and not d.get('worktree'):
+        value = r.get('worktree') or d.get('worktree')
+        if value:
+            wt = verify_worktree(c, d, value)
+        elif not d.get('readOnly'):
             raise ValueError('missing independent worktree')
-        wt = verify_worktree(c, d, r.get('worktree') or d['worktree'])
     except (ValueError, OSError, subprocess.TimeoutExpired) as e:
         errors.append(str(e))
     sha = r.get('commit', '')
-    if accept or d['role'] == 'developer' or d.get('phase') == 'author':
+    if meta(c).get('assetKind') != 'artifacts' and not d.get('readOnly') and (accept or d['role'] == 'developer' or d.get('phase') == 'author'):
         if not isinstance(sha, str) or not re.fullmatch(r'[a-f0-9]{40,64}', sha):
             errors.append('missing full commit SHA')
         else:
@@ -356,7 +709,7 @@ def receipt_errors(c, d, r):
                 errors.append('acceptance baseline changed; reverify current integration')
             if d.get('phase') == 'author' and wt and sha != git(wt, 'rev-parse', 'HEAD'):
                 errors.append('author commit does not match worktree HEAD')
-    if wt and git(wt, 'status', '--porcelain'):
+    if meta(c).get('assetKind') != 'artifacts' and wt and git(wt, 'status', '--porcelain'):
         errors.append('done worktree has uncommitted changes; evidence must match committed version')
     return errors
 
@@ -392,10 +745,19 @@ def validate_receipt(a):
 
 
 def compact(c, d, r=None, path=None, errors=()):
-    state = ('needs-review' if errors else r['result']) if r is not None else (
-        d['state'] if d['state'] in ('prepared', 'setting-up', 'self', 'replying') else 'unknown')
+    state = ('needs-review' if errors else r['result']) if r is not None else d['state']
+    rt = (dict(state='not-applicable', capacity='not-applicable') if d['transport'] == 'self' else
+          d.get('runtime', dict(state='unknown', capacity='unknown')) if is_agent(d) else dict(state='legacy-unobserved', capacity='unknown'))
+    proof = current_end_proof(d) or {}
     out = dict(module=d['module'], role=d['role'], attempt=d['attempt'], state=state,
-               sessionId=d.get('sessionId'), hostId=d.get('hostId'), worktree=d.get('worktree'))
+               agentId=d.get('agentId'), sessionId=d.get('sessionId'), executionKind=d.get('executionKind', 'legacy-app'),
+               worktree=d.get('worktree'), runtime=rt,
+               retiredAgents=[dict(agentId=x.get('agentId'), attempt=x['attempt'], runtime=x.get('runtime', {}))
+                              for x in d.get('previousSessions', []) if x.get('agentId')],
+               deliveryReady=bool(is_agent(d) and not errors and isinstance(r,dict) and r.get('result') == 'done'
+                                  and (d['transport'] == 'self' or d.get('completedAttempt') == d['attempt']
+                                       and proof.get('nativeState') == 'completed' and proof.get('payloadSha256') == json_hash(r))),
+               taskRevision=d.get('taskRevision'), taskSha256=d.get('taskSha256'))
     if r is not None and isinstance(r, dict):
         out.update(summary=str(r.get('summary', ''))[:600], commit=r.get('commit'),
             tests={k:sum(isinstance(t, dict) and t.get('result') == k for t in (r.get('tests') if isinstance(r.get('tests'), list) else []))
@@ -403,8 +765,8 @@ def compact(c, d, r=None, path=None, errors=()):
             risks=r.get('risks', []), needsInput=r.get('needsInput', []), receiptFile=str(path) if path else None)
     if errors:
         out['validationErrors'] = list(errors)
-    if state == 'unknown':
-        out['nextAction'] = 'Use wait_threads for runtime state; no verified receipt yet'
+    if rt['state'] in ('unknown', 'not_found', 'legacy-unobserved') or rt.get('endVerification'):
+        out['nextAction'] = 'Parent must reconcile native runtime evidence; receipt is business output, not liveness'
     return out
 
 
@@ -430,7 +792,7 @@ def read(a):
     if r is not None:
         emit(dict(receipt=r, validationErrors=errors) if errors else r)
     else:
-        emit(dict(sessionId=d.get('sessionId'), hostId=d.get('hostId'), nextAction='Use read_thread only to investigate missing receipt, failure, input or unknown state'))
+        emit(dict(agentId=d.get('agentId'), sessionId=d.get('sessionId'), nextAction='Inspect only relevant native result/evidence for missing receipt, failure or input; legacy App assets are read-only'))
 
 
 def find_handoff(c, d):
@@ -462,15 +824,14 @@ def persist(c, d, r):
 
 def collect(a):
     c = coord(a.coord)
-    with lock(c, a.module):
+    with lock(c, 'ROSTER'), lock(c, a.module):
         d = load(c, a.module)
         r, path, errors = read_receipt(c, d)
         if r is None or errors:
             raise ValueError('no verified receipt to collect: '+ '; '.join(errors))
         dest, hp = persist(c, d, r)
-        if r.get('worktree') and not d.get('worktree') and r['result'] == 'done':
-            wt = verify_worktree(c, d, r['worktree'])
-            d.update(worktree=str(wt), cwd=str(wt/d['subdir']) if d.get('subdir') else str(wt), branch=git(wt, 'rev-parse', '--abbrev-ref', 'HEAD'))
+        if is_agent(d) and r.get('worktree') and not d.get('worktree'):
+            d.update(bound_assets(c, d, r['worktree']))
             atomic(record(c, a.module), d)
         atomic(c/(d['module']+'.receipt.json'), r)
     out = compact(c, d, r, c/(d['module']+'.receipt.json'))
@@ -488,26 +849,61 @@ def reply(a):
     if not text.strip():
         raise ValueError('empty reply')
     native_settings()
-    with lock(c, a.module):
+    if a.session == 'auto':
+        raise ValueError('choose --session reuse or fresh explicitly; independent work needs prepare with a new module')
+    with lock(c, 'ROSTER'), lock(c, a.module):
         d = load(c, a.module)
-        if d['transport'] != 'native' or not d.get('sessionId'):
-            raise ValueError('reply requires an existing real native thread')
+        require_agent(d)
+        if d['transport'] != 'native' or not d.get('agentId'):
+            raise ValueError('reply requires an existing real native agent')
         if d['state'] == 'replying':
             raise ValueError('previous send outcome unresolved; use existing next-prompt and reconcile with native tools')
         if d.get('replies', 0) >= MAX_REPLIES and not a.force:
-            raise ValueError('rework cap reached; re-check requirements/contract/environment before --force')
+            raise ValueError('rework review checkpoint: re-check requirements/contract/environment, then --force; no forced fresh')
         if a.phase and d['role'] not in ('verify', 'integ'):
             raise ValueError('--phase execute only applies to verify/integ')
         fresh = a.session == 'fresh'
-        # The CLI cannot infer liveness from a receipt. Require an explicit host
-        # observation of this exact thread; --force cannot bypass this safeguard.
-        if fresh and (a.observed_state not in ('completed', 'failed', 'interrupted', 'stopped') or a.observed_session_id != d['sessionId']):
-            raise ValueError('fresh requires host-confirmed old turn end: --observed-session-id and --observed-state; running/unknown/input waits are unsafe')
+        target = dict(d, phase=a.phase or d.get('phase'))
+        if not fresh and independent_acceptance(target) and d.get('spawnContext', {}).get('forkContext') is True:
+            raise ValueError('independent acceptance cannot reuse parent-inherited history; choose fresh and spawn with fork_context=false')
+        # Raw host evidence must have been ingested for this exact attempt.
+        rt = d.get('runtime', {})
+        observed_id = a.observed_agent_id or a.observed_session_id
+        idle_recovery = resumed_idle(d)
+        if (observed_id != d['agentId'] or a.observed_state != rt.get('state') or
+                rt.get('attempt') != d['attempt'] or
+                not (rt.get('state') in TERMINAL and proved_end(d) or idle_recovery and not fresh)):
+            raise ValueError('reply requires observed native execution end for exact agent/attempt; ingest host event with observe first')
+        reuse_reason = (a.reuse_reason or '').strip()
+        fresh_reason = (a.fresh_reason or '').strip()
+        if fresh and not fresh_reason:
+            raise ValueError('fresh requires --fresh-reason with actual context/capability benefit, not role/stage/count alone')
+        if not fresh and not reuse_reason:
+            raise ValueError('reuse requires --reuse-reason explaining tight task continuity; same role alone is insufficient')
+        if not fresh and rt['state'] in ('shutdown', 'closed'):
+            raise ValueError('closed agent: parent must resume_agent and observe actual restored idle/ended state before reuse; no guaranteed recovery')
+        task_path = c/(d['module']+'.task.md')
+        old_prompt = c/(d['module']+'.prompt.md')
+        if task_path.exists():
+            old_task = task_path.read_text()
+        else:
+            # Extract legacy cards once; never accumulate old protocol/attempts.
+            previous_prompt = old_prompt.read_text()
+            marker = '\n任务卡：\n'
+            old_task = previous_prompt.split(marker, 1)[-1] if marker in previous_prompt else previous_prompt
+        task = Path(a.task).resolve().read_text() if a.task else old_task
+        if not task.strip():
+            raise ValueError('empty replacement task card')
         r, path, errors = read_receipt(c, d)
         hp = find_handoff(c, d)
         if fresh and not hp:
             raise ValueError('fresh requires current-attempt handoff; write and collect it first')
+        if fresh and not d.get('worktree') and r and not errors and r.get('worktree'):
+            d.update(bound_assets(c, d, r['worktree']))
+        if fresh and not d.get('worktree') and not d.get('readOnly'):
+            raise ValueError('fresh requires verified existing assets; bind or provide valid receipt worktree first')
         old = dict(d)
+        atomic(archive_dir(c, d)/'record.json', old)
         if r is not None:
             persist(c, d, r)  # archive invalid evidence too; do not reinterpret failure as success
         if hp:
@@ -516,49 +912,58 @@ def reply(a):
         if old_receipt.exists():
             atomic_text(archive_dir(c, d)/'raw.receipt.json', old_receipt.read_text())
             old_receipt.unlink()
-        old_prompt = c/(d['module']+'.prompt.md')
         if old_prompt.exists():
             atomic_text(archive_dir(c, d)/'prompt.md', old_prompt.read_text())
+        atomic_text(archive_dir(c, d)/'task.md', old_task)
         d.update(attempt=uuid.uuid4().hex, state='prepared' if fresh else 'replying',
-                 replies=d.get('replies', 0)+1, repliedAt=time.time())
+                 replies=d.get('replies', 0)+1, repliedAt=time.time(),
+                 taskRevision=d.get('taskRevision', 1)+(task != old_task),
+                 taskSha256=hashlib.sha256(task.encode()).hexdigest(),
+                 lastSessionDecision=dict(policy=a.session, reuseReason=reuse_reason if not fresh else None,
+                     agentId=old['agentId'], sessionId=old['sessionId'], freshReason=fresh_reason if fresh else None, observedState=a.observed_state, observedAt=time.time()))
         if a.phase:
             d['phase'] = a.phase
         if fresh:
             d['previousSessions'] = list(d.get('previousSessions', []))+[dict(
-                sessionId=old['sessionId'], hostId=old.get('hostId', 'local'), attempt=old['attempt'],
+                agentId=old['agentId'], sessionId=old['sessionId'], attempt=old['attempt'],
+                runtime=old.get('runtime', {}), completedAttempt=old.get('completedAttempt'), closure=old.get('closure'),
+                dispatchEvidence=old.get('dispatchEvidence'), dispatch=old.get('dispatch'), submissionId=old.get('submissionId'),
+                spawnContext=old.get('spawnContext'),
                 observedState=a.observed_state, observedAt=time.time(), handoffFile=str(archive_dir(c, old)/'handoff.md'))]
-            d.update(sessionId=None, hostId=None, clientThreadId=None, sidebar=None)
+            d.update(agentId=None, sessionId=None)
+            d.pop('spawnContext', None)
+        d['runtime'] = dict(state='unknown', capacity='unknown', attempt=d['attempt'])
+        d.pop('completedAttempt', None)
+        d.pop('dispatchEvidence', None)
+        d.pop('dispatch', None)
+        d.pop('submissionId', None)
+        d.pop('closure', None)
         # Preserve the old baseline until the worker merges integration. Execute
         # receipts must match the current integration HEAD regardless of this field.
         head = f"本轮 attempt={d['attempt']}；回执和交接路径使用本轮身份。\n"
         if a.phase == 'execute':
-            head += f"执行阶段：保留验收脚本，将最新 {meta(c)['integrationBranch']} 合入本工作树；脚本需要交付时先提交并 land，再记录实际验收 SHA。\n"
-        head += text+'\n继续前重读本卡、最新原始需求/用例/契约；复测失败项、受影响分支与完整主流程。\n'
-        task_path = c/(d['module']+'.task.md')
-        if task_path.exists():
-            task = task_path.read_text()
-        else:
-            # Existing native RQs predate .task.md: extract their business card
-            # once, rather than copying old attempts/protocol into future cards.
-            previous_prompt = old_prompt.read_text()
-            marker = '\n任务卡：\n'
-            task = previous_prompt.split(marker, 1)[-1] if marker in previous_prompt else previous_prompt
-            atomic_text(task_path, task)
+            if meta(c).get('assetKind') == 'artifacts':
+                head += '执行阶段：保留验收资产，对照任务卡的来源/产物版本与内容哈希，操作真实研究/数据入口，记录证据和未知项；不要求 Git 提交、合入或 SHA。\n'
+            else:
+                head += f"执行阶段：保留验收脚本，将最新 {meta(c)['integrationBranch']} 合入本工作树；脚本需要交付时先提交并 land，再记录实际验收 SHA。\n"
+        head += text+'\n继续前重读唯一生效卡，只按阅读地图读取相关原文锚点/事实/用例/契约版本；交接备注不得覆盖卡片要求。复测范围按受影响行为确定。\n'
+        atomic_text(task_path, task)
         handoff_ref = f"\n交接文件：{archive_dir(c,old)/'handoff.md'}\n" if hp else ''
-        current_prompt = preamble(c, d)+task+handoff_ref+'\n本轮变更：\n'+head
+        current_prompt = preamble(c, d)+task+handoff_ref+'\n执行交接（不变更任务要求）：\n'+head
         atomic_text(old_prompt, current_prompt)
         if fresh:
             prompt = current_prompt
         else:
-            prompt = head+f"稳定 worker 协议：{ROOT.parent/'reference'/'worker.md'}\n当前完整任务卡：{old_prompt}\n"+(
+            prompt = 'reuse 保留你自己的历史；不要重复排查已记录失败尝试。\n'+head+f"本轮 agent_id：{d['agentId']}。\n"+task+'\n'+f"稳定 worker 协议：{ROOT.parent/'reference'/'worker.md'}\n唯一生效任务卡：{task_path}\n版本：{d['taskRevision']}；SHA256：{d['taskSha256']}。旧卡不再生效。\n"+(
                 f"交接写 {handoff_path(c,d)}，回执写 {c/(d['module']+'.receipt.json')}；不可写则分别写 {handoff_path(c,d,True)} 和 {inbox(c,d)}。\n"
                 f"完成前运行 {shlex.quote(str(ROOT/'cc-fleet'))} validate-receipt --coord {shlex.quote(str(c))} --module {d['module']}。\n")
         atomic_text(c/(d['module']+'.next-prompt.md'), prompt)
         atomic(record(c, a.module), d)
     emit(dict(d, sessionPolicy='fresh' if fresh else 'reuse', nativeSettings=native_settings(), nativeSettingsPolicy='inherit-parent',
-        prompt=prompt, promptFile=str(c/(d['module']+'.next-prompt.md')),
-        nextAction=NATIVE_SETTINGS_ACTION+('Call create_thread; move and register the new real identity with --attempt. Reuse the existing worktree; do not archive/stop the old thread automatically.' if fresh else
-            'Call send_message_to_thread for the existing identity; after acceptance register the same identity. If outcome is uncertain, inspect before retrying.')))
+        promptFile=str(c/(d['module']+'.next-prompt.md')),
+        **(dict(spawnPolicy=spawn_policy(d)) if fresh else {}),
+        nextAction=NATIVE_SETTINGS_ACTION+(spawn_action(d)+'Register returned agent_id and evidence with --attempt. Preserve existing assets. Close the stopped old agent after evidence is saved; record successful close plus prior terminal evidence; isolated not_found never proves release.' if fresh else
+            'Call send_input(target=existing agentId, message=complete next-prompt file); register its accepted submission_id/evidence. Wait may return cached previous completed: observe verifies the full current worker JSON against the valid current receipt before any end/close/reply/delivery grant. Keep agent history; do not spawn. Reconcile uncertain sends before retrying.')))
 
 
 def snapshot(a):
@@ -582,10 +987,12 @@ def snapshot(a):
 def dispatch(a):
     c = coord(a.coord)
     d = load(c, a.module)
-    if d['state'] not in ('prepared', 'setting-up'):
+    require_agent(d)
+    if d.get('agentId') or d['state'] not in ('prepared', 'blocked-capacity', 'blocked-tools'):
         raise ValueError('already attempted; inspect registered native identity before retrying')
     emit(dict(d, promptFile=str(c/(d['module']+'.prompt.md')), nativeSettings=native_settings(), nativeSettingsPolicy='inherit-parent',
-        nextAction=NATIVE_SETTINGS_ACTION+'Use native create_thread only if not already pending; move, verify and register.'))
+        spawnPolicy=spawn_policy(d),
+        nextAction=NATIVE_SETTINGS_ACTION+'Resolve any capacity/tools block and rule out an uncertain prior spawn first. '+spawn_action(d)+'Then register returned agent_id/evidence.'))
 
 
 def retired_hook(a):
@@ -599,24 +1006,26 @@ def parser():
     subs = p.add_subparsers(dest='cmd', required=True)
     q = subs.add_parser('init')
     q.add_argument('--cwd', required=True)
+    q.add_argument('--workspace', action='store_true', help='Non-Git research/data artifact coordination')
     q.add_argument('--host', choices=('codex-app',), default='codex-app')
     for arg in ('owner-id', 'base', 'rq'):
         q.add_argument('--'+arg)
     q.set_defaults(fn=init)
     for cmd, fn in [('prepare', prepare), ('bind', bind), ('register', register), ('dispatch', dispatch),
                     ('status', status), ('read', read), ('collect', collect), ('validate-receipt', validate_receipt),
-                    ('reply', reply), ('snapshot', snapshot)]:
+                    ('reply', reply), ('observe', observe), ('defer', defer), ('snapshot', snapshot)]:
         q = subs.add_parser(cmd)
         q.add_argument('--coord', required=True)
         q.set_defaults(fn=fn)
         if cmd not in ('status', 'snapshot'):
             q.add_argument('--module', required=True, type=name)
-        if cmd in ('bind', 'register'):
-            q.add_argument('--attempt')
+        if cmd in ('bind', 'register', 'observe', 'defer'):
+            q.add_argument('--attempt', required=cmd in ('register', 'observe', 'defer'))
         if cmd == 'prepare':
             q.add_argument('--task', required=True)
             q.add_argument('--role', default='developer', choices=('developer', 'scout', *ACCEPT_ROLES))
             q.add_argument('--phase', choices=('author',))
+            q.add_argument('--read-only', action='store_true')
             q.add_argument('--self', dest='self_dev', action='store_true')
             q.add_argument('--subdir')
             q.add_argument('--backend', choices=('codex',), default='codex')
@@ -627,21 +1036,35 @@ def parser():
             q.add_argument('--worktree', required=True)
         if cmd == 'register':
             g = q.add_mutually_exclusive_group(required=True)
-            g.add_argument('--session-id')
-            g.add_argument('--client-thread-id')
+            g.add_argument('--agent-id')
+            g.add_argument('--session-id', help='Deprecated alias for agent ID ONLY on new subagent records')
+            g.add_argument('--client-thread-id', help=argparse.SUPPRESS)
+            q.add_argument('--evidence-file')
+            q.add_argument('--context-reason', help='One sentence explaining the PM decision to spawn with fork_context=true; not a native tool argument')
             q.add_argument('--host-id')
             q.add_argument('--sidebar-section-id')
+        if cmd == 'observe':
+            q.add_argument('--agent-id', required=True)
+            q.add_argument('--tool', required=True, choices=('wait_agent', 'close_agent', 'resume_agent'))
+            q.add_argument('--evidence-file', required=True)
+        if cmd == 'defer':
+            q.add_argument('--reason', required=True, choices=('capacity', 'tools', 'uncertain'))
+            q.add_argument('--evidence-file', required=True)
         if cmd in ('status', 'collect'):
             q.add_argument('--details', action='store_true')
         if cmd == 'validate-receipt':
             q.add_argument('--receipt-file')
         if cmd == 'reply':
             q.add_argument('--text-file', required=True)
+            q.add_argument('--task', help='Complete replacement for the active task card; dispatch notes never override it')
             q.add_argument('--phase', choices=('execute',))
             q.add_argument('--force', action='store_true')
             q.add_argument('--session', choices=('auto', 'reuse', 'fresh'), default='auto')
-            q.add_argument('--observed-session-id')
-            q.add_argument('--observed-state', choices=('completed', 'failed', 'interrupted', 'stopped', 'running', 'unknown', 'waiting'))
+            q.add_argument('--reuse-reason', help='Why this tightly related continuation benefits from the existing context')
+            q.add_argument('--fresh-reason')
+            q.add_argument('--observed-agent-id')
+            q.add_argument('--observed-session-id', help='Deprecated agent ID alias on new records only')
+            q.add_argument('--observed-state', choices=(*TERMINAL, 'pending_init', 'running', 'not_found', 'unknown', 'waiting'))
         if cmd == 'snapshot':
             q.add_argument('--file', required=True)
     for cmd in ('stop-guard', 'rescue-owners'):

@@ -4,7 +4,7 @@
 # 为什么需要它（本技能的隔离模型，2026-06-13 起）：
 #   每个 RQ 有一条独立【集成分支】 fleet/<RQ>（主 session 用 `cc-fleet init --cwd <repo>` 在
 #   发起任务时的当前分支上创建）。worker 的 worktree base 锚定 fleet/<RQ>、改动也只合回 fleet/<RQ>，
-#   **绝不碰共享开发分支（dev/<name> / main）**——共享分支只在主 session 整体验收通过后、由它把
+#   **绝不碰共享开发分支（dev/<name> / main）**——共享分支只在主 session 整体验收通过后、委派集成 worker 把
 #   fleet/<RQ> 合回一次。这样「单个模块完成但整体需求没做完」时，半成品被关在 fleet/<RQ> 里，
 #   同项目其它并发 RQ / 用户本人完全不受干扰。
 #
@@ -39,7 +39,7 @@ usage() {
   cat >&2 <<'EOF'
 用法: cc-fleet-land <RQ> [--int-branch <name>] [--push-backup <module>] [--dry-run]
   在 worker 自己的隔离 worktree 内、改动已 commit 后运行，把改动安全合入集成分支 fleet/<RQ>。
-  绝不碰共享开发分支——共享分支由主 session 验收后合一次。
+  绝不碰共享开发分支——共享分支经主端放行后由集成 worker 按授权合入一次。
 EOF
 }
 
